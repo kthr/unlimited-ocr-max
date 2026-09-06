@@ -17,10 +17,10 @@ jobs:
     steps:
       # fetch-depth: 0 brings the annotated tag object along -- its message is
       # the release notes below.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           python-version: "3.12"
 
@@ -63,12 +63,12 @@ jobs:
           printf '%s\n' "$notes" > release-notes.md
           cat release-notes.md
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
           path: dist/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
           path: release-notes.md
@@ -87,18 +87,22 @@ jobs:
       # No PyPI API token is stored in this repository.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      # PyPA recommends tracking the `release/v1` branch so fixes arrive without
+      # a bump; this pin is the stricter choice -- the commit `release/v1`
+      # pointed at on 2026-09-06, which is also what the v1.14.2 tag resolves
+      # to. Re-pin it when you want the newer release.
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
 
       # Fallback, if you would rather not set up Trusted Publishing: create a
       # project-scoped API token on pypi.org, store it as the repository secret
       # PYPI_API_TOKEN, delete the `permissions: id-token: write` block above,
       # and replace the publish step with:
       #
-      # - uses: pypa/gh-action-pypi-publish@release/v1
+      # - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2 (release/v1)
       #   with:
       #     password: ${{ secrets.PYPI_API_TOKEN }}
 
@@ -108,16 +112,29 @@ jobs:
     permissions:
       contents: write # create the release and upload its assets
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: dist
           path: dist
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-notes
           path: .
-      - uses: softprops/action-gh-release@v3
-        with:
-          body_path: release-notes.md
-          files: dist/*
-          fail_on_unmatched_files: true
+      # `gh` is preinstalled on the runner, so the release needs no third-party
+      # action at all: the job's own `contents: write` GITHUB_TOKEN is the only
+      # credential. This job never checks the repository out, so `gh` cannot
+      # infer the repo from a git remote -- GH_REPO tells it. `failglob` turns
+      # an empty `dist/` into a hard failure instead of uploading a literal
+      # `dist/*`, and `--verify-tag` refuses to create a release for a tag that
+      # is not on the remote.
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s failglob
+          ls -l dist/*
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "unlimited-ocr-max $GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --verify-tag

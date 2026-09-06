@@ -19,8 +19,9 @@ and macOS, and asserts both `kernels/*.mojo` are inside it.
 4. `git push origin main --follow-tags`.
 5. `.github/workflows/publish.yml` then checks the tag against
    `project.version`, builds the wheel and sdist, publishes them to PyPI
-   through Trusted Publishing, and attaches them to a GitHub Release. Nothing
-   is ever published from a developer machine.
+   through Trusted Publishing, and attaches them to a GitHub Release (created
+   with `gh release create` and the workflow's own token -- no third-party
+   release action). Nothing is ever published from a developer machine.
 
 ## One-time PyPI setup
 
@@ -39,6 +40,10 @@ pending publisher* → GitHub, with
 All five values must match the workflow exactly. The first tag push creates the
 project and turns the pending publisher into a real one; the `pypi` environment
 is created by GitHub on first use. No API token, no repository secret.
+
+Once that environment exists, add yourself under GitHub → *Settings* →
+*Environments* → `pypi` → *Required reviewers*, so every upload to PyPI waits
+for a human approval instead of going out on any tag push.
 
 Being on PyPI does not remove `--extra-index-url
 https://whl.modular.com/nightly/simple/` from the install instructions: the
