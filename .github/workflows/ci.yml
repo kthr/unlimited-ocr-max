@@ -1,0 +1,102 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # `max[all]==26.6.0.dev2026082707` is published on Modular's nightly index
+  # only, so every install of this package needs this index in addition to PyPI
+  # -- for CI and for end users alike (see README "Install").
+  MODULAR_INDEX: https://whl.modular.com/nightly/simple/
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+      # Pyflakes rules only: undefined names, unused imports, f-string mistakes.
+      # No style opinions -- this package has no ruff config to disagree with.
+      - name: ruff (F rules)
+        run: uvx ruff@0.16.6 check --select F unlimited_ocr_max tests
+
+  wheel:
+    name: wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # macOS arm64 is the platform this port is validated on; Linux x86_64 is
+      # what MAX targets first and what most `pip install` users are on. The
+      # tests are model-free -- they import the architecture but never open a
+      # device or compile a kernel, so neither runner needs a GPU (nor the
+      # Metal Toolchain, which MAX only shells out to when it compiles Metal
+      # kernels at serve time). fail-fast off: one platform failing must not
+      # hide the other's result. If the Linux leg ever becomes a nuisance
+      # (torch pulls the CUDA wheels there), drop `ubuntu-latest` from the list.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.12"
+
+      # Builds the sdist, then the wheel *from* the sdist, so a file missing
+      # from the sdist cannot be present in the wheel.
+      - name: Build wheel and sdist
+        run: uv build
+
+      # The listing is captured once and matched from a here-string: with
+      # `pipefail` on, `unzip -l | grep -q` fails intermittently because grep
+      # exits on the first match and unzip dies of SIGPIPE.
+      - name: The Mojo custom op sources are inside the wheel
+        run: |
+          wheel="$(ls dist/*.whl)"
+          listing="$(unzip -l "$wheel")"
+          echo "$listing"
+          for f in unlimited_ocr_max/kernels/__init__.mojo \
+                   unlimited_ocr_max/kernels/ngram_block.mojo; do
+            grep -qE "[[:space:]]${f}$" <<<"$listing" \
+              || { echo "::error file=pyproject.toml::${f} is missing from ${wheel}"; exit 1; }
+          done
+
+      - name: Metadata is valid
+        run: uv run --no-project --with twine twine check --strict dist/*
+
+      # The venv lives outside the checkout so the tests import the *installed*
+      # wheel (site-packages), never the source tree next to them -- that is
+      # what makes the kernels/*.mojo and `max` version assertions meaningful.
+      # The nightly index may be slow (hence the timeout, ~4 GB of wheels on
+      # Linux where torch pulls the CUDA stack); it may not fail.
+      - name: Install the built wheel into a fresh venv
+        timeout-minutes: 30
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv" \
+            --extra-index-url "$MODULAR_INDEX" \
+            "$(ls dist/*.whl)" 'pytest>=9'
+
+      # 15 model-free tests: the MAX pin, lazy architecture export, the Mojo
+      # sources in the installed package, `max serve` argv, prompt expansion.
+      - name: pytest
+        run: |
+          "$RUNNER_TEMP/venv/bin/pytest" tests -q
+
+      - name: Console script
+        run: |
+          "$RUNNER_TEMP/venv/bin/unlimited-ocr-max" --help
