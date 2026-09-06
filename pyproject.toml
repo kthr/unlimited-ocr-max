@@ -1,0 +1,60 @@
+[project]
+name = "unlimited-ocr-max"
+version = "0.1.0"
+description = "baidu/Unlimited-OCR as a MAX custom architecture with a Mojo custom op, served on Apple Silicon (Metal or CPU)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.14"
+authors = [{ name = "Konstantin Thierbach" }]
+keywords = ["ocr", "document-ai", "max", "mojo", "apple-silicon", "metal", "moe", "unlimited-ocr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    # The exact build this port is validated on; published on Modular's nightly index only.
+    "max[all]==26.6.0.dev2026082707",
+    "numpy>=2.5.2",
+    "pillow>=12.3.0",
+    "torch>=2.13.0,<2.15",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9"]
+
+[project.scripts]
+unlimited-ocr-max = "unlimited_ocr_max.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/kthr/unlimited-ocr-max"
+Model = "https://huggingface.co/kthierbach/unlimited-ocr-max"
+Issues = "https://github.com/kthr/unlimited-ocr-max/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+ignore-vcs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["unlimited_ocr_max"]
+
+[tool.hatch.build.targets.sdist]
+include = ["unlimited_ocr_max", "tests", "README.md", "LICENSE", "pyproject.toml"]
+
+# The 26.6 dev build lives on Modular's nightly index, not PyPI. This block
+# applies to a checkout of this repository; an install from PyPI or a git URL
+# must pass --extra-index-url https://whl.modular.com/nightly/simple/ itself.
+[[tool.uv.index]]
+name = "modular-nightly"
+url = "https://whl.modular.com/nightly/simple/"
