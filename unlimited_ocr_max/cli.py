@@ -14,7 +14,7 @@ from pathlib import Path
 DEFAULT_MODEL = "kthierbach/unlimited-ocr-max"
 #: The model-repo tag this package version was validated against; ignored for a local ``--model``.
 DEFAULT_REVISION = "v0.1.0"
-WEIGHT_VARIANTS = ("bf16",)
+WEIGHT_VARIANTS = ("bf16", "int8")
 PACKAGE_DIR = Path(__file__).resolve().parent
 SERVED_MODEL_NAME = "unlimited-ocr-max"
 MAX_LENGTH = 2048
@@ -23,8 +23,13 @@ NGRAM_ENV = "_UNLIMITED_OCR_MAX_NGRAM_SIZE"
 
 
 def weight_file(variant: str) -> str:
-    """The unquantised weights are the plain ``model.safetensors``: MAX reads encoding hints (``bf16``,
-    ``fp16``, ``q4_k_m``, ...) out of weight filenames, and a ``bf16`` hint is refused on CPU."""
+    """The filename of a weight variant: ``bf16`` is the plain, unquantised ``model.safetensors``,
+    every other variant is ``model-<variant>.safetensors`` (``int8`` -> ``model-int8.safetensors``).
+
+    The unquantised shard carries no variant in its name on purpose: MAX reads encoding hints
+    (``bf16``, ``fp16``, ``q4_k_m``, ...) out of weight filenames and refuses a ``bf16`` hint on CPU.
+    ``int8`` is not one of those tokens, so the quantised name stays hint-free too -- guarded by
+    ``test_max_filename_parser_ignores_our_weight_filenames``."""
     if variant not in WEIGHT_VARIANTS:
         raise SystemExit(f"unknown --weights {variant!r}; choose from {', '.join(WEIGHT_VARIANTS)}")
     return "model.safetensors" if variant == "bf16" else f"model-{variant}.safetensors"
@@ -71,7 +76,14 @@ def serve_command(*, max_exe: str, model: str, weight_path: str, devices: str, p
     ]
 
 
+def check_devices_support_variant(weights: str, devices: str) -> None:
+    """Refuse a variant its device cannot serve, before any path or network work."""
+    if weights == "int8" and devices == "cpu":
+        raise SystemExit("--weights int8 is GPU-only; serve on cpu with --weights bf16")
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
+    check_devices_support_variant(args.weights, args.devices)
     model, weight_path, revision = resolve_model(args.model, args.weights, args.revision)
     cmd = serve_command(
         max_exe=max_executable(), model=model, weight_path=weight_path, devices=args.devices, port=args.port, revision=revision
@@ -96,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     srv.add_argument("--revision", default=DEFAULT_REVISION,
                      help="Hub revision for config, tokenizer and weights; ignored for a local directory (default: %(default)s)")
     srv.add_argument("--weights", default="bf16", choices=WEIGHT_VARIANTS,
-                     help="weight variant: bf16 is the unquantised model.safetensors, others model-<variant>.safetensors (default: %(default)s)")
+                     help="weight variant: bf16 is the unquantised model.safetensors (cpu or gpu), int8 is model-int8.safetensors (gpu only) (default: %(default)s)")
     srv.add_argument("--port", type=int, default=8010, help="(default: %(default)s)")
     # 35 is `ngram.DEFAULT_NGRAM_SIZE`, repeated here so this module imports no MAX.
     srv.add_argument("--ngram-size", type=int, default=35,

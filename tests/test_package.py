@@ -1,4 +1,5 @@
-"""Model-free checks: the pin, the lazy architecture export, the serve command, prompt construction."""
+"""Model-free checks: the pin, the lazy architecture export, the serve command, the weight variants,
+MAX's weight-filename parser, prompt construction."""
 
 from __future__ import annotations
 
@@ -104,10 +105,37 @@ def test_refuses_a_path_looking_model_that_is_not_a_directory() -> None:
             cli.resolve_model(model, "bf16", None)
 
 
-def test_weight_file_names_carry_no_encoding_hint_for_the_unquantised_weights() -> None:
-    assert cli.weight_file("bf16") == "model.safetensors"
+def test_weight_file_maps_every_variant_to_its_filename() -> None:
+    assert cli.WEIGHT_VARIANTS == ("bf16", "int8")
+    assert cli.weight_file("bf16") == "model.safetensors"  # unquantised: no encoding hint in the name
+    assert cli.weight_file("int8") == "model-int8.safetensors"
     with pytest.raises(SystemExit):
         cli.weight_file("int4")
+
+
+def test_max_filename_parser_ignores_our_weight_filenames() -> None:
+    """MAX infers a quantisation encoding from the weight filename and then refuses a bf16 hint on
+    CPU -- the failure mode that broke CPU serving while the shard was named
+    ``model-bf16.safetensors``. This guard fails loudly on a pin bump whose token list starts
+    matching our filenames. The positive control keeps a green guard meaningful: without it, an
+    import or parser that stopped resolving encodings would pass the guard for the wrong reason."""
+    from max.pipelines.modeling.config_enums import parse_supported_encoding_from_file_name
+
+    for variant in cli.WEIGHT_VARIANTS:  # model.safetensors, model-int8.safetensors
+        assert parse_supported_encoding_from_file_name(cli.weight_file(variant)) is None, variant
+    assert parse_supported_encoding_from_file_name("model-bf16.safetensors") is not None
+
+
+def test_int8_on_cpu_is_refused_before_any_path_work() -> None:
+    missing = "/nonexistent/unlimited-ocr-max"  # resolve_model would fail on this, with another message
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["serve", "--devices", "cpu", "--weights", "int8", "--model", missing])
+    assert str(refused.value) == "--weights int8 is GPU-only; serve on cpu with --weights bf16"
+
+    for weights, devices in (("bf16", "cpu"), ("int8", "gpu")):  # every other combination gets that far
+        with pytest.raises(SystemExit) as reached_resolve_model:
+            cli.main(["serve", "--devices", devices, "--weights", weights, "--model", missing])
+        assert "neither an existing directory" in str(reached_resolve_model.value)
 
 
 def test_ngram_size_travels_to_the_server_through_the_private_variable(monkeypatch: pytest.MonkeyPatch) -> None:
