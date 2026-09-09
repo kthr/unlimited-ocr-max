@@ -52,6 +52,11 @@ packages = ["unlimited_ocr_max"]
 [tool.hatch.build.targets.sdist]
 include = ["unlimited_ocr_max", "tests", "README.md", "LICENSE", "pyproject.toml"]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: compiles Mojo kernels through a MAX InferenceSession; CI runs -m 'not slow'",
+]
+
 # The 26.6 dev build lives on Modular's nightly index, not PyPI. This block
 # applies to a checkout of this repository; an install from PyPI or a git URL
 # must pass --extra-index-url https://whl.modular.com/nightly/simple/ itself.
