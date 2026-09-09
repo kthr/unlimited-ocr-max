@@ -4,4 +4,5 @@
 importing the struct here is what makes its ``@register`` reachable.
 """
 
+from .moe_int8 import Int8DequantExpert, MoeInt8Qmv
 from .ngram_block import NgramBlock
