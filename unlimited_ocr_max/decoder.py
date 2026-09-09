@@ -19,6 +19,16 @@ Invariants the emitted graph depends on:
   exact chain so it is bitwise equal to the dense path. The native decode path
   (``moe_create_indices`` + ``grouped_matmul_ragged``) is GPU-only on this MAX
   build and is not bitwise equal to either.
+* With ``DecoderConfig.int8_experts`` the three stacks are int8 next to fp32
+  per-group scales (``…experts.<proj>_scales``, group size
+  :data:`~unlimited_ocr_max.model_config.INT8_GROUP_SIZE`) and reach the
+  ``kernels/moe_int8.mojo`` ops WHOLE: at ``seq == 1`` ``moe_int8_qmv`` reads
+  the top-6 experts straight from the stacks, at ``seq > 1`` ``int8_dequant_expert``
+  hands expert ``j`` to the same 64-term chain as a bf16 ``[N, K]`` weight. A
+  graph-level slice of a weight stack is never staged in int8 mode: weight-only
+  expressions are compile-folded and the folded slice is materialized on the
+  device (KON-142), which the kernels exist to avoid. The graph that stages
+  these ops needs ``custom_extensions=[MOJO_KERNELS]``.
 * Hidden states are rank-2 ``[seq_len, hidden]``; ``seq_len`` is a static graph
   dimension so the causal mask and the RoPE tables are graph constants.
 """
@@ -30,11 +40,11 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 from max.dtype import DType
-from max.graph import DeviceRef, TensorValue, Weight, ops
+from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn import LayerList, Module
 from max.nn.kernels import grouped_matmul_ragged, moe_create_indices
 
-from .model_config import DecoderConfig
+from .model_config import INT8_GROUP_SIZE, DecoderConfig
 
 __all__ = [
     "COMPUTE_DTYPE",
@@ -118,20 +128,76 @@ class StackedExperts(Module):
     A plain stack of the checkpoint's ``[out, in]`` per-expert tensors in
     ascending expert index -- the layout ``grouped_matmul_ragged`` requires.
     Declared without a ``.weight`` suffix: ``…mlp.experts.gate_proj``.
+
+    With ``int8=True`` the stacks are int8 and each has an fp32
+    ``[num_experts, N, K / INT8_GROUP_SIZE]`` sibling ``…experts.gate_proj_scales``
+    -- the names the weight adapter stacks an int8 checkpoint into. The stacks
+    are only ever passed whole, to the Mojo kernels (see the module docstring).
     """
 
-    def __init__(self, num_experts: int, hidden_dim: int, ffn_dim: int, *, dtype: DType, device: DeviceRef) -> None:
+    def __init__(
+        self, num_experts: int, hidden_dim: int, ffn_dim: int, *, dtype: DType, device: DeviceRef, int8: bool = False
+    ) -> None:
         super().__init__()
         self.num_experts = num_experts
-        self.gate_proj = Weight("gate_proj", dtype, [num_experts, ffn_dim, hidden_dim], device=device)
-        self.up_proj = Weight("up_proj", dtype, [num_experts, ffn_dim, hidden_dim], device=device)
-        self.down_proj = Weight("down_proj", dtype, [num_experts, hidden_dim, ffn_dim], device=device)
+        self.int8 = int8
+        self.device = device
+        weight_dtype = DType.int8 if int8 else dtype
+        self.gate_proj = Weight("gate_proj", weight_dtype, [num_experts, ffn_dim, hidden_dim], device=device)
+        self.up_proj = Weight("up_proj", weight_dtype, [num_experts, ffn_dim, hidden_dim], device=device)
+        self.down_proj = Weight("down_proj", weight_dtype, [num_experts, hidden_dim, ffn_dim], device=device)
+        if int8:
+            groups_in, groups_ffn = hidden_dim // INT8_GROUP_SIZE, ffn_dim // INT8_GROUP_SIZE
+            fp32 = DType.float32
+            self.gate_proj_scales = Weight("gate_proj_scales", fp32, [num_experts, ffn_dim, groups_in], device=device)
+            self.up_proj_scales = Weight("up_proj_scales", fp32, [num_experts, ffn_dim, groups_in], device=device)
+            self.down_proj_scales = Weight("down_proj_scales", fp32, [num_experts, hidden_dim, groups_ffn], device=device)
+
+    def _stacks(self) -> tuple[tuple[Weight, Weight], ...]:
+        """``(weight, scales)`` for gate, up, down (int8 mode only)."""
+        return (
+            (self.gate_proj, self.gate_proj_scales),
+            (self.up_proj, self.up_proj_scales),
+            (self.down_proj, self.down_proj_scales),
+        )
+
+    def _dequant(self, weight: Weight, scales: Weight, expert_idx: TensorValue) -> TensorValue:
+        """``int8_dequant_expert``: expert ``expert_idx`` (a ``[1]`` int32) of the whole stack as bf16 ``[N, K]``."""
+        out_type = TensorType(DType.bfloat16, [weight.shape[1], weight.shape[2]], device=self.device)
+        return ops.custom(
+            "int8_dequant_expert", device=self.device, values=[weight, scales, expert_idx], out_types=[out_type]
+        )[0].tensor
 
     def expert(self, expert_idx: int) -> tuple[TensorValue, TensorValue, TensorValue]:
-        """Expert ``j``'s three rank-2 weights, as static slices."""
+        """Expert ``j``'s three rank-2 weights: static slices, or in int8 mode the kernel's bf16 dequantization."""
         if not 0 <= expert_idx < self.num_experts:
             raise IndexError(f"expert {expert_idx} out of range for {self.num_experts}")
-        return self.gate_proj[expert_idx], self.up_proj[expert_idx], self.down_proj[expert_idx]
+        if not self.int8:
+            return self.gate_proj[expert_idx], self.up_proj[expert_idx], self.down_proj[expert_idx]
+        index = ops.constant(np.asarray([expert_idx], dtype=np.int32), DType.int32, device=self.device)
+        gate, up, down = (self._dequant(weight, scales, index) for weight, scales in self._stacks())
+        return gate, up, down
+
+    def _qmv(self, x: TensorValue, expert_ids: TensorValue, weight: Weight, scales: Weight) -> TensorValue:
+        """``moe_int8_qmv``: row ``s`` of ``x`` against expert ``expert_ids[s]``, fp32 ``[k, N]``."""
+        out_type = TensorType(DType.float32, [x.shape[0], weight.shape[1]], device=self.device)
+        return ops.custom(
+            "moe_int8_qmv", device=self.device, values=[x, expert_ids, weight, scales], out_types=[out_type]
+        )[0].tensor
+
+    def qmv(self, x: TensorValue, expert_ids: TensorValue) -> TensorValue:
+        """``down(silu(gate(x)) * up(x))`` per row through the int8 kernel, ``[k, K] x [k] -> [k, hidden]``.
+
+        Three kernel calls over the whole stacks; the kernel indexes the expert.
+        The activation must already be fp32: the kernel pins its result, and so
+        its ``x`` and ``scales``, to float32.
+        """
+        if x.dtype != DType.float32:
+            raise TypeError(f"moe_int8_qmv takes an fp32 activation, got {x.dtype}")
+        (gate_w, gate_s), (up_w, up_s), (down_w, down_s) = self._stacks()
+        gate_out = self._qmv(x, expert_ids, gate_w, gate_s)
+        up_out = self._qmv(x, expert_ids, up_w, up_s)
+        return self._qmv(ops.silu(gate_out) * up_out, expert_ids, down_w, down_s)
 
     def select(self, expert_ids: TensorValue) -> tuple[TensorValue, TensorValue, TensorValue]:
         """The three stacks gathered at a runtime-valued ``[k]`` set of expert ids."""
@@ -260,6 +326,12 @@ class MoE(Module):
     run: on CPU through the hand-rolled gather that reuses the dense 64-term
     accumulation (bitwise equal to it), on an accelerator through MAX's grouped
     kernels (``native_decode``).
+
+    In int8 mode (``config.int8_experts``) the prefill chain dequantizes each
+    expert through ``int8_dequant_expert`` and the decode step runs
+    ``moe_int8_qmv`` on whichever device the module is built for -- the kernel
+    is device-agnostic; the port's GPU-only rule for int8 is enforced where the
+    graphs are built (:mod:`~unlimited_ocr_max.graphs`), not here.
     """
 
     def __init__(self, config: DecoderConfig, *, dtype: DType, device: DeviceRef) -> None:
@@ -268,11 +340,17 @@ class MoE(Module):
         self.num_experts_per_token = config.num_experts_per_tok
         self.hidden_dim = config.hidden_size
         self.native_decode = not device.is_cpu()
+        self.int8 = config.int8_experts
         self.gate = MoEGate(
             config.hidden_size, config.n_routed_experts, config.num_experts_per_tok, dtype=dtype, device=device
         )
         self.experts = StackedExperts(
-            config.n_routed_experts, config.hidden_size, config.moe_intermediate_size, dtype=dtype, device=device
+            config.n_routed_experts,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            dtype=dtype,
+            device=device,
+            int8=config.int8_experts,
         )
         self.shared_experts = GatedMlp(config.hidden_size, config.shared_experts_dim, dtype=dtype, device=device)
 
@@ -333,25 +411,43 @@ class MoE(Module):
         picks = ops.gather(outputs, slot_of_expert, axis=0)
         return self._accumulate(router, lambda j: picks[j : j + 1, :])
 
+    def _mix(self, x: TensorValue, weights: TensorValue, expert_out: TensorValue) -> TensorValue:
+        """The k per-slot expert outputs ``[seq * k, hidden]`` weighted by the ``[seq, k]`` router as one matmul."""
+        restored = expert_out.reshape((x.shape[0], self.num_experts_per_token, self.hidden_dim))
+        # Both casts are no-ops at fp32 and guard the mixed-dtype matmul against a bf16 router.
+        mixed = ops.unsqueeze(ops.cast(weights, restored.dtype), axis=1) @ restored
+        return ops.cast(ops.squeeze(mixed, axis=1), x.dtype)
+
     def _routed_native(self, x: TensorValue, indices: TensorValue, weights: TensorValue) -> TensorValue:
         """Top-k experts through ``moe_create_indices`` + ``grouped_matmul_ragged``; router weights as one matmul."""
-        seq = x.shape[0]
         k = self.num_experts_per_token
         token_expert_order, expert_start_indices, restore_token_order, expert_ids, expert_usage_stats = (
             moe_create_indices(ops.cast(ops.reshape(indices, [-1]), DType.int32), self.num_experts)
         )
         permuted = ops.gather(x, ops.cast(ops.floor_div(token_expert_order, k), DType.int32), axis=0)
         expert_out = self.experts.grouped(permuted, expert_start_indices, expert_ids, expert_usage_stats)
-        restored = ops.gather(expert_out, restore_token_order, axis=0).reshape((seq, k, self.hidden_dim))
-        # Both casts are no-ops at fp32 and guard the mixed-dtype matmul against a bf16 router.
-        mixed = ops.unsqueeze(ops.cast(weights, restored.dtype), axis=1) @ restored
-        return ops.cast(ops.squeeze(mixed, axis=1), x.dtype)
+        return self._mix(x, weights, ops.gather(expert_out, restore_token_order, axis=0))
+
+    def _routed_int8(self, x: TensorValue, indices: TensorValue, weights: TensorValue) -> TensorValue:
+        """Top-k experts through ``moe_int8_qmv`` on the whole int8 stacks; router weights as one matmul.
+
+        The token row is broadcast to ``[k, hidden]`` so slot ``s`` meets expert
+        ``indices[s]`` inside the kernel -- no permutation, no restore gather.
+        Three kernel calls per layer (gate, up, down) plus the same mixing ops
+        as :meth:`_routed_native`, which keeps the staged-op count level with it.
+        """
+        k = self.num_experts_per_token
+        expert_ids = ops.cast(ops.reshape(indices, [-1]), DType.int32)
+        rows = ops.broadcast_to(x, (k, self.hidden_dim))
+        return self._mix(x, weights, self.experts.qmv(rows, expert_ids))
 
     def __call__(self, x: TensorValue) -> TensorValue:
         indices, weights = self.gate(x)
         router = self.router_matrix(indices, weights)
         if x.shape[0] == 1:
-            if self.native_decode:
+            if self.int8:
+                routed = self._routed_int8(x, indices, weights)
+            elif self.native_decode:
                 routed = self._routed_native(x, indices, weights)
             else:
                 routed = self._routed_sparse(x, indices, router)
@@ -401,7 +497,11 @@ class DecoderLayer(Module):
 
 
 class UnlimitedOcrDecoder(Module):
-    """``embed_tokens`` / ``layers`` / ``norm`` / ``lm_head``; FQNs are the checkpoint keys minus ``model.``."""
+    """``embed_tokens`` / ``layers`` / ``norm`` / ``lm_head``; FQNs are the checkpoint keys minus ``model.``.
+
+    ``dtype`` is the storage dtype of every weight except, with
+    ``config.int8_experts``, the routed expert stacks (int8 plus fp32 scales).
+    """
 
     def __init__(self, config: DecoderConfig, *, dtype: DType = DType.bfloat16, device: DeviceRef | None = None) -> None:
         super().__init__()

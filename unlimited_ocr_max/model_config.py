@@ -4,13 +4,19 @@ The language fields are read from the top level (what the reference reads) and
 cross-checked against the duplicated ``language_config`` block. The vision and
 projector blocks are parsed only to refuse a checkpoint the hardcoded towers in
 ``layers/`` do not match.
+
+One field is not in ``config.json`` at all: :attr:`DecoderConfig.int8_experts`
+says which *weight file* the decoder is built for (the routed experts as int8
+stacks with per-group scales, or bf16). It is set from the checkpoint through
+:meth:`UnlimitedOCRConfig.with_int8_experts` once the adapter has looked at the
+expert tensors' dtypes.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +25,7 @@ from max.dtype import DType
 from .layers import clip_l, projector, sam_vit
 
 __all__ = [
+    "INT8_GROUP_SIZE",
     "ROPE_THETA",
     "ClipVisionConfig",
     "ConfigError",
@@ -36,6 +43,10 @@ class ConfigError(ValueError):
 
 #: Absent from ``config.json``; the reference's ``DeepseekV2Config`` default.
 ROPE_THETA = 10000.0
+
+#: The int8 checkpoint's quantization group, in weights along ``K``: an expert's
+#: ``[N, K]`` int8 weight carries fp32 scales ``[N, K / 128]``.
+INT8_GROUP_SIZE = 128
 
 #: Reference defaults for keys ``config.json`` leaves unset.
 _DECODER_DEFAULTS: dict[str, Any] = {
@@ -95,6 +106,11 @@ class DecoderConfig:
     rm_head: bool
     eos_token_id: int
 
+    #: Not a ``config.json`` key. ``True`` declares the routed experts as int8
+    #: ``[64, N, K]`` stacks next to fp32 ``[64, N, K / INT8_GROUP_SIZE]`` scales
+    #: and routes them through the Mojo kernels; ``False`` keeps the bf16 stacks.
+    int8_experts: bool = False
+
     def __post_init__(self) -> None:
         if self.use_mla:
             raise ConfigError("use_mla is True; only the plain-MHA path is implemented")
@@ -138,6 +154,10 @@ class DecoderConfig:
             raise ConfigError("lm_head is False; no output projection to map")
         if self.rm_head:
             raise ConfigError("rm_head is True; reward heads are not ported")
+        if self.int8_experts:
+            for name in ("hidden_size", "moe_intermediate_size"):
+                if getattr(self, name) % INT8_GROUP_SIZE:
+                    raise ConfigError(f"int8 experts need {name} divisible by the group size {INT8_GROUP_SIZE}")
 
     @property
     def head_dim(self) -> int:
@@ -259,10 +279,14 @@ class UnlimitedOCRConfig:
 
     @property
     def dtype(self) -> DType:
-        """The checkpoint storage dtype, ``bfloat16``."""
+        """The checkpoint storage dtype, ``bfloat16`` (an int8 file quantizes only the routed experts)."""
         if self.torch_dtype != "bfloat16":
             raise ConfigError(f"unexpected torch_dtype {self.torch_dtype!r}")
         return DType.bfloat16
+
+    def with_int8_experts(self, enabled: bool = True) -> UnlimitedOCRConfig:
+        """A copy built for the int8 (or, with ``False``, the bf16) expert weights."""
+        return replace(self, decoder=replace(self.decoder, int8_experts=enabled))
 
     @classmethod
     def from_json_file(cls, path: str | Path) -> UnlimitedOCRConfig:
