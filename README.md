@@ -50,7 +50,9 @@ this port's flags, on `http://127.0.0.1:8010` under the model id
   pins this). int8 reproduces bf16's transcribed **text byte-for-byte** on the
   port's twelve-page set; only grounding bounding-box coordinates differ, by one
   or two pixels. It cuts the served peak memory by ~2.5 GiB (16.7 → 14.2 GiB on
-  the M4 24 GB), which is what brings the model within reach of a 16 GB machine.
+  the M4 24 GB), which is what brings the model within reach of a 16 GB machine. It also
+  decodes about 1.8× faster (~37 vs ~21 tokens/second on that M4, greedy), because
+  the routed-expert decode is weight-bandwidth-bound and int8 halves the bytes read.
 * `--ngram-size` sets the no-repeat-n-gram guard, default 35; `0` switches it
   off, which reproduces the PyTorch reference byte for byte.
 
