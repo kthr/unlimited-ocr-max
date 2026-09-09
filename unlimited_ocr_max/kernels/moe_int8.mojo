@@ -48,8 +48,8 @@ struct MoeInt8Qmv:
     ) raises:
         comptime assert result.rank == 2, "moe_int8_qmv output is rank-2 [k, N]"
         comptime assert (
-            result.dtype.is_floating_point()
-        ), "moe_int8_qmv accumulates in floating point"
+            result.dtype == DType.float32
+        ), "moe_int8_qmv accumulates in float32 (the contract pins fp32)"
 
         if Int(x.dim_size(0)) != Int(result.dim_size(0)):
             raise Error("moe_int8_qmv: x and output disagree on k")
@@ -59,6 +59,8 @@ struct MoeInt8Qmv:
             raise Error("moe_int8_qmv: w and output disagree on N")
         if Int(w.dim_size(2)) != Int(x.dim_size(1)):
             raise Error("moe_int8_qmv: w and x disagree on K")
+        if Int(w.dim_size(0)) < 1:
+            raise Error("moe_int8_qmv: the expert stack is empty")
         if Int(scales.dim_size(0)) != Int(w.dim_size(0)):
             raise Error("moe_int8_qmv: scales and w disagree on E")
         if Int(scales.dim_size(1)) != Int(w.dim_size(1)):
@@ -125,6 +127,8 @@ struct Int8DequantExpert:
             raise Error("int8_dequant_expert: w and output disagree on N")
         if Int(w.dim_size(2)) != Int(result.dim_size(1)):
             raise Error("int8_dequant_expert: w and output disagree on K")
+        if Int(w.dim_size(0)) < 1:
+            raise Error("int8_dequant_expert: the expert stack is empty")
         if Int(scales.dim_size(0)) != Int(w.dim_size(0)):
             raise Error("int8_dequant_expert: scales and w disagree on E")
         if Int(scales.dim_size(1)) != Int(w.dim_size(1)):

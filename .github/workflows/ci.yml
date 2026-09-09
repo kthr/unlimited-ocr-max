@@ -70,7 +70,8 @@ jobs:
           listing="$(unzip -l "$wheel")"
           echo "$listing"
           for f in unlimited_ocr_max/kernels/__init__.mojo \
-                   unlimited_ocr_max/kernels/ngram_block.mojo; do
+                   unlimited_ocr_max/kernels/ngram_block.mojo \
+                   unlimited_ocr_max/kernels/moe_int8.mojo; do
             grep -qE "[[:space:]]${f}$" <<<"$listing" \
               || { echo "::error file=pyproject.toml::${f} is missing from ${wheel}"; exit 1; }
           done

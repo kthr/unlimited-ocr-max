@@ -375,3 +375,28 @@ def test_real_shape_smoke(n: int, kdim: int) -> None:
     del dequant_model
     assert np.array_equal(got, _dequant_ref_bits(w, scales, e))
     print(f"[uocr] real-shape dequant [{num_experts},{n},{kdim}]: bit-exact")
+
+
+def test_qmv_rejects_a_group_miscount() -> None:
+    """The host-side shape raises are load-bearing: K not divisible by the group
+    count must refuse loudly instead of reading garbage group boundaries."""
+    with pytest.raises(Exception, match=r"moe_int8_qmv: K must be a multiple of the group count"):
+        model = _load_qmv(k=2, e=3, n=4, kdim=32, groups=5)
+        _execute(
+            model,
+            np.zeros((2, 32), dtype=np.float32),
+            np.zeros(2, dtype=np.int32),
+            np.zeros((3, 4, 32), dtype=np.int8),
+            np.zeros((3, 4, 5), dtype=np.float32),
+        )
+
+
+def test_dequant_rejects_a_group_miscount() -> None:
+    with pytest.raises(Exception, match=r"int8_dequant_expert: K must be a multiple of the group count"):
+        model = _load_dequant(e=3, n=4, kdim=32, groups=5)
+        _execute(
+            model,
+            np.zeros((3, 4, 32), dtype=np.int8),
+            np.zeros((3, 4, 5), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+        )

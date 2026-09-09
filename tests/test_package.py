@@ -48,6 +48,7 @@ def test_mojo_kernel_ships_with_the_package() -> None:
     kernels = cli.PACKAGE_DIR / "kernels"
     assert (kernels / "__init__.mojo").is_file()
     assert (kernels / "ngram_block.mojo").is_file()
+    assert (kernels / "moe_int8.mojo").is_file()
 
 
 TAIL = [
