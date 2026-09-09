@@ -24,10 +24,12 @@ from max.pipelines.lib.interfaces.pipeline_model import ModelInputs, ModelOutput
 
 from .batch_processor import BASE_SIZE, UnlimitedOcrBatchProcessor, ViewGeometry, request_key
 from .decoder import COMPUTE_DTYPE
+from .graphs import check_int8_device
 from .kv_cache import KvCache
 from .model_config import DecoderConfig, UnlimitedOCRConfig
 from .ngram import DEFAULT_NGRAM_SIZE
 from .pipeline import UnlimitedOcrPipeline
+from .weight_adapters import is_int8_checkpoint
 
 __all__ = [
     "NGRAM_SIZE_ENV",
@@ -170,7 +172,12 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         geometry = ViewGeometry(self._image_size())
         if self.adapter is None:
             raise ValueError("UnlimitedOCRModel needs the safetensors weight adapter registered in arch.py")
-        renamed = self.adapter(dict(self.weights.items()), config=self._arch_config.model, image_size=geometry.image_size)
+        weights = dict(self.weights.items())
+        if self._weights_are_int8(weights):
+            # The decoder the adapter checks the file against must declare the int8 stacks and their scales.
+            self._arch_config.model = self._arch_config.model.with_int8_experts()
+            check_int8_device(self._arch_config.decoder, self.device_refs[0])
+        renamed = self.adapter(weights, config=self._arch_config.model, image_size=geometry.image_size)
         prompt_len = self._prompt_len(geometry)
         self._pipeline = UnlimitedOcrPipeline(
             self._arch_config.model,
@@ -187,6 +194,16 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
             ngram_window=self._arch_config.decoder.sliding_window_size,
         )
         self._served: dict[str, ServedRequest] = {}
+
+    @staticmethod
+    def _weights_are_int8(weights: dict[str, Any]) -> bool:
+        """Whether the checkpoint's routed experts are int8, read off the expert tensors' dtypes.
+
+        Only the expert entries are materialised (mmap-backed ``WeightData``,
+        cached inside each ``Weights`` so the adapter's own read reuses it).
+        """
+        experts = {name: source.data() for name, source in weights.items() if ".mlp.experts." in name}
+        return is_int8_checkpoint(experts)
 
     def _image_size(self) -> int:
         resolutions = getattr(self.huggingface_config, "candidate_resolutions", None)

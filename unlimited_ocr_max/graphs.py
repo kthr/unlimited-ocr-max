@@ -4,11 +4,19 @@ Every builder expects ``load_state_dict`` to have been called on its module
 first (MAX assigns weight FQNs while walking the tree, and doing that with a
 graph open raises), and a ``Weight`` binds to the first graph it is added to,
 so each graph needs a fresh module instance.
+
+An int8 decoder (``config.decoder.int8_experts``) stages ``ops.custom`` calls
+into ``kernels/moe_int8.mojo``, so both language graphs are then opened with
+``custom_extensions=[MOJO_KERNELS]``; a bf16 decoder's graphs are opened exactly
+as before. int8 is accelerator-only in this port and both builders refuse a CPU
+``DeviceRef`` (the CLI refuses ``--weights int8`` on cpu first; this is the
+second line).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from max.dtype import DType
 from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
@@ -25,7 +33,8 @@ from .layers.projector import (
     image_token_count,
 )
 from .layers.sam_vit import IN_CHANS, SamViT
-from .model_config import UnlimitedOCRConfig
+from .model_config import DecoderConfig, UnlimitedOCRConfig
+from .ngram import MOJO_KERNELS
 
 __all__ = [
     "IMAGE_TOKEN_ID",
@@ -39,7 +48,23 @@ __all__ = [
     "build_language_graph",
     "build_layout_graph",
     "build_vision_graph",
+    "check_int8_device",
 ]
+
+
+def check_int8_device(config: DecoderConfig, device: DeviceRef) -> None:
+    """Refuse int8 experts on CPU: the port ships that path for accelerators only."""
+    if config.int8_experts and device.is_cpu():
+        raise ValueError(
+            "the int8 expert weights are GPU-only in this port; serve the bf16 weights on cpu "
+            "(or pick an accelerator device for int8)"
+        )
+
+
+def _language_graph_kwargs(decoder: UnlimitedOcrDecoder, device: DeviceRef) -> dict[str, Any]:
+    """Extra ``Graph(...)`` arguments for the decoder's mode: the Mojo kernels for int8, nothing for bf16."""
+    check_int8_device(decoder.config, device)
+    return {"custom_extensions": [MOJO_KERNELS]} if decoder.config.int8_experts else {}
 
 #: The placeholder token the image embeddings are spliced into.
 IMAGE_TOKEN_ID = 128815
@@ -220,7 +245,9 @@ def build_language_graph(
         TensorType(DType.int64, [seq_len], device=device),
         TensorType(COMPUTE_DTYPE, [n_image_tokens, hidden], device=device),
     ]
-    with Graph(f"unlimited_ocr_language_tokens_{seq_len}", input_types=input_types) as graph:
+    with Graph(
+        f"unlimited_ocr_language_tokens_{seq_len}", input_types=input_types, **_language_graph_kwargs(decoder, device)
+    ) as graph:
         token_ids = graph.inputs[0].tensor
         image_embeds = graph.inputs[1].tensor
         input_embeds = splice_image_embeddings(decoder.embed(token_ids), token_ids, image_embeds)
@@ -263,7 +290,9 @@ def build_decode_graph(
         TensorType(DType.bool, [1, "past_len", 1], device=device),
         *([cache_type] * (2 * num_layers)),
     ]
-    with Graph(f"unlimited_ocr_decode_{max_seq_len}_ring", input_types=input_types) as graph:
+    with Graph(
+        f"unlimited_ocr_decode_{max_seq_len}_ring", input_types=input_types, **_language_graph_kwargs(decoder, device)
+    ) as graph:
         token_id = graph.inputs[0].tensor
         position = graph.inputs[1].tensor
         write_sel = graph.inputs[2].tensor
