@@ -67,7 +67,7 @@ def test_serve_command_for_a_hub_model() -> None:
     cmd = cli.serve_command(max_exe="/venv/bin/max", model=model, weight_path=weight_path, devices="gpu", port=8010, revision=revision)
     assert cmd == [
         "/venv/bin/max", "serve", "--model", "kthierbach/unlimited-ocr-max",
-        "--huggingface-model-revision", "v0.1.0", "--huggingface-weight-revision", "v0.1.0",
+        "--huggingface-model-revision", cli.DEFAULT_REVISION, "--huggingface-weight-revision", cli.DEFAULT_REVISION,
         "--weight-path", "kthierbach/unlimited-ocr-max/model.safetensors",
         *TAIL,
     ]

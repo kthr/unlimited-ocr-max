@@ -32,17 +32,25 @@ This downloads the model repository once (6.2 GiB) and runs `max serve` with
 this port's flags, on `http://127.0.0.1:8010` under the model id
 `unlimited-ocr-max`.
 
-* `--revision` defaults to `v0.1.0`, the model-repo tag this package version was
+* `--revision` defaults to `v0.2.0`, the model-repo tag this package version was
   validated against, so a fixed package version serves fixed weights; the tag
   must exist or the download fails before MAX starts. Ignored for a local
   directory.
 * `--model <dir>` serves a local copy with the repository's layout
   (`config.json`, the tokenizer files, `model.safetensors`).
-* `--weights bf16` (the only variant today) selects the unquantised
-  `model.safetensors` and passes it as `max serve --weight-path`; future
-  quantised variants are `model-<variant>.safetensors`. The unquantised file has
-  no encoding token in its name because MAX reads hints such as `bf16` out of
-  weight filenames and would refuse the CPU path.
+* `--weights bf16` (default) selects the unquantised `model.safetensors`; it
+  serves on `--devices cpu` or `gpu`. `--weights int8` selects
+  `model-int8.safetensors`, a symmetric per-group int8 quantisation of the 64
+  routed experts (group size 128, along the input dimension; every other tensor
+  stays bf16), and is **GPU only** — the dequantise-and-matmul runs in a Mojo
+  custom op (`moe_int8`), since MAX's own int8 matmul is gated to a later Apple
+  GPU. The chosen file is passed as `max serve --weight-path`; neither name
+  carries an encoding token, because MAX reads hints such as `bf16` out of weight
+  filenames and would refuse the CPU path or mislabel the GPU one (a package test
+  pins this). int8 reproduces bf16's transcribed **text byte-for-byte** on the
+  port's twelve-page set; only grounding bounding-box coordinates differ, by one
+  or two pixels. It cuts the served peak memory by ~2.5 GiB (16.7 → 14.2 GiB on
+  the M4 24 GB), which is what brings the model within reach of a 16 GB machine.
 * `--ngram-size` sets the no-repeat-n-gram guard, default 35; `0` switches it
   off, which reproduces the PyTorch reference byte for byte.
 

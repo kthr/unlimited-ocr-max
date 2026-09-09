@@ -13,7 +13,7 @@ from pathlib import Path
 
 DEFAULT_MODEL = "kthierbach/unlimited-ocr-max"
 #: The model-repo tag this package version was validated against; ignored for a local ``--model``.
-DEFAULT_REVISION = "v0.1.0"
+DEFAULT_REVISION = "v0.2.0"
 WEIGHT_VARIANTS = ("bf16", "int8")
 PACKAGE_DIR = Path(__file__).resolve().parent
 SERVED_MODEL_NAME = "unlimited-ocr-max"
