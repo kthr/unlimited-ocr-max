@@ -110,15 +110,27 @@ def test_stacking_rejects_a_short_scales_stack() -> None:
         stack_expert_weights(state, num_experts=EXPERTS)
 
 
-def test_an_unknown_weight_suffix_is_never_half_matched() -> None:
+@pytest.mark.parametrize(
+    "name",
+    [
+        "layers.1.mlp.experts.0.up_proj.weight_zeros",
+        "layers.1.mlp.experts.0.up_proj.weight_scale_inv",
+        "layers.1.mlp.experts.0.up_proj.weight_scales2",
+        "layers.1.mlp.experts.0.up_proj.weight_SCALES",
+        "layers.1.self_attn.q_proj.weight_scales",
+    ],
+)
+def test_an_unknown_weight_suffix_is_never_half_matched(name: str) -> None:
     """``weight_scales`` is a suffix of its own, so a look-alike passes through untouched."""
     state = renamed(bf16_checkpoint())
-    state["layers.1.mlp.experts.0.up_proj.weight_zeros"] = torch.zeros(N, GROUPS)
+    state[name] = torch.zeros(N, GROUPS)
     state["layers.1.mlp.shared_experts.up_proj.weight"] = torch.zeros(N, K)
     out = stack_expert_weights(state, num_experts=EXPERTS)
-    assert "layers.1.mlp.experts.0.up_proj.weight_zeros" in out
+    assert name in out
     assert "layers.1.mlp.shared_experts.up_proj.weight" in out
-    assert "layers.1.mlp.experts.up_proj_zeros" not in out
+    assert not any(
+        key.startswith("layers.1.mlp.experts.up_proj_") for key in out
+    ), "a look-alike must never be stacked"
 
 
 # --- detection ----------------------------------------------------------------
@@ -220,3 +232,16 @@ def test_declared_weights_still_check_names_and_shapes() -> None:
     wrong_shape = {"layers.1.mlp.experts.gate_proj": torch.zeros((EXPERTS, N, GROUPS), dtype=torch.bfloat16)}
     with pytest.raises(WeightMappingError, match="checkpoint shape"):
         check_against_declared(wrong_shape, _declared(DType.bfloat16))
+
+
+def test_language_state_dict_rejects_a_half_quantized_file_at_the_detector() -> None:
+    """The detector is wired into ``language_state_dict`` before anything needs the config,
+    so a half-quantized file fails with the message that names the offending tensors
+    rather than the downstream "language weights disagree" one."""
+    from unlimited_ocr_max.weight_adapters import language_state_dict
+
+    checkpoint = bf16_checkpoint()
+    stem = "model.layers.1.mlp.experts.0.gate_proj"
+    checkpoint[f"{stem}.weight"] = _expert_weight(0, torch.int8)  # int8 weight, no scales
+    with pytest.raises(WeightMappingError, match="weight_scales"):
+        language_state_dict(checkpoint, config=None)  # type: ignore[arg-type]  # never reached

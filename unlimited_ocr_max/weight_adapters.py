@@ -100,7 +100,7 @@ def _dtype_name(tensor: Any) -> str:
 
 
 def load_checkpoint(path: str | Path) -> dict[str, Any]:
-    """Every tensor of a safetensors shard as bfloat16 torch tensors (numpy has no bf16)."""
+    """Every tensor of a safetensors shard as torch tensors, in the dtype the file stores (numpy has no bf16)."""
     from safetensors import safe_open
 
     with safe_open(str(path), framework="pt") as handle:
