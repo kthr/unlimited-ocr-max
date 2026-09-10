@@ -1,6 +1,6 @@
 [project]
 name = "unlimited-ocr-max"
-version = "0.2.0"
+version = "0.2.1"
 description = "baidu/Unlimited-OCR as a MAX custom architecture with a Mojo custom op, served on Apple Silicon (Metal or CPU)"
 readme = "README.md"
 license = "MIT"

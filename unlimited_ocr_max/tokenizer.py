@@ -192,17 +192,48 @@ class UnlimitedOcrProcessor:
         }
 
 
-def load_delegate(model_path: str | Path, *, max_length: int | None = None) -> Any:
-    """``PreTrainedTokenizerFast`` over ``tokenizer.json``, with the special tokens from ``tokenizer_config.json``."""
+def _resolve_tokenizer_files(model_path: str | Path, revision: str | None) -> tuple[Path, Path | None]:
+    """``(tokenizer.json, tokenizer_config.json | None)`` as local paths.
+
+    A local directory serves its own files; a Hub repo id downloads them from
+    ``revision``. MAX fetches ``config.json`` and the weights itself but hands the
+    architecture the bare repo id, so the tokenizer must resolve its own files --
+    a local-only filesystem check turns the repo id into a bogus relative path.
+    """
     path = Path(model_path)
-    tokenizer_file = path / "tokenizer.json"
-    if not tokenizer_file.is_file():
-        raise FileNotFoundError(f"{tokenizer_file} is required; there is no safe AutoTokenizer fallback")
+    if path.is_dir():
+        tokenizer_file = path / "tokenizer.json"
+        if not tokenizer_file.is_file():
+            raise FileNotFoundError(f"{tokenizer_file} is required; there is no safe AutoTokenizer fallback")
+        config_path = path / "tokenizer_config.json"
+        return tokenizer_file, (config_path if config_path.is_file() else None)
+
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    repo_id = str(model_path)
+    try:
+        tokenizer_file = Path(hf_hub_download(repo_id, "tokenizer.json", revision=revision))
+    except EntryNotFoundError as exc:
+        raise FileNotFoundError(
+            f"{repo_id} (revision {revision}) has no tokenizer.json; there is no safe AutoTokenizer fallback"
+        ) from exc
+    try:
+        config_file: Path | None = Path(hf_hub_download(repo_id, "tokenizer_config.json", revision=revision))
+    except EntryNotFoundError:
+        config_file = None
+    return tokenizer_file, config_file
+
+
+def load_delegate(model_path: str | Path, *, revision: str | None = None, max_length: int | None = None) -> Any:
+    """``PreTrainedTokenizerFast`` over ``tokenizer.json``, with the special tokens from ``tokenizer_config.json``.
+
+    ``model_path`` is a local directory or a Hub repo id (downloaded from ``revision``)."""
+    tokenizer_file, config_file = _resolve_tokenizer_files(model_path, revision)
     from transformers import PreTrainedTokenizerFast
 
     settings: dict[str, Any] = {}
-    config_file = path / "tokenizer_config.json"
-    if config_file.is_file():
+    if config_file is not None:
         raw = json.loads(config_file.read_text())
         for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
             value = raw.get(key)
@@ -255,9 +286,9 @@ class UnlimitedOcrTokenizer(TextAndVisionTokenizer):
         trust_remote_code: bool = False,
         **unused_kwargs: Any,
     ) -> None:
-        del revision, trust_remote_code
+        del trust_remote_code
         self.model_path = model_path
-        self.delegate = load_delegate(model_path, max_length=max_length)
+        self.delegate = load_delegate(model_path, revision=revision, max_length=max_length)
         self.max_length = max_length or self.delegate.model_max_length
 
         config = pipeline_config.model.huggingface_config

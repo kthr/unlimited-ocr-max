@@ -13,13 +13,15 @@ Metal GPU or the CPU. The weights are baidu's, unchanged, served from
 ```bash
 uv tool install --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
 # or, into a venv
-pip install --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
+pip install --pre --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
 ```
 
 The extra index is required: the package pins one exact MAX nightly build
 (`max[all]==26.6.0.dev2026082707`) because the port depends on fixes no stable
 MAX release carries yet, and that build is published only on Modular's nightly
-index. The pin and the flag go away with the next stable Modular release.
+index. The pin and the flag go away with the next stable Modular release. `--pre`
+is needed with `pip` (not `uv`) so it will select the pre-release `mojo` that
+build depends on; `uv` selects it automatically.
 
 ## Serve
 
