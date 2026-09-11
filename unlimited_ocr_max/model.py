@@ -244,9 +244,15 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         return ModelOutputs(next_token_logits=buffer, logits=buffer)
 
     def _prefill(self, request_id: str, model_inputs: UnlimitedOcrInputs, tokens: np.ndarray) -> np.ndarray:
-        """Vision tower, then the static-length prefill graph; one language graph at a time on an accelerator."""
+        """Vision tower, then the static-length prefill graph; one language graph at a time on an accelerator.
+
+        The policy is the pipeline's named ``releases_language_graphs``
+        predicate, and the decode release comes **unconditionally first**: no
+        failure path can reach the prefill load with the previous request's
+        decode graph still resident.
+        """
         assert model_inputs.pixel_values is not None
-        transient = self._pipeline.on_accelerator
+        transient = self._pipeline.releases_language_graphs
         if transient:
             self._pipeline.release_decode()
         pixels = model_inputs.pixel_values[0].to(CPU()).to_numpy()
