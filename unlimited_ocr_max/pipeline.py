@@ -4,7 +4,8 @@ Graphs are compiled lazily. On an accelerator the pipeline holds one language
 graph at a time (prefill is released once its host outputs are back, the decode
 graph before the next prefill -- :attr:`UnlimitedOcrPipeline.releases_language_graphs`),
 binds both language graphs to ONE shared device copy of the language weights
-(:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT`), and keeps the KV cache
+(:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT` -- **bf16 only**; the int8 variant
+serves unshared, KON-162), and keeps the KV cache
 device-resident; on CPU every graph stays resident and the cache is host numpy.
 ``base`` mode is one 1024px view; a tiled
 :class:`~unlimited_ocr_max.batch_processor.CropLayout`
@@ -56,6 +57,26 @@ __all__ = ["SHARE_LANGUAGE_WEIGHTS_DEFAULT", "PrefillResult", "UnlimitedOcrPipel
 #: deliberately separate (holding both graphs measured over the Metal budget even
 #: with sharing on). Accelerator-only via
 #: :attr:`UnlimitedOcrPipeline.shares_language_weights`; CPU is untouched.
+#:
+#: **bf16 only (KON-162 / KON-161 round 2).** The served int8 identity gate at
+#: the commit that shipped this default read **0/12 in both request orders**
+#: against the pinned KON-149 transcripts -- deterministic byte-for-byte across
+#: three server processes, two pages coordinate-drift-only, ten gross, one
+#: deterministic empty response -- while every in-process value-level A/B of the
+#: mechanism is bitwise green for BOTH variants: the bare MoE layer at the
+#: production stack shapes, the real-weight decode graph at the served shape
+#: (129280 logits, bit-equal), the served prefill -> release -> decode sequence,
+#: and full real pages generated to EOS (toc_dotted 646/646 tokens,
+#: byte-identical to the pinned transcript under both flag settings; the
+#: registry buffers themselves round-trip sha-clean at ~3 GiB). The served
+#: divergence is therefore not attributable to the graphs or the registry at
+#: the value level and remains unlocalised above the pipeline, so the int8
+#: variant serves **unshared** -- the pinned-transcript configuration -- until a
+#: served gate clears it: :attr:`UnlimitedOcrPipeline.shares_language_weights`
+#: is also ``and not int8_experts``. What int8 gives back is the per-request
+#: decode-reload saving only (its reload population was already 3.1-6.5 s
+#: pre-registry, against bf16's 8.4 s), and it sheds the registry's +4-6 %
+#: steady decode-step cost with it.
 SHARE_LANGUAGE_WEIGHTS_DEFAULT = True
 
 
@@ -108,7 +129,8 @@ class UnlimitedOcrPipeline:
         #: time). An attribute rather than a property so a probe can set it
         #: either way against the shipped default;
         #: :attr:`shares_language_weights` is the conjunction with
-        #: :attr:`on_accelerator` and is the only thing the graph loaders read.
+        #: :attr:`on_accelerator` and ``not int8_experts`` (KON-162) and is the
+        #: only thing the graph loaders read.
         self._share_language_weights = SHARE_LANGUAGE_WEIGHTS_DEFAULT
         #: The shared device registry, built once by
         #: :meth:`_resolved_language_weights` and never dropped: both language
@@ -134,13 +156,20 @@ class UnlimitedOcrPipeline:
         """Whether both language graphs bind ONE device registry of the language weights.
 
         :attr:`_share_language_weights` (:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT`,
-        **on**) gated by :attr:`on_accelerator` -- the one place that conjunction
-        is spelled. **False on CPU**, whatever the attribute says: there is no
-        device budget to fit into, a host array *is* the graph's memory so there
-        is no duplicate copy to remove, and the numerically gated path stays
-        byte-identical by construction.
+        **on**) gated by :attr:`on_accelerator` and by the weight variant -- the
+        one place that conjunction is spelled. **False on CPU**, whatever the
+        attribute says: there is no device budget to fit into, a host array *is*
+        the graph's memory so there is no duplicate copy to remove, and the
+        numerically gated path stays byte-identical by construction. **False in
+        int8 mode** (KON-162): the served int8 identity gate falsified the
+        registry commit at 0/12 in both request orders while every in-process
+        value-level A/B of the mechanism -- up to full real pages byte-identical
+        to the pinned transcripts under both flag settings -- is green, so int8
+        serves in the pinned-transcript configuration (per-graph placement)
+        until a served gate clears the shared registry for it. The full record
+        is on :data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT`.
         """
-        return self._share_language_weights and self.on_accelerator
+        return self._share_language_weights and self.on_accelerator and not self.config.decoder.int8_experts
 
     @property
     def releases_language_graphs(self) -> bool:
