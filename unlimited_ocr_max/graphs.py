@@ -49,6 +49,7 @@ __all__ = [
     "build_layout_graph",
     "build_vision_graph",
     "check_int8_device",
+    "declare_device_resident_weights",
 ]
 
 
@@ -65,6 +66,37 @@ def _language_graph_kwargs(decoder: UnlimitedOcrDecoder, device: DeviceRef) -> d
     """Extra ``Graph(...)`` arguments for the decoder's mode: the Mojo kernels for int8, nothing for bf16."""
     check_int8_device(decoder.config, device)
     return {"custom_extensions": [MOJO_KERNELS]} if decoder.config.int8_experts else {}
+
+
+def declare_device_resident_weights(graph: Graph, decoder: UnlimitedOcrDecoder) -> int:
+    """Declare every language weight as *already resident* on the graph's device.
+
+    Called as the first statement inside a language graph's ``with Graph(...)``
+    block, before any op reads a weight. Returns how many it declared.
+
+    **Why it has to be explicit.** A :class:`~max.graph.Weight` used by an op
+    adds itself lazily with ``force_initial_weight_on_host=not weight._has_alias``,
+    so the only lever the implicit path offers is ``_has_alias`` -- and that
+    attribute does not compile on Metal in tractable time (KON-100: >10-21 min
+    against 0.9 s). Pre-adding is the same placement without the attribute:
+    ``Graph.add_weight`` caches by name and by identity, so every later
+    implicit use -- ``matmul`` operands and the int8 stacks consumed whole by
+    ``ops.custom`` alike -- returns the value declared here.
+
+    **What it changes in the emitted graph**, on an accelerator: each weight's
+    ``mo.constant.external`` is declared on the *device* instead of on the host
+    followed by a transfer, so the per-graph ``rmo.mo.transfer`` ops for the
+    weights disappear. The declaration set itself is unchanged. The registry
+    values ``session.load`` binds must then be device-resident
+    (:meth:`~unlimited_ocr_max.pipeline.UnlimitedOcrPipeline._resolved_language_weights`
+    builds them), which is what lets both language graphs share **one** device
+    copy of the weights instead of materialising one each (KON-113/KON-158).
+    On CPU the weight's device *is* the host, so this is never called there.
+    """
+    weights = decoder.raw_state_dict()
+    for weight in weights.values():
+        graph.add_weight(weight, force_initial_weight_on_host=False)
+    return len(weights)
 
 #: The placeholder token the image embeddings are spliced into.
 IMAGE_TOKEN_ID = 128815
@@ -233,12 +265,19 @@ def build_language_graph(
     seq_len: int,
     n_image_tokens: int,
     device: DeviceRef,
+    device_resident_weights: bool = False,
 ) -> LanguageGraph:
     """The prefill graph: ``(token_ids [seq_len], image_embeds [n_image_tokens, hidden])`` at a static ``seq_len``.
 
     Outputs ``logits`` (last row), ``final_norm``, ``input_embeds``, then every
     layer's post-RoPE ``key_<i>`` / ``value_<i>`` in the cache's sequence-major
     layout, which is what seeds the KV cache.
+
+    ``device_resident_weights`` declares every decoder weight as already
+    resident on ``device`` (:func:`declare_device_resident_weights`); the
+    caller is :attr:`~unlimited_ocr_max.pipeline.UnlimitedOcrPipeline.shares_language_weights`,
+    and the registry it loads with must then hold device buffers.
+    Accelerator-only; the parameter itself defaults off.
     """
     hidden = config.decoder.hidden_size
     input_types = [
@@ -248,6 +287,8 @@ def build_language_graph(
     with Graph(
         f"unlimited_ocr_language_tokens_{seq_len}", input_types=input_types, **_language_graph_kwargs(decoder, device)
     ) as graph:
+        if device_resident_weights:
+            declare_device_resident_weights(graph, decoder)
         token_ids = graph.inputs[0].tensor
         image_embeds = graph.inputs[1].tensor
         input_embeds = splice_image_embeddings(decoder.embed(token_ids), token_ids, image_embeds)
@@ -274,12 +315,14 @@ def build_decode_graph(
     *,
     max_seq_len: int,
     device: DeviceRef,
+    device_resident_weights: bool = False,
 ) -> DecodeGraph:
     """The one-token step: ``(token_id, position, write_sel, key_cache_0..n, value_cache_0..n) -> (logits, key_*, value_*)``.
 
     The cache dimension ``past_len`` is symbolic; ``max_seq_len`` only sizes the
     RoPE table. The MoE dispatch at ``seq == 1`` follows the device (see
-    :class:`~unlimited_ocr_max.decoder.MoE`).
+    :class:`~unlimited_ocr_max.decoder.MoE`). ``device_resident_weights`` is
+    :func:`build_language_graph`'s parameter of the same name, same contract.
     """
     dec = config.decoder
     num_layers = dec.num_hidden_layers
@@ -293,6 +336,8 @@ def build_decode_graph(
     with Graph(
         f"unlimited_ocr_decode_{max_seq_len}_ring", input_types=input_types, **_language_graph_kwargs(decoder, device)
     ) as graph:
+        if device_resident_weights:
+            declare_device_resident_weights(graph, decoder)
         token_id = graph.inputs[0].tensor
         position = graph.inputs[1].tensor
         write_sel = graph.inputs[2].tensor

@@ -237,6 +237,32 @@ def test_both_language_graphs_build_in_int8_mode() -> None:
         assert "layers.1.mlp.experts.gate_proj_scales" in text
 
 
+def test_both_language_graphs_build_in_int8_mode_with_device_resident_weights() -> None:
+    """KON-161: pre-adding the weights device-side intercepts the int8 stacks' implicit add path too.
+
+    The stacks and their scales reach ``ops.custom`` whole through the same
+    ``Graph.add_weight`` cache the matmul weights use, so the declaration flips
+    their placement without changing what the graphs stage: the same kernel
+    calls, the same scales names, no native-MoE ops.
+    """
+    config = _config(int8=True, num_hidden_layers=3)  # layer 0 dense, layers 1-2 MoE
+    dref = DeviceRef.GPU(0)
+    dec = config.decoder
+    n_moe = dec.num_hidden_layers - dec.first_k_dense_replace
+
+    for build, kwargs, want_custom in (
+        (build_decode_graph, {"max_seq_len": 64}, 3 * n_moe),
+        (build_language_graph, {"seq_len": 5, "n_image_tokens": 2}, 3 * dec.n_routed_experts * n_moe),
+    ):
+        decoder = _named(UnlimitedOcrDecoder(dec, dtype=config.dtype, device=dref))
+        text = str(build(config, decoder, device=dref, device_resident_weights=True, **kwargs).graph)
+        counts = _op_counts(text)
+        assert counts["mo.custom"] == want_custom
+        assert "moe_int8_qmv" in text or "int8_dequant_expert" in text
+        assert "mo.grouped.matmul.ragged" not in text and "mo.moe.create.indices" not in text
+        assert "layers.1.mlp.experts.gate_proj_scales" in text
+
+
 def test_int8_on_cpu_is_refused_at_graph_construction() -> None:
     config = _config(int8=True)
     cpu = DeviceRef.CPU()
