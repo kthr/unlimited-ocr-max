@@ -62,7 +62,7 @@ On the GPU the server holds one language graph at a time — the vision tower,
 the prefill graph and the decode graph together do not fit the Metal budget —
 so every request reloads a graph. With `--weights bf16` the language weights
 are bound as **one shared device registry** that both graphs declare
-device-side, which takes that per-request decode reload from ~3 s to **~1.5 s**
+device-side, which takes that per-request decode reload from ~10.5 s to **~1.5 s**
 and the time to first token from ~8.5 s to ~5.3 s. It is not free: holding the
 registry through decode costs about **+9 %** on the steady decode step, and the
 net is still **−7 to −15 s per page** on every page measured. `--weights int8`
