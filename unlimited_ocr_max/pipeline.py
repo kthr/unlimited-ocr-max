@@ -247,10 +247,21 @@ class UnlimitedOcrPipeline:
         once (measured 17.83 GiB host peak in the research port, two clamped
         arms), so each host entry is popped as its buffer is made. This method
         therefore **takes ownership** of the language state dict on an
-        accelerator: after it runs, that mapping is empty and gone. The
-        ``synchronize`` closes the async copies before the sources can be
-        collected -- the failure otherwise is silent wrong bytes, once per
-        process is not a term worth saving.
+        accelerator: after it runs, that mapping is empty and gone.
+
+        **What the ``synchronize`` actually covers -- stated precisely, because
+        an overclaim here reads as a safety argument.** ``.to(device)`` is an
+        async copy and a host-backed source must outlive the *copy*, not the
+        call (KON-125). This drain runs **after** the loop, so the only entry
+        whose source it strictly orders is the **last** one; every earlier
+        source was already dropped inside the loop. It is kept as
+        belt-and-braces -- one drain per process is not a term worth saving --
+        and not as the thing that makes the loop safe. What says the bytes are
+        right is value-level evidence: KON-161 round 2 byte-compared this
+        shipped conversion at production expert-stack shapes and decoded real
+        pages to EOS byte-identically with the registry on and off. Strict
+        per-entry ordering would need a drain inside the loop; nothing has
+        measured a need for one.
         """
         if not self.shares_language_weights:
             return self._resolved_language_state_dict()
@@ -491,10 +502,10 @@ class UnlimitedOcrPipeline:
     def generate(self, *, pixels: np.ndarray, token_ids: np.ndarray, local_pixels: np.ndarray | None = None) -> list[int]:
         """Greedy decode to EOS (included) or ``max_new_tokens``; the n-gram guard, if on, is applied to every step."""
         stages = self.run_vision(pixels, local_pixels)
-        if self.on_accelerator:
+        if self.releases_language_graphs:
             self.release_vision()
         prefill = self.run_prefill(token_ids, stages["image_embeds"])
-        if self.on_accelerator:
+        if self.releases_language_graphs:
             self.release_prefill()
 
         eos = self.config.decoder.eos_token_id

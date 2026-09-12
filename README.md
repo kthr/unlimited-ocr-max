@@ -58,6 +58,22 @@ this port's flags, on `http://127.0.0.1:8010` under the model id
 * `--ngram-size` sets the no-repeat-n-gram guard, default 35; `0` switches it
   off, which reproduces the PyTorch reference byte for byte.
 
+On the GPU the server holds one language graph at a time — the vision tower,
+the prefill graph and the decode graph together do not fit the Metal budget —
+so every request reloads a graph. With `--weights bf16` the language weights
+are bound as **one shared device registry** that both graphs declare
+device-side, which takes that per-request decode reload from ~3 s to **~1.5 s**
+and the time to first token from ~8.5 s to ~5.3 s. It is not free: holding the
+registry through decode costs about **+9 %** on the steady decode step, and the
+net is still **−7 to −15 s per page** on every page measured. `--weights int8`
+deliberately does **not** share: the same registry commit was falsified by the
+served identity gate on int8 (0 of 12 pages byte-identical in both request
+orders, including one page that returned an empty response), while a flag-off
+control on the same machine and harness served 12 of 12 — so int8 serves in the
+per-graph configuration its published transcripts were taken in, and reloads in
+the ~3 s class. Both variants reproduce their pinned transcripts byte for byte
+as shipped.
+
 One page per request, `base` mode, image first:
 
 ```bash
