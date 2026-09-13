@@ -47,5 +47,5 @@ for a human approval instead of going out on any tag push.
 
 Being on PyPI does not remove `--extra-index-url
 https://whl.modular.com/nightly/simple/` from the install instructions: the
-pinned `max[all]==26.6.0.dev2026082707` is published on that index only, until
+pinned `max[all]==26.6.0.dev2026091105` is published on that index only, until
 this port's fixes reach a stable MAX release.

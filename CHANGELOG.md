@@ -11,6 +11,11 @@
   both request orders.
 
 ### Behavior
+- **MAX pin bumped to `26.6.0.dev2026091105`** (from `26.6.0.dev2026082707`).
+  Next-day successor of the dev2026091005 re-probe; validated by the research
+  repo's bump smokes: package suite green including the pin guard, the Mojo
+  kernels (int8 included) compile and run on Metal, and MAX's filename parser
+  still resolves no encoding from our weight filenames.
 - **int8 deliberately does not share weights** — serving int8 is unchanged from
   v0.2.1. A served gate showed the shared registry corrupts int8 output
   deterministically while every in-process check is bit-clean; a flag-off

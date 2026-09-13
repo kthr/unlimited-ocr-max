@@ -15,7 +15,7 @@ import pytest
 from unlimited_ocr_max import cli
 
 ROOT = Path(__file__).resolve().parent.parent
-PINNED_MAX_VERSION = "26.6.0.dev2026082707"
+PINNED_MAX_VERSION = "26.6.0.dev2026091105"
 
 
 def test_installed_max_is_the_pinned_nightly() -> None:

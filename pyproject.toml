@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
     # The exact build this port is validated on; published on Modular's nightly index only.
-    "max[all]==26.6.0.dev2026082707",
+    "max[all]==26.6.0.dev2026091105",
     "numpy>=2.5.2",
     "pillow>=12.3.0",
     "torch>=2.13.0,<2.15",

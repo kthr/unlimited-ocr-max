@@ -17,7 +17,7 @@ defaults:
     shell: bash
 
 env:
-  # `max[all]==26.6.0.dev2026082707` is published on Modular's nightly index
+  # `max[all]==26.6.0.dev2026091105` is published on Modular's nightly index
   # only, so every install of this package needs this index in addition to PyPI
   # -- for CI and for end users alike (see README "Install").
   MODULAR_INDEX: https://whl.modular.com/nightly/simple/
