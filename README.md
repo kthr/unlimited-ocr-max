@@ -17,7 +17,7 @@ pip install --pre --extra-index-url https://whl.modular.com/nightly/simple/ unli
 ```
 
 The extra index is required: the package pins one exact MAX nightly build
-(`max[all]==26.6.0.dev2026082707`) because the port depends on fixes no stable
+(`max[all]==26.6.0.dev2026091105`) because the port depends on fixes no stable
 MAX release carries yet, and that build is published only on Modular's nightly
 index. The pin and the flag go away with the next stable Modular release. `--pre`
 is needed with `pip` (not `uv`) so it will select the pre-release `mojo` that
@@ -88,7 +88,7 @@ EOF
 ## Tested on
 
 Apple M4, 24 GB unified memory, macOS 26.5.2, Python 3.12,
-`max==26.6.0.dev2026082707`. The GPU path needs full Xcode plus the Metal
+`max==26.6.0.dev2026091105`. The GPU path needs full Xcode plus the Metal
 Toolchain (`xcodebuild -downloadComponent MetalToolchain`); the Command Line
 Tools do not ship the Metal compiler MAX shells out to. Greedy output with the
 guard off is byte-identical to the fp32 PyTorch reference on both devices. The
