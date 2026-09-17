@@ -34,10 +34,12 @@ This downloads the model repository once (6.2 GiB) and runs `max serve` with
 this port's flags, on `http://127.0.0.1:8010` under the model id
 `unlimited-ocr-max`.
 
-* `--revision` defaults to `v0.2.0`, the model-repo tag this package version was
-  validated against, so a fixed package version serves fixed weights; the tag
-  must exist or the download fails before MAX starts. Ignored for a local
-  directory.
+* `--revision` defaults to `DEFAULT_REVISION` in `unlimited_ocr_max/cli.py` —
+  `v0.2.1` in this build, tied by a package test to the package's own version —
+  the model-repo tag this package version was validated against, so a fixed
+  package version serves fixed weights; the tag must exist or the download fails
+  before MAX starts. Ignored for a local directory. `unlimited-ocr-max serve
+  --help` prints the value the installed build carries.
 * `--model <dir>` serves a local copy with the repository's layout
   (`config.json`, the tokenizer files, `model.safetensors`).
 * `--weights bf16` (default) selects the unquantised `model.safetensors`; it

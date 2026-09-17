@@ -4,11 +4,14 @@
 
 ### Performance
 - **bf16: the language weights are one device copy, shared by both language
-  graphs** (device-weight registry, on by default on GPU). Per-request decode
-  reload ~10.5 s → **~1.5 s**, TTFT ~8.5 → ~5.3 s, net −7 to −15 s per page on
-  the 12-page corpus; steady decode step ~+9 % (a priced tradeoff, net-positive
-  on every measured page). Output byte-identical to v0.2.1 on all 12 pages,
-  both request orders.
+  graphs** (device-weight registry, on by default on GPU; CPU serving and
+  `--weights int8` are unaffected). Per-request decode reload ~10.5 s →
+  **~1.5 s**, TTFT ~8.5 → ~5.3 s, net −7 to −15 s per page on the 12-page
+  corpus; steady decode step ~+9 % (a priced tradeoff, net-positive on every
+  measured page). The registry is built once per process, on the first request
+  that builds a language graph, and survives every graph release — it is not
+  rebuilt per request. Output byte-identical to v0.2.1 on all 12 pages, both
+  request orders.
 
 ### Behavior
 - **MAX pin bumped to `26.6.0.dev2026091105`** (from `26.6.0.dev2026082707`).
@@ -22,8 +25,16 @@
   control confirmed the gate. Evidence: the research repo's EXPERIMENTS.md,
   KON-158 blocks (b)/(c).
 - The serve path's graph-release policy is now a named predicate
-  (`releases_language_graphs`) and carries the package's first release-policy
-  and weight-sharing tests (value-level, not count-level).
+  (`releases_language_graphs`), which the served prefill reads instead of the
+  raw device. The policy itself — one language graph at a time on an
+  accelerator — is unchanged from v0.2.1 and is deliberately *not* gated by the
+  weight sharing above. It carries the package's first release-policy and
+  weight-sharing tests (value-level, not count-level).
+
+### Documentation
+- README: `--revision`'s stated default was `v0.2.0` while `cli.DEFAULT_REVISION`
+  has been `v0.2.1` since that release; the claim now names `DEFAULT_REVISION`
+  as its source.
 
 ## [0.2.1] — 2026-09-10
 - Fix: serving from a Hub id downloads the tokenizer at the pinned revision
