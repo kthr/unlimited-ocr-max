@@ -6,8 +6,14 @@
 - **bf16: the language weights are one device copy, shared by both language
   graphs** (device-weight registry, on by default on GPU; CPU serving and
   `--weights int8` are unaffected). Per-request decode reload ~10.5 s →
-  **~1.5 s**, TTFT ~8.5 → ~5.3 s, net −7 to −15 s per page on the 12-page
-  corpus; steady decode step ~+9 % (a priced tradeoff, net-positive on every
+  **~1.5 s** — two populations, stated as such: the before is this package's
+  own measured pre-registry median (10.56 s); the after is the research port's
+  directly measured post-registry class for the same mechanism, this package's
+  own post-registry evidence being that the reload no longer reaches the
+  scheduler's ~3 s logging tick (i.e. < ~3 s). TTFT ~8.5 → ~5.3 s, net −7 to
+  −15 s per page on the 12-page corpus (per-page wall-clock deltas, measured
+  directly — not derived from the reload pair); steady decode step ~+9 % (a
+  priced tradeoff, net-positive on every
   measured page). The registry is built once per process, on the first request
   that builds a language graph, and survives every graph release — it is not
   rebuilt per request. Output byte-identical to v0.2.1 on all 12 pages, both
