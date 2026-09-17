@@ -34,10 +34,12 @@ This downloads the model repository once (6.2 GiB) and runs `max serve` with
 this port's flags, on `http://127.0.0.1:8010` under the model id
 `unlimited-ocr-max`.
 
-* `--revision` defaults to `v0.2.0`, the model-repo tag this package version was
-  validated against, so a fixed package version serves fixed weights; the tag
-  must exist or the download fails before MAX starts. Ignored for a local
-  directory.
+* `--revision` defaults to `DEFAULT_REVISION` in `unlimited_ocr_max/cli.py`
+  (tied by a package test to the package's own version) — the model-repo tag
+  this package version was validated against, so a fixed
+  package version serves fixed weights; the tag must exist or the download fails
+  before MAX starts. Ignored for a local directory. `unlimited-ocr-max serve
+  --help` prints the value the installed build carries.
 * `--model <dir>` serves a local copy with the repository's layout
   (`config.json`, the tokenizer files, `model.safetensors`).
 * `--weights bf16` (default) selects the unquantised `model.safetensors`; it
@@ -71,7 +73,9 @@ served identity gate on int8 (0 of 12 pages byte-identical in both request
 orders, including one page that returned an empty response), while a flag-off
 control on the same machine and harness served 12 of 12 — so int8 serves in the
 per-graph configuration its published transcripts were taken in, and reloads in
-the ~3 s class. Both variants reproduce their pinned transcripts byte for byte
+the 3–6 s class (the measured population is the research port's, 3.1–6.5 s;
+this package's own int8 reload population has not been measured directly).
+Both variants reproduce their pinned transcripts byte for byte
 as shipped.
 
 One page per request, `base` mode, image first:
