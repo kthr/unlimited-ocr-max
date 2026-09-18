@@ -1,5 +1,12 @@
 """Checkpoint tensors -> the two sub-models' MAX state dicts.
 
+A checkpoint tensor is a :class:`~max.driver.Buffer` throughout -- MAX's own
+mmap of the safetensors file, which the adapter never converts away from.
+Nothing else in reach carries bfloat16 *and* names it: numpy has no such dtype,
+and torch is not a runtime dependency of this package. So the language side
+hands MAX back what MAX handed it, and only the vision side, which serves fp32
+anyway, materialises numpy.
+
 ``language_model``: strip ``model.``, rename ``mlp.gate.weight`` to
 ``mlp.gate.gate_score.weight``, and stack each MoE layer's 64 routed experts into
 three ``[64, N, K]`` tensors in ascending expert index (the layout
@@ -35,7 +42,9 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+from max.driver import Buffer
 
+from .bf16 import buffer_to_numpy, numpy_to_buffer
 from .decoder import UnlimitedOcrDecoder
 from .layers.clip_l import UNUSED_CHECKPOINT_WEIGHTS
 from .layers.sam_vit import CHECKPOINT_PREFIX as SAM_PREFIX
@@ -105,18 +114,23 @@ def language_weight_name(checkpoint_name: str) -> str:
 
 
 def stack_expert_weights(state_dict: Mapping[str, Any], *, num_experts: int) -> dict[str, Any]:
-    """Collapse the per-expert tensors (torch tensors) of every MoE layer into stacks.
+    """Collapse the per-expert ``Buffer``s of every MoE layer into one ``Buffer`` per stack.
 
     ``layers.{i}.mlp.experts.{j}.<proj>.weight`` becomes
     ``layers.{i}.mlp.experts.<proj>`` and, on an int8 checkpoint,
     ``…{j}.<proj>.weight_scales`` becomes ``layers.{i}.mlp.experts.<proj>_scales``.
     Each stack is built in ascending expert index and gets the same completeness
-    check: indices 0..n-1 with no gaps, exactly ``num_experts`` of them.
-    """
-    import torch
+    check: indices 0..n-1 with no gaps, exactly ``num_experts`` of them, all of
+    one dtype -- experts that disagree would let ``np.stack`` promote silently
+    and the re-view would then be reading the wrong bytes.
 
+    The members' bytes are copied exactly once, by the ``np.stack`` that lays
+    them out; every step around it aliases. bf16 makes the trip as uint16
+    because numpy has no bfloat16 dtype, and the stack is named bfloat16 again
+    on the far side -- the bit patterns are never interpreted in between.
+    """
     out: dict[str, Any] = {}
-    grouped: dict[str, dict[int, Any]] = {}
+    grouped: dict[str, dict[int, Buffer]] = {}
     for name, value in state_dict.items():
         match = _EXPERT_WEIGHT_RE.match(name)
         if match is None:
@@ -130,7 +144,12 @@ def stack_expert_weights(state_dict: Mapping[str, Any], *, num_experts: int) -> 
             raise WeightMappingError(f"{stacked}: expert indices must be 0..n-1 with no gaps, got {indices}")
         if len(indices) != num_experts:
             raise WeightMappingError(f"{stacked}: expected {num_experts} experts, got {len(indices)}")
-        out[stacked] = torch.stack([members[j] for j in indices], dim=0)
+        dtypes = {members[j].dtype for j in indices}
+        if len(dtypes) != 1:
+            found = sorted({_dtype_name(members[j]) for j in indices})
+            raise WeightMappingError(f"{stacked}: the experts disagree on dtype: {found}")
+        stack = np.stack([buffer_to_numpy(members[j]) for j in indices])
+        out[stacked] = numpy_to_buffer(stack, dtypes.pop())
     return out
 
 

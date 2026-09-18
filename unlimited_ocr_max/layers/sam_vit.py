@@ -20,10 +20,13 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+from max.driver import Buffer
 from max.dtype import DType
 from max.graph import DeviceRef, TensorValue, Weight, ops
 from max.nn import Conv2d, LayerNorm, Linear
 from max.nn.layer import LayerList, Module
+
+from ..bf16 import bf16_to_fp32, buffer_to_numpy
 
 __all__ = [
     "CHECKPOINT_PREFIX",
@@ -309,10 +312,17 @@ class SamViT(Module):
 
 
 def as_float32(value: Any) -> np.ndarray:
-    """Contiguous float32 copy of a checkpoint tensor (torch or numpy); bf16 -> fp32 is lossless."""
-    if hasattr(value, "detach") and hasattr(value, "numpy"):
-        value = value.detach().to("cpu").float().numpy()
-    return np.ascontiguousarray(np.asarray(value), dtype=np.float32)
+    """Contiguous float32 view of a checkpoint tensor -- a MAX ``Buffer`` or a plain numpy array.
+
+    Widening bf16 is lossless and not a rounding decision at all: bf16 *is* the
+    top half of the fp32 word. It goes through
+    :func:`~unlimited_ocr_max.bf16.bf16_to_fp32` because numpy cannot hold the
+    narrow form even long enough to cast it.
+    """
+    if isinstance(value, Buffer):
+        bits = buffer_to_numpy(value)
+        value = bf16_to_fp32(bits) if value.dtype == DType.bfloat16 else bits
+    return np.ascontiguousarray(value, dtype=np.float32)
 
 
 def sam_state_dict(

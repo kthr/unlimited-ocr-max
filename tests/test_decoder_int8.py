@@ -201,8 +201,9 @@ def test_int8_declarations_pass_the_adapters_check() -> None:
         for proj in PROJECTIONS:
             n, k = (hidden, ffn) if proj == "down_proj" else (ffn, hidden)
             stem = f"layers.1.mlp.experts.{expert}.{proj}"
-            renamed[f"{stem}.weight"] = torch.zeros((n, k), dtype=torch.int8)
-            renamed[f"{stem}.weight_scales"] = torch.ones((n, k // INT8_GROUP_SIZE), dtype=torch.float32)
+            renamed[f"{stem}.weight"] = Buffer.from_dlpack(torch.zeros((n, k), dtype=torch.int8))
+            scales = torch.ones((n, k // INT8_GROUP_SIZE), dtype=torch.float32)
+            renamed[f"{stem}.weight_scales"] = Buffer.from_dlpack(scales)
     stacked = stack_expert_weights(renamed, num_experts=e)
     check_against_declared(stacked, _experts(config, 1, device=DeviceRef.GPU(0)))
     # And the bf16 declaration refuses the int8 file: the dtype half of the check is what tells them apart.
