@@ -239,8 +239,10 @@ class UnlimitedOcrPipeline:
         the registry values must already be on the device, and neither
         ``session.load`` materialises its own ~5.5 GiB copy.
 
-        Every dtype goes through ``Buffer.from_dlpack`` uniformly -- bf16 dense
-        weights, int8 expert stacks, fp32 scales -- because numpy has no bf16.
+        The host entries are already ``Buffer``s -- MAX's mmap of the checkpoint
+        for the dense weights, one host allocation per expert stack -- so every
+        dtype needs the same single step, ``.to(device)``: bf16 dense weights,
+        int8 expert stacks and fp32 scales alike.
 
         **The conversion is incremental, and that is not cosmetic**: building
         the whole device dict beside the host one holds both ~5.5 GiB copies at
@@ -270,7 +272,7 @@ class UnlimitedOcrPipeline:
             built: dict[str, Buffer] = {}
             # `list(...)` because the loop mutates `host`.
             for name in list(host):
-                built[name] = Buffer.from_dlpack(host[name]).to(self._driver_device)
+                built[name] = host[name].to(self._driver_device)
                 # Drop the host bytes now, one weight at a time, so the two
                 # copies never both exist in full.
                 del host[name]

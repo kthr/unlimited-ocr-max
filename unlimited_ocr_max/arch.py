@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from max.driver import Buffer
 from max.graph.weights import WeightsFormat
 from max.pipelines.context import TextAndVisionContext
 from max.pipelines.lib import SupportedArchitecture
@@ -30,11 +31,15 @@ DEFAULT_ENCODING: SupportedEncoding = "bfloat16"
 SERVED_ENCODING: SupportedEncoding = "float32"
 
 
-def _as_tensor(source: Any) -> Any:
-    """``Weights.data()`` is a ``WeightData`` exposing its buffer through DLPack; numpy has no bf16, so torch is the bridge."""
-    import torch
+def _as_tensor(source: Any) -> Buffer:
+    """The ``Buffer`` behind one checkpoint entry: MAX's mmap of the safetensors file, not a copy of it.
 
-    return torch.from_dlpack(source.data().data)
+    ``Weights.data()`` already wraps a ``Buffer``, so ``to_buffer`` is a naming
+    step rather than a conversion. A ``Buffer`` is also the only value here that
+    can *say* bfloat16 -- numpy has no such dtype -- which is what lets the whole
+    weight path carry dtype and shape without torch.
+    """
+    return source.data().to_buffer()
 
 
 def convert_state_dict(

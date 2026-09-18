@@ -242,18 +242,18 @@ def test_the_registry_takes_the_host_tensors_and_holds_every_dtype() -> None:
     beside a full host copy held 2x ~5.5 GiB at once in the research port, so
     each host entry is dropped the moment its buffer exists, and afterwards the
     host mapping is empty and ``_language_state_dict`` is gone. All three
-    checkpoint dtypes -- bf16 dense, int8 stacks, fp32 scales -- go through
-    ``Buffer.from_dlpack`` uniformly (numpy has no bf16), and each round-trips
-    bit for bit.
+    checkpoint dtypes -- bf16 dense, int8 stacks, fp32 scales -- arrive as host
+    ``Buffer``s from the adapter and take the same single ``.to(device)`` step,
+    and each round-trips bit for bit.
     """
     from max.driver import CPU, Accelerator, Buffer
 
-    host = {
+    originals = {
         "dense": torch.arange(8, dtype=torch.float32).reshape(2, 4).to(torch.bfloat16),
         "stack": torch.arange(-4, 4, dtype=torch.int8).reshape(2, 4),
         "scales": torch.linspace(0.5, 1.5, 8, dtype=torch.float32).reshape(2, 4),
     }
-    originals = {name: tensor.clone() for name, tensor in host.items()}
+    host = {name: Buffer.from_dlpack(tensor) for name, tensor in originals.items()}
     pipeline = _pipeline(DeviceRef.GPU(0), language=host, driver=Accelerator())
 
     registry = pipeline._resolved_language_weights()
@@ -269,6 +269,80 @@ def test_the_registry_takes_the_host_tensors_and_holds_every_dtype() -> None:
         back = torch.from_dlpack(registry[name].to(CPU()))
         assert back.dtype == tensor.dtype, name
         assert torch.equal(back, tensor), name
+
+
+def test_a_cpu_registry_binds_a_stacked_buffer_straight_into_a_graph() -> None:
+    """The CPU arm: no sharing, so the adapter's own values are what ``session.load`` binds.
+
+    Everything above is about the accelerator registry, where the values are
+    converted before MAX sees them. On CPU :attr:`shares_language_weights` is
+    False and the host mapping goes through untouched -- so the one thing that
+    has to hold is that a stack built by ``stack_expert_weights`` (a ``Buffer``
+    re-viewed as bfloat16 over a uint16 ``np.stack``) is something MAX will load
+    and read correctly. Deliberately not ``gpu_only``: this arm is the one that
+    runs everywhere, CI included, and it is the one nothing else covers.
+    """
+    from max.driver import CPU, Buffer
+    from max.dtype import DType
+    from max.engine import InferenceSession
+    from max.graph import Graph, Weight, ops
+
+    from unlimited_ocr_max.weight_adapters import stack_expert_weights
+
+    experts, rows, cols = 3, 2, 4
+    stem = "layers.1.mlp.experts"
+    # Each expert carries its own index, so a misordered stack cannot pass.
+    state = {
+        f"{stem}.{index}.gate_proj.weight": Buffer.from_dlpack(
+            torch.full((rows, cols), float(index) + 0.5, dtype=torch.bfloat16)
+        )
+        for index in range(experts)
+    }
+    name = f"{stem}.gate_proj"
+    stack = stack_expert_weights(state, num_experts=experts)[name]
+
+    weight = Weight(name, DType.bfloat16, [experts, rows, cols], device=DeviceRef.CPU())
+    with Graph("cpu_registry", input_types=[]) as graph:
+        graph.output(ops.cast(graph.add_weight(weight), DType.float32))
+    model = InferenceSession(devices=[CPU()]).load(graph, weights_registry={name: stack})
+
+    got = model.execute()[0].to_numpy()
+    want = np.stack([np.full((rows, cols), float(index) + 0.5, dtype=np.float32) for index in range(experts)])
+    assert got.dtype == np.float32
+    assert np.array_equal(got, want), f"the graph read {got[:, 0, 0]}, expected {want[:, 0, 0]}"
+
+
+@gpu_only
+def test_the_registry_releases_each_host_entry_before_it_builds_the_next() -> None:
+    """The host mapping shrinks *during* the loop, which is the whole reason it is one.
+
+    ``assert host == {}`` above says only that the entries went, not when: a
+    build that made a full second dict and cleared the first afterwards passes
+    it while holding 2x ~5.5 GiB (17.83 GiB host peak, measured in the research
+    port). So the liveness is recorded instead. A ``Buffer`` cannot be weakly
+    referenced, but the numpy array it aliases can, and that array dies exactly
+    with the last ``Buffer`` holding it -- which also shows the device copy does
+    not keep its source alive. Entry ``k`` dying while ``n-1-k`` entries remain
+    is one at a time; a bulk release records every entry at zero.
+    """
+    import weakref
+
+    from max.driver import Accelerator, Buffer
+
+    names = [f"w{index}" for index in range(4)]
+    arrays = [np.full((256, 256), index, dtype=np.float32) for index in range(len(names))]
+    host = {name: Buffer.from_numpy(array) for name, array in zip(names, arrays, strict=True)}
+    released: list[tuple[str, int]] = []
+    for name, array in zip(names, arrays, strict=True):
+        weakref.finalize(array, lambda held=name: released.append((held, len(host))))
+    del arrays, array, name  # only the host Buffers hold the arrays now
+
+    pipeline = _pipeline(DeviceRef.GPU(0), language=host, driver=Accelerator())
+    registry = pipeline._resolved_language_weights()
+
+    assert released == [(name, len(names) - 1 - index) for index, name in enumerate(names)]
+    assert host == {}
+    assert len(registry) == len(names)
 
 
 # --------------------------------------------------------------------------
