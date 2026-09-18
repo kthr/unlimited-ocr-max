@@ -2,8 +2,8 @@
 
 Preprocessing reproduces the reference's ``infer()`` bitwise: pad to square with
 the mean colour (``int(0.5 * 255) == 127``), ``ToTensor``, normalise with
-mean/std 0.5, then a bfloat16 round-trip through torch so the fp32 pixels hold
-only bf16-representable values.
+mean/std 0.5, then a bf16 round-trip (``bf16.fp32_to_bf16_roundtrip``) so the
+fp32 pixels hold only bf16-representable values.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ from max.pipelines.context import TextAndVisionContext
 from max.pipelines.lib.interfaces.arch_config import ArchConfig
 from max.pipelines.lib.interfaces.batch_processor import BatchProcessor, BatchProcessorRuntime
 from max.pipelines.lib.interfaces.pipeline_model import ModelOutputs
+
+from .bf16 import fp32_to_bf16_roundtrip
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -95,14 +97,12 @@ def pad_to_square(image: Image.Image, size: int) -> Image.Image:
 
 def normalise_view(image: Image.Image) -> np.ndarray:
     """``ToTensor`` + ``Normalize(0.5, 0.5)`` + the bf16 round-trip -> ``[3, H, W]`` fp32."""
-    import torch
-
     hwc = np.array(image, dtype=np.uint8, copy=True)
     if hwc.ndim != 3 or hwc.shape[2] != 3:
         raise ValueError(f"expected an RGB HWC image, got shape {hwc.shape}")
-    tensor = torch.from_numpy(hwc).permute(2, 0, 1).contiguous().to(torch.float32).div(255.0)
-    tensor = (tensor - PIXEL_MEAN) / PIXEL_STD
-    return np.ascontiguousarray(tensor.to(torch.bfloat16).to(torch.float32).numpy())
+    chw = np.ascontiguousarray(hwc.transpose(2, 0, 1)).astype(np.float32) / np.float32(255.0)
+    pixels = (chw - np.float32(PIXEL_MEAN)) / np.float32(PIXEL_STD)
+    return fp32_to_bf16_roundtrip(pixels)
 
 
 def preprocess_page(source: str | Path | Image.Image, *, base_size: int = BASE_SIZE) -> np.ndarray:
