@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 from max.dtype import DType
@@ -275,3 +276,31 @@ def test_sam_state_dict_rejects_mismatched_rel_pos() -> None:
     # Try to load at 512px (32x32 grid) — target for global block should be 63=2*32-1
     with pytest.raises(ValueError, match=r"blocks\.2\.attn\.rel_pos_h: found shape .+, need shape \(63, 64\)"):
         sam_state_dict(checkpoint, image_size=512)
+
+
+def test_sam_state_dict_passes_through_matching_pos_embed_and_rel_pos() -> None:
+    """When pos_embed and rel_pos tables already match the target grid, they pass through unchanged."""
+    from unlimited_ocr_max.layers.sam_vit import sam_state_dict
+
+    # Create a checkpoint with correctly sized tables for 1024px (64x64 grid)
+    image_size = 1024
+    grid = image_size // 16  # 64
+    checkpoint = {
+        "model.sam_model.pos_embed": torch.ones((1, grid, grid, 768), dtype=torch.float32),
+        # Global blocks (indices 2, 5, 8, 11) need (2*64-1, 64) = (127, 64)
+        "model.sam_model.blocks.2.attn.rel_pos_h": torch.ones((127, 64), dtype=torch.float32),
+        "model.sam_model.blocks.2.attn.rel_pos_w": torch.ones((127, 64), dtype=torch.float32),
+        # Windowed blocks need (2*14-1, 64) = (27, 64)
+        "model.sam_model.blocks.0.attn.rel_pos_h": torch.ones((27, 64), dtype=torch.float32),
+        "model.sam_model.blocks.0.attn.rel_pos_w": torch.ones((27, 64), dtype=torch.float32),
+    }
+
+    result = sam_state_dict(checkpoint, image_size=image_size)
+
+    # Verify shapes are preserved as np.float32 (sam_state_dict returns numpy arrays)
+    assert result["pos_embed"].shape == (1, grid, grid, 768)
+    assert result["pos_embed"].dtype == np.float32
+    assert result["blocks.2.attn.rel_pos_h"].shape == (127, 64)
+    assert result["blocks.2.attn.rel_pos_h"].dtype == np.float32
+    assert result["blocks.0.attn.rel_pos_h"].shape == (27, 64)
+    assert result["blocks.0.attn.rel_pos_h"].dtype == np.float32

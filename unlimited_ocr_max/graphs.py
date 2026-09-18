@@ -109,9 +109,9 @@ ENCODER_STAGES = VISION_STAGES[:-1]
 class UnlimitedOcrVisionModel(Module):
     """SAM ViT-B -> CLIP-L (fed SAM's grid) -> fuse -> projector -> image-token rows.
 
-    One instance serves one resolution: SAM's position tables and CLIP's are
-    resampled per resolution in the state dict. FQNs are the checkpoint keys
-    minus ``model.``.
+    One instance serves one resolution: CLIP's position tables are resampled
+    per resolution in the state dict; SAM's position tables must already match
+    the target resolution. FQNs are the checkpoint keys minus ``model.``.
     """
 
     def __init__(self, *, image_size: int = BASE_SIZE, dtype: DType = COMPUTE_DTYPE, device: DeviceRef | None = None) -> None:

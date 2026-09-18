@@ -9,9 +9,9 @@ puts on the trailing axis ``ops.layer_norm`` reduces.
 
 Weight FQNs are the checkpoint keys minus ``model.sam_model.``. Resolution is
 static per instance: ``pos_embed`` and the global blocks' ``rel_pos_*`` tables
-are resampled on the host for anything other than the 1024px pretraining grid
-(``get_abs_pos_sam`` bicubic+antialias, ``get_rel_pos`` linear), so the graph
-only ever sees correctly shaped tables.
+must already match the target grid; a mismatch raises :exc:`ValueError`
+rather than resampling. Resampling is a gundam-mode requirement this package
+does not serve.
 """
 
 from __future__ import annotations
