@@ -308,32 +308,6 @@ class SamViT(Module):
         return ops.permute(self.net_3(x2), [0, 3, 1, 2])
 
 
-def _interpolate_abs_pos(pos_embed: np.ndarray, tgt_size: int) -> np.ndarray:
-    """Host-side ``get_abs_pos_sam``: torch bicubic + antialias, ``align_corners=False``."""
-    if pos_embed.shape[1] == tgt_size:
-        return pos_embed
-    import torch
-    import torch.nn.functional as F
-
-    old = torch.from_numpy(np.ascontiguousarray(pos_embed)).permute(0, 3, 1, 2)
-    new = F.interpolate(
-        old.to(torch.float32), size=(tgt_size, tgt_size), mode="bicubic", antialias=True, align_corners=False
-    ).to(old.dtype)
-    return new.permute(0, 2, 3, 1).contiguous().numpy()
-
-
-def _interpolate_rel_pos(rel_pos: np.ndarray, max_rel_dist: int) -> np.ndarray:
-    """Host-side interpolation branch of ``get_rel_pos`` (``mode="linear"``)."""
-    if rel_pos.shape[0] == max_rel_dist:
-        return rel_pos
-    import torch
-    import torch.nn.functional as F
-
-    table = torch.from_numpy(np.ascontiguousarray(rel_pos)).to(torch.float32)
-    resized = F.interpolate(table.reshape(1, table.shape[0], -1).permute(0, 2, 1), size=max_rel_dist, mode="linear")
-    return resized.reshape(-1, max_rel_dist).permute(1, 0).contiguous().numpy()
-
-
 def as_float32(value: Any) -> np.ndarray:
     """Contiguous float32 copy of a checkpoint tensor (torch or numpy); bf16 -> fp32 is lossless."""
     if hasattr(value, "detach") and hasattr(value, "numpy"):
@@ -346,9 +320,9 @@ def sam_state_dict(
 ) -> dict[str, np.ndarray]:
     """Checkpoint tensors -> :class:`SamViT` state dict at ``image_size``.
 
-    Strips ``prefix``, upcasts to fp32, resamples ``pos_embed`` and the global
-    blocks' ``rel_pos_*`` for the resolution, and transposes the five 4-D conv
-    filters to RSCF.
+    Strips ``prefix``, upcasts to fp32, and transposes the five 4-D conv filters
+    to RSCF. Position embeddings and relative position tables must already match
+    the target resolution and are not resampled.
     """
     grid = image_size // PATCH_SIZE
     out: dict[str, np.ndarray] = {}
@@ -358,11 +332,20 @@ def sam_state_dict(
         name = key[len(prefix):]
         array = as_float32(value)
         if name == "pos_embed":
-            array = _interpolate_abs_pos(array, grid)
+            if array.shape[1] != grid:
+                raise ValueError(
+                    f"pos_embed: found shape {array.shape}, need shape (1, {grid}, {grid}, {EMBED_DIM}); "
+                    f"resampling is a gundam-mode requirement this package does not serve"
+                )
         elif name.endswith((".rel_pos_h", ".rel_pos_w")):
             block = int(name.split(".")[1])
             q_size = grid if block in GLOBAL_ATTN_INDEXES else WINDOW_SIZE
-            array = _interpolate_rel_pos(array, 2 * q_size - 1)
+            target_size = 2 * q_size - 1
+            if array.shape[0] != target_size:
+                raise ValueError(
+                    f"{name}: found shape {array.shape}, need shape ({target_size}, {array.shape[1]}); "
+                    f"resampling is a gundam-mode requirement this package does not serve"
+                )
         elif array.ndim == 4:
             array = array.transpose(2, 3, 1, 0)
         out[name] = np.ascontiguousarray(array, dtype=np.float32)
