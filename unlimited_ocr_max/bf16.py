@@ -68,8 +68,12 @@ def buffer_to_numpy(buffer: Buffer) -> np.ndarray:
     numpy cannot consume a bf16 DLPack capsule at all -- it answers
     ``BufferError: Unsupported dtype in DLTensor`` -- so bf16 crosses under the
     name of its storage width and :func:`numpy_to_buffer` gives the dtype back on
-    the far side. A host buffer aliases; nothing is copied, and the caller owes
-    the returned array the buffer's lifetime.
+    the far side. A host buffer aliases; nothing is copied.
+
+    The returned array holds the memory alive itself, through the DLPack capsule
+    at its ``.base``, so ``buffer`` may be dropped straight after. **Do not add
+    a defensive copy here**: the callers' one-allocation-per-stack property is
+    measured, and a copy would quietly double it.
     """
     dtype = _BF16_STORAGE if buffer.dtype == DType.bfloat16 else buffer.dtype
     return buffer.view(dtype, buffer.shape).to_numpy()

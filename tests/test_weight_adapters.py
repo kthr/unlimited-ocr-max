@@ -121,6 +121,14 @@ def test_stacking_refuses_experts_that_disagree_on_dtype() -> None:
         stack_expert_weights(state, num_experts=EXPERTS)
 
 
+def test_stacking_refuses_experts_that_disagree_on_shape_and_names_the_stack() -> None:
+    """np.stack rejects these on its own, but says only ``all input arrays must have the same shape``."""
+    state = renamed(bf16_checkpoint())
+    state["layers.1.mlp.experts.2.up_proj.weight"] = _buffer(torch.zeros((N, K // 2), dtype=torch.bfloat16))
+    with pytest.raises(WeightMappingError, match=rf"up_proj: the experts disagree on shape: \[\({N}, {K // 2}\), \({N}, {K}\)\]"):
+        stack_expert_weights(state, num_experts=EXPERTS)
+
+
 def test_stacking_rejects_a_gap_in_the_scales() -> None:
     state = renamed(int8_checkpoint())
     del state["layers.1.mlp.experts.2.up_proj.weight_scales"]

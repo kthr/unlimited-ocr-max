@@ -120,9 +120,11 @@ def stack_expert_weights(state_dict: Mapping[str, Any], *, num_experts: int) -> 
     ``layers.{i}.mlp.experts.<proj>`` and, on an int8 checkpoint,
     ``…{j}.<proj>.weight_scales`` becomes ``layers.{i}.mlp.experts.<proj>_scales``.
     Each stack is built in ascending expert index and gets the same completeness
-    check: indices 0..n-1 with no gaps, exactly ``num_experts`` of them, all of
-    one dtype -- experts that disagree would let ``np.stack`` promote silently
-    and the re-view would then be reading the wrong bytes.
+    check: indices 0..n-1 with no gaps, exactly ``num_experts`` of them, and all
+    of one dtype and one shape. Both disagreements are caught here rather than
+    left to ``np.stack``: a dtype it would resolve by promoting silently,
+    leaving the re-view to read the wrong bytes, and a shape it does reject but
+    without naming the stack that is wrong.
 
     The members' bytes are copied exactly once, by the ``np.stack`` that lays
     them out; every step around it aliases. bf16 makes the trip as uint16
@@ -148,6 +150,9 @@ def stack_expert_weights(state_dict: Mapping[str, Any], *, num_experts: int) -> 
         if len(dtypes) != 1:
             found = sorted({_dtype_name(members[j]) for j in indices})
             raise WeightMappingError(f"{stacked}: the experts disagree on dtype: {found}")
+        shapes = {tuple(int(d) for d in members[j].shape) for j in indices}
+        if len(shapes) != 1:
+            raise WeightMappingError(f"{stacked}: the experts disagree on shape: {sorted(shapes)}")
         stack = np.stack([buffer_to_numpy(members[j]) for j in indices])
         out[stacked] = numpy_to_buffer(stack, dtypes.pop())
     return out

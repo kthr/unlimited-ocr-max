@@ -271,6 +271,47 @@ def test_the_registry_takes_the_host_tensors_and_holds_every_dtype() -> None:
         assert torch.equal(back, tensor), name
 
 
+def test_a_cpu_registry_binds_a_stacked_buffer_straight_into_a_graph() -> None:
+    """The CPU arm: no sharing, so the adapter's own values are what ``session.load`` binds.
+
+    Everything above is about the accelerator registry, where the values are
+    converted before MAX sees them. On CPU :attr:`shares_language_weights` is
+    False and the host mapping goes through untouched -- so the one thing that
+    has to hold is that a stack built by ``stack_expert_weights`` (a ``Buffer``
+    re-viewed as bfloat16 over a uint16 ``np.stack``) is something MAX will load
+    and read correctly. Deliberately not ``gpu_only``: this arm is the one that
+    runs everywhere, CI included, and it is the one nothing else covers.
+    """
+    from max.driver import CPU, Buffer
+    from max.dtype import DType
+    from max.engine import InferenceSession
+    from max.graph import Graph, Weight, ops
+
+    from unlimited_ocr_max.weight_adapters import stack_expert_weights
+
+    experts, rows, cols = 3, 2, 4
+    stem = "layers.1.mlp.experts"
+    # Each expert carries its own index, so a misordered stack cannot pass.
+    state = {
+        f"{stem}.{index}.gate_proj.weight": Buffer.from_dlpack(
+            torch.full((rows, cols), float(index) + 0.5, dtype=torch.bfloat16)
+        )
+        for index in range(experts)
+    }
+    name = f"{stem}.gate_proj"
+    stack = stack_expert_weights(state, num_experts=experts)[name]
+
+    weight = Weight(name, DType.bfloat16, [experts, rows, cols], device=DeviceRef.CPU())
+    with Graph("cpu_registry", input_types=[]) as graph:
+        graph.output(ops.cast(graph.add_weight(weight), DType.float32))
+    model = InferenceSession(devices=[CPU()]).load(graph, weights_registry={name: stack})
+
+    got = model.execute()[0].to_numpy()
+    want = np.stack([np.full((rows, cols), float(index) + 0.5, dtype=np.float32) for index in range(experts)])
+    assert got.dtype == np.float32
+    assert np.array_equal(got, want), f"the graph read {got[:, 0, 0]}, expected {want[:, 0, 0]}"
+
+
 @gpu_only
 def test_the_registry_releases_each_host_entry_before_it_builds_the_next() -> None:
     """The host mapping shrinks *during* the loop, which is the whole reason it is one.
