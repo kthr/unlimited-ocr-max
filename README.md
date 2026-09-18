@@ -20,11 +20,10 @@ pip install unlimited-ocr-max
 (`max[all]==26.6.0`), and that release — with the `mojo` it depends on — is
 published on PyPI. Up to and including v0.2.1 the pin was a `26.6.0.dev*`
 nightly, because the 26.6 fixes this port needs had not reached a stable release
-yet — and **0.2.1 is still the latest release on PyPI**, so the two commands
-above install it today and fail to resolve `max` unless you add
+yet — so installing **those** versions needs
 `--extra-index-url https://whl.modular.com/nightly/simple/` (and `--pre` with
-`pip`, for the pre-release `mojo`). Installing from this branch's source needs
-neither.
+`pip`, for the pre-release `mojo`). From v0.3.0, and from this source tree,
+neither is needed.
 
 ## Serve
 

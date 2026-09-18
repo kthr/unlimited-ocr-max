@@ -48,10 +48,9 @@ secret.
 *Environments* → `pypi` → *Required reviewers*, so every upload to PyPI waits
 for a human approval instead of going out on any tag push.
 
-The install instructions need no extra index **from the next release on**: the
-pinned `max[all]==26.6.0` is on PyPI, so `pip install unlimited-ocr-max`
-resolves the whole dependency set from PyPI alone. That is not yet true of what
-is *published* — the latest release on PyPI is **0.2.1**, which still pins
-`max[all]==26.6.0.dev2026082707`, a nightly that is not on PyPI, so a plain
-`pip install unlimited-ocr-max` today installs 0.2.1 and fails to resolve `max`
-without `--extra-index-url https://whl.modular.com/nightly/simple/`.
+The install instructions need no extra index **from v0.3.0 on**: the pinned
+`max[all]==26.6.0` is on PyPI, so `pip install unlimited-ocr-max` resolves the
+whole dependency set from PyPI alone. Releases up to and including **0.2.1**
+pin `max[all]==26.6.0.dev2026082707`, a nightly that is not on PyPI — installing
+those old versions needs
+`--extra-index-url https://whl.modular.com/nightly/simple/`.

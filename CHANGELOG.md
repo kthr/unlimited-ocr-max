@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — collecting for v0.3.0
+## [0.3.0] — 2026-09-18
 
 ### Performance
 - **bf16: the language weights are one device copy, shared by both language
