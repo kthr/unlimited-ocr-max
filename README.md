@@ -11,17 +11,20 @@ Metal GPU or the CPU. The weights are baidu's, unchanged, served from
 ## Install
 
 ```bash
-uv tool install --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
+uv tool install unlimited-ocr-max
 # or, into a venv
-pip install --pre --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
+pip install unlimited-ocr-max
 ```
 
-The extra index is required: the package pins one exact MAX nightly build
-(`max[all]==26.6.0.dev2026091105`) because the port depends on fixes no stable
-MAX release carries yet, and that build is published only on Modular's nightly
-index. The pin and the flag go away with the next stable Modular release. `--pre`
-is needed with `pip` (not `uv`) so it will select the pre-release `mojo` that
-build depends on; `uv` selects it automatically.
+**From v0.3.0 on, PyPI alone is enough:** the package pins one exact MAX release
+(`max[all]==26.6.0`), and that release — with the `mojo` it depends on — is
+published on PyPI. Up to and including v0.2.1 the pin was a `26.6.0.dev*`
+nightly, because the 26.6 fixes this port needs had not reached a stable release
+yet — and **0.2.1 is still the latest release on PyPI**, so the two commands
+above install it today and fail to resolve `max` unless you add
+`--extra-index-url https://whl.modular.com/nightly/simple/` (and `--pre` with
+`pip`, for the pre-release `mojo`). Installing from this branch's source needs
+neither.
 
 ## Serve
 
@@ -92,7 +95,7 @@ EOF
 ## Tested on
 
 Apple M4, 24 GB unified memory, macOS 26.5.2, Python 3.12,
-`max==26.6.0.dev2026091105`. The GPU path needs full Xcode plus the Metal
+`max==26.6.0`. The GPU path needs full Xcode plus the Metal
 Toolchain (`xcodebuild -downloadComponent MetalToolchain`); the Command Line
 Tools do not ship the Metal compiler MAX shells out to. Greedy output with the
 guard off is byte-identical to the fp32 PyTorch reference on both devices. The

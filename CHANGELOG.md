@@ -20,11 +20,27 @@
   request orders.
 
 ### Behavior
-- **MAX pin bumped to `26.6.0.dev2026091105`** (from `26.6.0.dev2026082707`).
-  Next-day successor of the dev2026091005 re-probe; validated by the research
-  repo's bump smokes: package suite green including the pin guard, the Mojo
-  kernels (int8 included) compile and run on Metal, and MAX's filename parser
-  still resolves no encoding from our weight filenames.
+- **MAX pin is now the `26.6.0` stable release, and the nightly index is gone.**
+  Over this cycle the pin went `26.6.0.dev2026082707` (what v0.2.1 shipped) →
+  `26.6.0.dev2026091105` → the `26.6.0` release itself. That release, and the
+  `mojo` 1.1.0 toolchain `max[all]` pulls with it, are on PyPI, so the
+  `[[tool.uv.index]]` block, CI's extra index and the `--extra-index-url` /
+  `--pre` in the install instructions are all gone: `pip install
+  unlimited-ocr-max` now resolves from PyPI alone. Resolving the outgoing and
+  the incoming pin on one day, inputs otherwise identical, moves the eight
+  Modular distributions and nothing else — except seven transitive dependencies
+  (`pydantic`, `pydantic-core`, `tokenizers`, `safetensors`, `networkx`,
+  `cyclopts`, `hf-xet`) that land on stable versions instead of the
+  pre-release-driven versions the dev pin's `--prerelease allow` admitted
+  (six were themselves pre-releases; `pydantic-core` moved because the
+  pre-release `pydantic` pins it). Validated at the
+  stable in a venv rebuilt from scratch: the 61 model-free tests pass — the pin
+  guard and MAX's weight-filename parser among them — and so do all 25 `slow`
+  tests, which compile the Mojo kernels (int8 included) through a MAX
+  `InferenceSession` on Metal; run again with the kernels on CPU, 23 of them
+  pass and the two GPU-only real-shape smokes skip. The research port's full
+  gate suite and its byte-identical page transcripts are green on
+  `max==26.6.0` as well.
 - **int8 deliberately does not share weights** — serving int8 is unchanged from
   v0.2.1. A served gate showed the shared registry corrupts int8 output
   deterministically while every in-process check is bit-clean; a flag-off

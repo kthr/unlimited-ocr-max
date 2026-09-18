@@ -127,7 +127,7 @@ def _experts(config: UnlimitedOCRConfig, layer: int, *, device: DeviceRef) -> di
 # op census
 # --------------------------------------------------------------------------
 
-#: One MLIR result line; the pinned nightly emits the generic quoted form ``%1 = "rmo.add"(...)``.
+#: One MLIR result line; the pinned release emits the generic quoted form ``%1 = "rmo.add"(...)``.
 _OP_LINE = re.compile(r'^\s*(?:%\S+\s*=\s*)?"?((?:r?mo)\.[a-zA-Z_.0-9]+)"?')
 
 #: Declarations, not kernels: a weight is one ``mo.constant.external``, a graph constant one ``mo.constant``.
