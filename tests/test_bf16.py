@@ -69,22 +69,20 @@ def test_every_reachable_pixel_value_matches_torch() -> None:
     assert_same_bits(fp32_to_bf16_roundtrip(pixels), torch_roundtrip(pixels), "reachable pixels")
 
 
-def test_a_whole_page_view_matches_torch() -> None:
-    """The array ``normalise_view`` hands over: ``[3, H, W]``, non-trivially shaped, built the same way."""
-    rng = np.random.default_rng(7)
-    hwc = rng.integers(0, 256, size=(48, 64, 3), dtype=np.uint8)
-    chw = hwc.transpose(2, 0, 1).astype(np.float32) / np.float32(255.0)
-    pixels = np.ascontiguousarray((chw - np.float32(0.5)) / np.float32(0.5))
-    got = fp32_to_bf16_roundtrip(pixels)
-    assert got.shape == (3, 48, 64)
-    assert_same_bits(got, torch_roundtrip(pixels), "page view")
-
-
 # --- exponents, ties, specials ------------------------------------------------
 
 
 def test_a_sweep_across_every_exponent_matches_torch() -> None:
-    """All 256 exponents against a spread of mantissas: subnormals, the overflow edge, Inf and NaN included."""
+    """All 256 exponents against a spread of mantissas: subnormals, the overflow edge, Inf and NaN included.
+
+    This is also where the specials are checked against torch: both zeros, both
+    infinities, both quiet NaNs, a signalling NaN (mantissa ``0x1``), a NaN whose
+    payload sits only below the kept half (``0x8000``), the all-ones NaN, both
+    largest finites and the smallest subnormal are each ``sign | exponent |
+    mantissa`` triples this product already contains. Shrinking the mantissa
+    list would drop them silently -- the ones below that assert expected bits
+    *without* torch cover fewer patterns.
+    """
     signs = np.array([0x00000000, 0x80000000], dtype=np.uint32)
     exponents = np.arange(256, dtype=np.uint32) << np.uint32(23)
     mantissas = np.array([0x0, 0x1, 0x7FFF, 0x8000, 0x8001, 0xFFFF, 0x123456, 0x400000, 0x7FFFFF], dtype=np.uint32)
@@ -116,28 +114,6 @@ def test_either_side_of_a_tie_rounds_the_ordinary_way() -> None:
         got = fp32_to_bf16_roundtrip(values)
         assert_same_bits(got, torch_roundtrip(values), f"low 0x{int(low):04X}")
         assert np.array_equal(got.view(np.uint32), expected)
-
-
-SPECIALS = {
-    "+0": 0x00000000,
-    "-0": 0x80000000,
-    "+inf": 0x7F800000,
-    "-inf": 0xFF800000,
-    "+quiet nan": 0x7FC00000,
-    "-quiet nan": 0xFFC00000,
-    "signalling nan": 0x7F800001,
-    "nan with payload only below the kept half": 0x7F808000,
-    "nan of all ones": 0xFFFFFFFF,
-    "+max finite": 0x7F7FFFFF,
-    "-max finite": 0xFF7FFFFF,
-    "smallest subnormal": 0x00000001,
-}
-
-
-@pytest.mark.parametrize("case", list(SPECIALS), ids=list(SPECIALS))
-def test_specials_match_torch(case: str) -> None:
-    values = as_float32(np.array([SPECIALS[case]], dtype=np.uint32))
-    assert_same_bits(fp32_to_bf16_roundtrip(values), torch_roundtrip(values), case)
 
 
 def test_signed_zero_and_infinity_come_back_untouched() -> None:

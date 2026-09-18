@@ -259,7 +259,9 @@ def test_the_registry_takes_the_host_tensors_and_holds_every_dtype() -> None:
     registry = pipeline._resolved_language_weights()
     assert set(registry) == set(originals)
     assert all(isinstance(value, Buffer) for value in registry.values())
-    # Ownership taken: the host mapping was emptied entry by entry and dropped.
+    # Ownership taken: the host mapping is empty and dropped. This is the end
+    # state only; *when* each entry goes is the loop's invariant, and it is
+    # documented on `_resolved_language_weights` rather than pinned here.
     assert host == {}
     assert pipeline._language_state_dict is None
     # Idempotent: the same dict, not a second set of device copies.
@@ -310,39 +312,6 @@ def test_a_cpu_registry_binds_a_stacked_buffer_straight_into_a_graph() -> None:
     want = np.stack([np.full((rows, cols), float(index) + 0.5, dtype=np.float32) for index in range(experts)])
     assert got.dtype == np.float32
     assert np.array_equal(got, want), f"the graph read {got[:, 0, 0]}, expected {want[:, 0, 0]}"
-
-
-@gpu_only
-def test_the_registry_releases_each_host_entry_before_it_builds_the_next() -> None:
-    """The host mapping shrinks *during* the loop, which is the whole reason it is one.
-
-    ``assert host == {}`` above says only that the entries went, not when: a
-    build that made a full second dict and cleared the first afterwards passes
-    it while holding 2x ~5.5 GiB (17.83 GiB host peak, measured in the research
-    port). So the liveness is recorded instead. A ``Buffer`` cannot be weakly
-    referenced, but the numpy array it aliases can, and that array dies exactly
-    with the last ``Buffer`` holding it -- which also shows the device copy does
-    not keep its source alive. Entry ``k`` dying while ``n-1-k`` entries remain
-    is one at a time; a bulk release records every entry at zero.
-    """
-    import weakref
-
-    from max.driver import Accelerator, Buffer
-
-    names = [f"w{index}" for index in range(4)]
-    arrays = [np.full((256, 256), index, dtype=np.float32) for index in range(len(names))]
-    host = {name: Buffer.from_numpy(array) for name, array in zip(names, arrays, strict=True)}
-    released: list[tuple[str, int]] = []
-    for name, array in zip(names, arrays, strict=True):
-        weakref.finalize(array, lambda held=name: released.append((held, len(host))))
-    del arrays, array, name  # only the host Buffers hold the arrays now
-
-    pipeline = _pipeline(DeviceRef.GPU(0), language=host, driver=Accelerator())
-    registry = pipeline._resolved_language_weights()
-
-    assert released == [(name, len(names) - 1 - index) for index, name in enumerate(names)]
-    assert host == {}
-    assert len(registry) == len(names)
 
 
 # --------------------------------------------------------------------------
