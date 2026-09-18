@@ -287,7 +287,7 @@ def _table(*shape: int) -> Buffer:
 
 def test_as_float32_widens_a_bf16_buffer_and_leaves_a_numpy_array_alone() -> None:
     """The two inputs the vision side ever sees, and the values torch agrees they hold."""
-    from unlimited_ocr_max.layers.sam_vit import as_float32
+    from unlimited_ocr_max.buffers import as_float32
 
     tensor = torch.tensor([[1.5, -2.25, 0.0], [256.0, 3.5, -0.125]], dtype=torch.bfloat16)
     widened = as_float32(_buffer(tensor))
