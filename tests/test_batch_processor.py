@@ -8,14 +8,11 @@ against torch exhaustively, so this file only has to show that the surrounding
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import numpy as np
+import pytest
 import torch
 from PIL import Image
 
-from unlimited_ocr_max import batch_processor
 from unlimited_ocr_max.batch_processor import BASE_SIZE, PIXEL_MEAN, PIXEL_STD, normalise_view, preprocess_page
 
 
@@ -63,20 +60,11 @@ def test_preprocess_page_shape_and_dtype_are_unchanged() -> None:
     pixels = preprocess_page(image)
     assert pixels.shape == (1, 3, BASE_SIZE, BASE_SIZE)
     assert pixels.dtype == np.float32
-    assert np.ascontiguousarray(pixels).flags["C_CONTIGUOUS"]
+    # A real contract, not a formality: the array is staged straight into a `Buffer`.
+    assert pixels.flags["C_CONTIGUOUS"]
 
 
 def test_normalise_view_rejects_a_non_rgb_shape() -> None:
     grey = Image.new("L", (8, 8))
-    try:
+    with pytest.raises(ValueError, match="expected an RGB HWC image"):
         normalise_view(grey)
-    except ValueError as exc:
-        assert "expected an RGB HWC image" in str(exc)
-    else:
-        raise AssertionError("expected a ValueError for a non-RGB image")
-
-
-def test_batch_processor_source_has_no_torch_import() -> None:
-    """The one parity-critical torch site (KON-193): the module must not import torch at all."""
-    source = Path(batch_processor.__file__).read_text()
-    assert re.search(r"^\s*(import torch\b|from torch\b)", source, re.MULTILINE) is None

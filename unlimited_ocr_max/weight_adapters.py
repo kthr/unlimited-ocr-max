@@ -44,11 +44,11 @@ from typing import Any
 import numpy as np
 from max.driver import Buffer
 
-from .bf16 import buffer_to_numpy, numpy_to_buffer
+from .buffers import as_float32, buffer_to_numpy, numpy_to_buffer
 from .decoder import UnlimitedOcrDecoder
 from .layers.clip_l import UNUSED_CHECKPOINT_WEIGHTS
 from .layers.sam_vit import CHECKPOINT_PREFIX as SAM_PREFIX
-from .layers.sam_vit import as_float32, sam_state_dict
+from .layers.sam_vit import sam_state_dict
 from .model_config import UnlimitedOCRConfig
 
 __all__ = [
@@ -99,11 +99,12 @@ class WeightMappingError(RuntimeError):
 def _dtype_name(tensor: Any) -> str:
     """A tensor's or a :class:`~max.graph.Weight`'s dtype as a bare name (``bfloat16``).
 
-    ``DType`` and numpy dtypes carry ``.name``; a ``torch.dtype`` only stringifies
-    (``torch.bfloat16``), so the three become directly comparable.
+    Everything that reaches this -- a :class:`~max.driver.Buffer`, a
+    :class:`~max.graph.Weight`, a numpy array -- carries its dtype as a ``DType``
+    or a ``np.dtype``, and both spell the bare name on ``.name``, so a checkpoint
+    dtype and a declared one compare directly.
     """
-    dtype = tensor.dtype
-    return str(getattr(dtype, "name", None) or dtype).removeprefix("torch.")
+    return tensor.dtype.name
 
 
 def language_weight_name(checkpoint_name: str) -> str:

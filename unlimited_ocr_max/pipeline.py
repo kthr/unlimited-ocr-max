@@ -251,6 +251,18 @@ class UnlimitedOcrPipeline:
         therefore **takes ownership** of the language state dict on an
         accelerator: after it runs, that mapping is empty and gone.
 
+        *When* the host entries go is the whole point, not merely *that* they
+        go, so the loop below must stay a loop that mutates ``host`` in place.
+        A rewrite that built the full device dict first and cleared the host one
+        afterwards -- a dict comprehension, say -- would leave the same empty
+        mapping behind and hit the same 17.83 GiB peak it exists to avoid. The
+        host peak this shape buys is one device copy plus the entries **not yet
+        converted**: entry ``k`` is dropped while ``n-1-k`` remain, which is
+        also why a ``Buffer``'s source array dies with it rather than being kept
+        alive by the device copy. (An accelerator-only test used to record that
+        liveness entry by entry; it was removed as untested-in-CI mechanics, so
+        this paragraph is the record.)
+
         **What the ``synchronize`` actually covers -- stated precisely, because
         an overclaim here reads as a safety argument.** ``.to(device)`` is an
         async copy and a host-backed source must outlive the *copy*, not the

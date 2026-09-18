@@ -15,11 +15,25 @@
   fp32↔bf16 conversion in numpy, bit-exact against torch per its own test, and the
   checkpoint-tensor path already moved onto `max.driver.Buffer`; between them
   nothing left in `unlimited_ocr_max/` imports torch. Guarded by
-  `tests/test_no_runtime_torch.py` — the `pyproject.toml` declaration, a
-  package-wide sweep for `import torch`/`from torch`, and a subprocess check that
-  makes torch unimportable and exercises the package import, the CLI parser,
-  `preprocess_page` and a tokenizer helper, proving the package still works with
-  torch genuinely gone, not just currently unimported.
+  `tests/test_no_runtime_torch.py` — the `pyproject.toml` declaration and a
+  package-wide sweep for `import torch`/`from torch` — and, in CI, by a step that
+  installs the wheel with **no extras** and there exercises the package import,
+  the CLI parser, `preprocess_page` and a tokenizer helper: the property is proved
+  where torch is genuinely absent rather than merely unimported.
+- **A SAM position table that does not match the target resolution is now an
+  error instead of being resampled.** `sam_state_dict` — and so
+  `vision_state_dict`, which wraps it — raises `ValueError`, naming both the shape
+  found and the shape needed, when `pos_embed` or a global block's
+  `rel_pos_h`/`rel_pos_w` arrives at the wrong grid. It previously interpolated
+  the table on the host instead (torch bicubic with antialias for `pos_embed`,
+  torch linear for the relative tables). That resampling was a gundam-mode
+  requirement this package does not serve, and it was unreachable for everything
+  it does: at the 1024px grid this package serves, the checkpoint already stores
+  `pos_embed` as `[1, 64, 64, 768]` and the relative tables at 127 (global) and 27
+  (windowed) rows, which is exactly what the graph declares. So no conversion that
+  ever ran changes — a silent branch that never fired became a loud one — and two
+  more torch call sites left the weight path with it. `ValueError` rather than
+  `WeightMappingError` because `sam_vit` is imported *by* `weight_adapters`.
 - **`weight_adapters.load_checkpoint` is gone** — an exported (`__all__`) function
   that read a safetensors shard into torch tensors and had no callers anywhere in
   the shipped package.

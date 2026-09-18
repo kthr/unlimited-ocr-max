@@ -101,15 +101,46 @@ jobs:
 
       # The property the whole torch-removal run (KON-190..194) exists to
       # deliver, pinned in CI rather than only verified by hand: installing
-      # the wheel with no extras must not resolve torch, and the package must
-      # still import. A separate venv from the `pytest` steps above, which
-      # install the `test` extra (torch included) on purpose. `-P` is required:
-      # unlike pytest (which inserts each test file's own directory, not the
-      # checkout root, into sys.path), a bare `python -c` prepends cwd --
-      # $GITHUB_WORKSPACE, which contains this very package's source -- and
-      # would silently check the checkout instead of the installed wheel.
+      # the wheel with no extras must not resolve torch, and every weight-free
+      # path must still work. A separate venv from the `pytest` steps above,
+      # which install the `test` extra (torch included) on purpose -- so this
+      # is the only place in the matrix where torch is *genuinely* absent, and
+      # therefore the only place the property can honestly be proved. A test
+      # inside the suite could only simulate the absence (by blocking the name)
+      # and would prove something about the simulation instead.
+      # `-P` is required: unlike pytest (which inserts each test file's own
+      # directory, not the checkout root, into sys.path), a bare `python -c`
+      # prepends cwd -- $GITHUB_WORKSPACE, which contains this very package's
+      # source -- and would silently check the checkout instead of the wheel.
+      # The `site-packages` assertion is what makes dropping `-P` fail loudly
+      # instead of turning this step into a no-op against the source tree.
+      # The Python below sits at the block scalar's own indentation, which YAML
+      # strips, so every statement reaches the shell at column 0 -- indenting it
+      # any further inside the `run: |` block would be an IndentationError, and
+      # any less would end the block scalar. Single quotes throughout: the outer
+      # shell string is double-quoted.
       - name: The wheel installs and imports without torch
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/venv-no-extras"
           uv pip install --python "$RUNNER_TEMP/venv-no-extras" "$(ls dist/*.whl)"
-          "$RUNNER_TEMP/venv-no-extras/bin/python" -P -c "import unlimited_ocr_max"
+          "$RUNNER_TEMP/venv-no-extras/bin/python" -P -c "
+          import importlib.util
+          assert importlib.util.find_spec('torch') is None, 'the no-extras install resolved torch'
+
+          import unlimited_ocr_max
+          assert 'site-packages' in unlimited_ocr_max.__file__, unlimited_ocr_max.__file__
+
+          from unlimited_ocr_max.cli import build_parser
+          args = build_parser().parse_args(['serve', '--devices', 'cpu'])
+          assert args.command == 'serve', args
+
+          from PIL import Image
+          from unlimited_ocr_max.batch_processor import preprocess_page
+          pixels = preprocess_page(Image.new('RGB', (48, 32), color=(10, 20, 30)), base_size=64)
+          assert pixels.shape == (1, 3, 64, 64), pixels.shape
+
+          from unlimited_ocr_max.tokenizer import build_prompt
+          assert build_prompt(lambda text: [7] * len(text.split()), prompt='<image>hello world').seq_len > 0
+
+          print('no-extras: import, CLI parser, preprocess_page and build_prompt all work without torch')
+          "
