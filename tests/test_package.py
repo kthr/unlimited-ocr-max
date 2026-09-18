@@ -21,6 +21,10 @@ PINNED_MAX_VERSION = "26.6.0"
 def test_installed_max_is_the_pinned_release() -> None:
     assert importlib.metadata.version("max") == PINNED_MAX_VERSION
     assert f'"max[all]=={PINNED_MAX_VERSION}"' in (ROOT / "pyproject.toml").read_text()
+    # The README states the pin to the reader, so it must not drift from pyproject.
+    # Only README.md is checked: it is the one doc in the sdist `include` list, so
+    # this assertion holds for an install from the sdist as well as from a checkout.
+    assert f"max[all]=={PINNED_MAX_VERSION}" in (ROOT / "README.md").read_text()
 
 
 def _modules_after(code: str) -> set[str]:

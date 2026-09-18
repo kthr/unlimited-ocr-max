@@ -23,11 +23,15 @@ and macOS, and asserts both `kernels/*.mojo` are inside it.
    with `gh release create` and the workflow's own token -- no third-party
    release action). Nothing is ever published from a developer machine.
 
-## One-time PyPI setup
+## One-time PyPI setup — already done
 
-`unlimited-ocr-max` does not exist on PyPI yet, so register it as a *pending*
-trusted publisher: pypi.org → *Your account* → *Publishing* → *Add a new
-pending publisher* → GitHub, with
+`unlimited-ocr-max` exists on PyPI. The *pending* trusted publisher was
+registered before the first release (pypi.org → *Your account* → *Publishing* →
+*Add a new pending publisher* → GitHub); the first tag push created the project
+(**v0.1.0**) and turned the pending publisher into a real one, and GitHub
+created the `pypi` environment on that first use. Both exist now — nothing here
+has to be redone. These are the registered values, kept for the case where the
+publisher has to be re-created:
 
 | field | value |
 | --- | --- |
@@ -37,16 +41,17 @@ pending publisher* → GitHub, with
 | Workflow name | `publish.yml` |
 | Environment name | `pypi` |
 
-All five values must match the workflow exactly. The first tag push creates the
-project and turns the pending publisher into a real one; the `pypi` environment
-is created by GitHub on first use. No API token, no repository secret.
+All five values must match the workflow exactly. No API token, no repository
+secret.
 
-Once that environment exists, add yourself under GitHub → *Settings* →
+**Still to do, if it has not been:** add yourself under GitHub → *Settings* →
 *Environments* → `pypi` → *Required reviewers*, so every upload to PyPI waits
 for a human approval instead of going out on any tag push.
 
-The install instructions need no extra index: the pinned `max[all]==26.6.0` is
-on PyPI, so `pip install unlimited-ocr-max` resolves the whole dependency set
-from PyPI alone. (Up to and including v0.2.1 the pin was a `26.6.0.dev*`
-nightly, which required `--extra-index-url
-https://whl.modular.com/nightly/simple/`.)
+The install instructions need no extra index **from the next release on**: the
+pinned `max[all]==26.6.0` is on PyPI, so `pip install unlimited-ocr-max`
+resolves the whole dependency set from PyPI alone. That is not yet true of what
+is *published* — the latest release on PyPI is **0.2.1**, which still pins
+`max[all]==26.6.0.dev2026082707`, a nightly that is not on PyPI, so a plain
+`pip install unlimited-ocr-max` today installs 0.2.1 and fails to resolve `max`
+without `--extra-index-url https://whl.modular.com/nightly/simple/`.
