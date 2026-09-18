@@ -21,8 +21,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Recognition",
 ]
 dependencies = [
-    # The exact build this port is validated on; published on Modular's nightly index only.
-    "max[all]==26.6.0.dev2026091105",
+    # The exact release this port is validated on; published on PyPI.
+    "max[all]==26.6.0",
     "numpy>=2.5.2",
     "pillow>=12.3.0",
     "torch>=2.13.0,<2.15",
@@ -56,10 +56,3 @@ include = ["unlimited_ocr_max", "tests", "README.md", "LICENSE", "pyproject.toml
 markers = [
     "slow: compiles Mojo kernels through a MAX InferenceSession; CI runs -m 'not slow'",
 ]
-
-# The 26.6 dev build lives on Modular's nightly index, not PyPI. This block
-# applies to a checkout of this repository; an install from PyPI or a git URL
-# must pass --extra-index-url https://whl.modular.com/nightly/simple/ itself.
-[[tool.uv.index]]
-name = "modular-nightly"
-url = "https://whl.modular.com/nightly/simple/"

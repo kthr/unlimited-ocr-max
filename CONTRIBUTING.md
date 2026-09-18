@@ -1,7 +1,7 @@
 # Contributing
 
 ```bash
-uv venv && uv pip install -e '.[test]'   # nightly index comes from [[tool.uv.index]]
+uv venv && uv pip install -e '.[test]'   # everything, MAX included, comes from PyPI
 .venv/bin/pytest tests -q                # 15 model-free tests, no weights needed
 ```
 
@@ -45,7 +45,8 @@ Once that environment exists, add yourself under GitHub → *Settings* →
 *Environments* → `pypi` → *Required reviewers*, so every upload to PyPI waits
 for a human approval instead of going out on any tag push.
 
-Being on PyPI does not remove `--extra-index-url
-https://whl.modular.com/nightly/simple/` from the install instructions: the
-pinned `max[all]==26.6.0.dev2026091105` is published on that index only, until
-this port's fixes reach a stable MAX release.
+The install instructions need no extra index: the pinned `max[all]==26.6.0` is
+on PyPI, so `pip install unlimited-ocr-max` resolves the whole dependency set
+from PyPI alone. (Up to and including v0.2.1 the pin was a `26.6.0.dev*`
+nightly, which required `--extra-index-url
+https://whl.modular.com/nightly/simple/`.)

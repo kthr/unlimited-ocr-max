@@ -15,10 +15,10 @@ import pytest
 from unlimited_ocr_max import cli
 
 ROOT = Path(__file__).resolve().parent.parent
-PINNED_MAX_VERSION = "26.6.0.dev2026091105"
+PINNED_MAX_VERSION = "26.6.0"
 
 
-def test_installed_max_is_the_pinned_nightly() -> None:
+def test_installed_max_is_the_pinned_release() -> None:
     assert importlib.metadata.version("max") == PINNED_MAX_VERSION
     assert f'"max[all]=={PINNED_MAX_VERSION}"' in (ROOT / "pyproject.toml").read_text()
 
