@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Behavior
+- **torch is no longer a runtime dependency.** It moves from `[project].dependencies`
+  to the `test` extra (same `>=2.13.0,<2.15` pin), where it now serves only as the
+  bit-exactness oracle `tests/test_bf16.py` checks numpy's fp32↔bf16 round-trip
+  against, and as the fixture builder for the weight-adapter tests. `pip install
+  unlimited-ocr-max` no longer resolves torch — on Linux that also means no
+  `nvidia-*` CUDA wheels, which torch pulls in as its own dependencies regardless
+  of whether a GPU is present: several gigabytes an installing user was paying for
+  a library this port's runtime never touched. The dependency declaration is
+  catching up with the code: `unlimited_ocr_max/bf16.py` (new this run) does the
+  fp32↔bf16 conversion in numpy, bit-exact against torch per its own test, and the
+  checkpoint-tensor path already moved onto `max.driver.Buffer`; between them
+  nothing left in `unlimited_ocr_max/` imports torch. Guarded by
+  `tests/test_no_runtime_torch.py` — the `pyproject.toml` declaration, a
+  package-wide sweep for `import torch`/`from torch`, and a subprocess check that
+  makes torch unimportable and exercises the package import, the CLI parser,
+  `preprocess_page` and a tokenizer helper, proving the package still works with
+  torch genuinely gone, not just currently unimported.
+- **`weight_adapters.load_checkpoint` is gone** — an exported (`__all__`) function
+  that read a safetensors shard into torch tensors and had no callers anywhere in
+  the shipped package.
+
 ## [0.3.0] — 2026-09-18
 
 ### Performance

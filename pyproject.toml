@@ -25,11 +25,15 @@ dependencies = [
     "max[all]==26.6.0",
     "numpy>=2.5.2",
     "pillow>=12.3.0",
-    "torch>=2.13.0,<2.15",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=9"]
+test = [
+    "pytest>=9",
+    # Bit-exactness oracle for tests/test_bf16.py and the fixture builder
+    # for the weight-adapter tests; not needed at runtime.
+    "torch>=2.13.0,<2.15",
+]
 
 [project.scripts]
 unlimited-ocr-max = "unlimited_ocr_max.cli:main"
