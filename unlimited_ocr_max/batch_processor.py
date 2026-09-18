@@ -2,8 +2,8 @@
 
 Preprocessing reproduces the reference's ``infer()`` bitwise: pad to square with
 the mean colour (``int(0.5 * 255) == 127``), ``ToTensor``, normalise with
-mean/std 0.5, then a bfloat16 round-trip through torch so the fp32 pixels hold
-only bf16-representable values.
+mean/std 0.5, then a bf16 round-trip (``bf16.fp32_to_bf16_roundtrip``) so the
+fp32 pixels hold only bf16-representable values.
 """
 
 from __future__ import annotations

@@ -8,6 +8,7 @@ against torch exhaustively, so this file only has to show that the surrounding
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -78,4 +79,4 @@ def test_normalise_view_rejects_a_non_rgb_shape() -> None:
 def test_batch_processor_source_has_no_torch_import() -> None:
     """The one parity-critical torch site (KON-193): the module must not import torch at all."""
     source = Path(batch_processor.__file__).read_text()
-    assert "import torch" not in source
+    assert re.search(r"^\s*(import torch\b|from torch\b)", source, re.MULTILINE) is None
