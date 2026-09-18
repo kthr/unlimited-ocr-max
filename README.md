@@ -25,6 +25,11 @@ yet — so installing **those** versions needs
 `pip`, for the pre-release `mojo`). From v0.3.0, and from this source tree,
 neither is needed.
 
+**Runtime dependencies are `max[all]`, `numpy` and `pillow` — nothing else.**
+torch is not installed by `pip install unlimited-ocr-max`; it is only needed
+for development (the `test` extra), as the bit-exactness oracle a couple of
+tests check numpy's bf16 round-trip against.
+
 ## Serve
 
 ```bash

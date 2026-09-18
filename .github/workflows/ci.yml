@@ -77,14 +77,17 @@ jobs:
       # wheel (site-packages), never the source tree next to them -- that is
       # what makes the kernels/*.mojo and `max` version assertions meaningful.
       # `max[all]==26.6.0` comes from PyPI like everything else; no extra index.
-      # The download may be slow (hence the timeout, ~4 GB of wheels on Linux
-      # where torch pulls the CUDA stack); it may not fail.
+      # The `test` extra is what brings pytest and torch in -- torch is not a
+      # runtime dependency of the wheel itself, only of this extra (the
+      # bit-exactness oracle a few tests hold their numpy conversions against).
+      # The download may still be slow (hence the timeout, ~4 GB of wheels on
+      # Linux, where the extra's torch pulls the CUDA stack); it may not fail.
       - name: Install the built wheel into a fresh venv
         timeout-minutes: 30
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/venv"
           uv pip install --python "$RUNNER_TEMP/venv" \
-            "$(ls dist/*.whl)" 'pytest>=9'
+            "$(ls dist/*.whl)[test]"
 
       # The model-free set: every file under tests/, no weights and no server
       # needed. The count has one home -- see CONTRIBUTING.md.
@@ -95,3 +98,18 @@ jobs:
       - name: Console script
         run: |
           "$RUNNER_TEMP/venv/bin/unlimited-ocr-max" --help
+
+      # The property the whole torch-removal run (KON-190..194) exists to
+      # deliver, pinned in CI rather than only verified by hand: installing
+      # the wheel with no extras must not resolve torch, and the package must
+      # still import. A separate venv from the `pytest` steps above, which
+      # install the `test` extra (torch included) on purpose. `-P` is required:
+      # unlike pytest (which inserts each test file's own directory, not the
+      # checkout root, into sys.path), a bare `python -c` prepends cwd --
+      # $GITHUB_WORKSPACE, which contains this very package's source -- and
+      # would silently check the checkout instead of the installed wheel.
+      - name: The wheel installs and imports without torch
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/venv-no-extras"
+          uv pip install --python "$RUNNER_TEMP/venv-no-extras" "$(ls dist/*.whl)"
+          "$RUNNER_TEMP/venv-no-extras/bin/python" -P -c "import unlimited_ocr_max"
