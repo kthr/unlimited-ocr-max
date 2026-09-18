@@ -23,16 +23,15 @@ A half-quantized file -- scales for some experts or projections but not all,
 int8 expert weights with no scales, or scales next to non-int8 weights -- is a
 :class:`WeightMappingError`, never a guess.
 
-``vision``: strip ``model.``, upcast to fp32, resample SAM's position tables for
-the resolution and transpose its conv filters to RSCF; the dead CLIP patch conv
-is dropped by name.
+``vision``: strip ``model.``, upcast to fp32, transpose SAM's conv filters to RSCF;
+the dead CLIP patch conv is dropped by name. SAM's position tables are expected
+to match the target resolution and are not resampled.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -50,7 +49,6 @@ __all__ = [
     "check_against_declared",
     "is_int8_checkpoint",
     "language_state_dict",
-    "load_checkpoint",
     "stack_expert_weights",
     "vision_state_dict",
 ]
@@ -97,14 +95,6 @@ def _dtype_name(tensor: Any) -> str:
     """
     dtype = tensor.dtype
     return str(getattr(dtype, "name", None) or dtype).removeprefix("torch.")
-
-
-def load_checkpoint(path: str | Path) -> dict[str, Any]:
-    """Every tensor of a safetensors shard as torch tensors, in the dtype the file stores (numpy has no bf16)."""
-    from safetensors import safe_open
-
-    with safe_open(str(path), framework="pt") as handle:
-        return {key: handle.get_tensor(key) for key in handle.keys()}  # noqa: SIM118
 
 
 def language_weight_name(checkpoint_name: str) -> str:
