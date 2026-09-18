@@ -2,7 +2,7 @@
 
 ```bash
 uv venv && uv pip install -e '.[test]'   # everything, MAX included, comes from PyPI
-.venv/bin/pytest tests -q                # 15 model-free tests, no weights needed
+.venv/bin/pytest tests -q -m "not slow"  # 61 model-free tests, no weights needed
 ```
 
 CI runs the same tests against the *built wheel* in a throwaway venv on Linux

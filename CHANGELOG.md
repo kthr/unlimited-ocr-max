@@ -31,7 +31,9 @@
   Modular distributions and nothing else — except seven transitive dependencies
   (`pydantic`, `pydantic-core`, `tokenizers`, `safetensors`, `networkx`,
   `cyclopts`, `hf-xet`) that land on stable versions instead of the
-  pre-releases the dev pin's `--prerelease allow` admitted. Validated at the
+  pre-release-driven versions the dev pin's `--prerelease allow` admitted
+  (six were themselves pre-releases; `pydantic-core` moved because the
+  pre-release `pydantic` pins it). Validated at the
   stable in a venv rebuilt from scratch: the 61 model-free tests pass — the pin
   guard and MAX's weight-filename parser among them — and so do all 25 `slow`
   tests, which compile the Mojo kernels (int8 included) through a MAX

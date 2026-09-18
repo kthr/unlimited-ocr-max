@@ -86,7 +86,7 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/venv" \
             "$(ls dist/*.whl)" 'pytest>=9'
 
-      # 15 model-free tests: the MAX pin, lazy architecture export, the Mojo
+      # 61 model-free tests: the MAX pin, lazy architecture export, the Mojo
       # sources in the installed package, `max serve` argv, prompt expansion.
       - name: pytest
         run: |
