@@ -37,6 +37,16 @@ def as_float32(bits: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(bits, dtype=np.uint32).view(np.float32)
 
 
+def is_nan(bits: np.ndarray) -> np.ndarray:
+    """Mask of NaN patterns: exponent all ones, mantissa non-zero.
+
+    torch's answer for a NaN input is **platform-dependent** -- see
+    ``test_a_nan_input_always_comes_back_a_quiet_nan`` -- so every comparison
+    against torch below excludes them, and their contract is asserted directly.
+    """
+    return (bits & np.uint32(0x7FFFFFFF)) > np.uint32(0x7F800000)
+
+
 def assert_same_bits(got: np.ndarray, want: np.ndarray, case: str) -> None:
     assert got.dtype == np.float32, f"{case}: {got.dtype}"
     assert got.shape == want.shape, f"{case}: {got.shape} != {want.shape}"
@@ -88,7 +98,10 @@ def test_a_sweep_across_every_exponent_matches_torch() -> None:
     mantissas = np.array([0x0, 0x1, 0x7FFF, 0x8000, 0x8001, 0xFFFF, 0x123456, 0x400000, 0x7FFFFF], dtype=np.uint32)
     bits = (signs[:, None, None] | exponents[None, :, None] | mantissas[None, None, :]).ravel()
     values = as_float32(bits)
-    assert_same_bits(fp32_to_bf16_roundtrip(values), torch_roundtrip(values), "exponent sweep")
+    got = fp32_to_bf16_roundtrip(values)
+    finite = ~is_nan(bits)
+    assert_same_bits(got[finite], torch_roundtrip(values[finite]), "exponent sweep")
+    assert np.array_equal(got.view(np.uint32)[~finite], np.full(int((~finite).sum()), 0x7FC00000, dtype=np.uint32))
 
 
 def test_every_tie_rounds_to_even() -> None:
@@ -98,11 +111,10 @@ def test_every_tie_rounds_to_even() -> None:
     bits = kept | np.uint32(0x8000)
     values = as_float32(bits)
     got = fp32_to_bf16_roundtrip(values)
-    assert_same_bits(got, torch_roundtrip(values), "ties")
+    finite = ~is_nan(bits)
+    assert_same_bits(got[finite], torch_roundtrip(values[finite]), "ties")
 
-    # Round-to-even is visible without a reference: a tie always lands on an even
-    # mantissa. NaN inputs are excluded -- torch answers those with one fixed NaN.
-    finite = (bits & np.uint32(0x7FFFFFFF)) <= np.uint32(0x7F800000)
+    # Round-to-even is visible without a reference: a tie always lands on an even mantissa.
     assert np.all((got.view(np.uint32)[finite] >> np.uint32(16)) % 2 == 0)
 
 
@@ -122,15 +134,24 @@ def test_signed_zero_and_infinity_come_back_untouched() -> None:
     assert np.array_equal(got.view(np.uint32), bits)
 
 
-def test_every_nan_collapses_to_one_canonical_quiet_nan() -> None:
-    """torch's conversion is not IS-a-NaN-preserving: payload and sign are dropped
-    (``c10::detail::round_to_nearest_even``). Matching torch means dropping them too."""
+def test_a_nan_input_always_comes_back_a_quiet_nan() -> None:
+    """NaN in, canonical quiet NaN out -- and deliberately NOT compared against torch.
+
+    torch's own answer here depends on the machine: ``c10::detail::round_to_nearest_even``
+    canonicalises to ``0x7FC0`` (measured on macOS arm64, torch 2.14.0), while the
+    x86_64 vectorised path returns the rounded pattern instead (``0xFFFF0000`` for
+    ``0xFFFFFFFF``, measured on ubuntu-latest in CI). Pinning either would make this
+    suite pass on one runner and fail on the other, so the contract asserted here is
+    ours: a NaN stays a NaN. That is also what keeps the 32-bit add's wrap -- confined
+    to ``[0xFFFF8000, 0xFFFFFFFF]``, every value of which is NaN -- from surfacing as
+    ``+0.0``. No input this package converts is ever NaN: pixels come from uint8.
+    """
     rng = np.random.default_rng(3)
     payloads = np.unique(np.concatenate([np.arange(1, 4096), rng.integers(1, 1 << 23, size=1 << 14)])).astype(np.uint32)
     bits = np.concatenate([np.uint32(0x7F800000) | payloads, np.uint32(0xFF800000) | payloads])
     values = as_float32(bits)
     got = fp32_to_bf16_roundtrip(values)
-    assert_same_bits(got, torch_roundtrip(values), "nan payloads")
+    assert np.all(np.isnan(got))
     assert np.array_equal(got.view(np.uint32), np.full(bits.size, 0x7FC00000, dtype=np.uint32))
 
 

@@ -9,10 +9,14 @@ over the whole bf16 range, an exhaustive tie sweep and the specials -- because a
 pixel off by one mantissa bit moves the logits, and the port is gated on
 byte-identical output.
 
-torch's narrowing is round-to-nearest-even on the upper 16 bits *except* for NaN,
-where it answers with one canonical quiet NaN, payload and sign dropped
-(``c10::detail::round_to_nearest_even``). That is torch's behaviour rather than
-IEEE's, so it is reproduced here deliberately.
+Narrowing is round-to-nearest-even on the upper 16 bits, bitwise what torch gives
+for every finite value. NaN is the one input where torch does not answer the same
+on every machine -- ``c10::detail::round_to_nearest_even`` canonicalises to
+``0x7FC0`` on macOS arm64, while the x86_64 vectorised path returns the rounded
+pattern -- so a NaN is canonicalised here unconditionally rather than chasing a
+platform. Nothing this package converts is ever NaN (pixels come from uint8), and
+the canonicalisation is also what keeps the 32-bit add's wrap, confined to the
+all-NaN range ``[0xFFFF8000, 0xFFFFFFFF]``, from surfacing as ``+0.0``.
 
 **numpy and nothing else** -- deliberately, not incidentally. Importing MAX here
 would shut this module out of the one kind of consumer that most wants the rule:
