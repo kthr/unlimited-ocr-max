@@ -39,6 +39,7 @@ import math
 from collections.abc import Callable, Sequence
 
 import numpy as np
+from max.driver import accelerator_api
 from max.dtype import DType
 from max.graph import DeviceRef, TensorType, TensorValue, Weight, ops
 from max.nn import LayerList, Module
@@ -75,6 +76,29 @@ def causal_mask_bias(seq_len: int) -> np.ndarray:
     return np.where(allowed, np.float32(0.0), np.finfo(np.float32).min).astype(np.float32)
 
 
+#: CUDA caps ``gridDim.y`` and ``.z`` at 65535 while ``x`` holds 2**31-1. MAX's
+#: GEMV dispatcher checks ``ceildiv(n, 2)`` against that cap and then launches
+#: ``ceildiv(n, tile_n)`` blocks on y with ``tile_n`` as low as 1
+#: (``max/kernels/src/linalg/gemv.mojo``), so the check passes and the launch
+#: fails for an fp32 GEMV wider than the cap: ``CUDA_ERROR_INVALID_VALUE``.
+#: Measured on an A100 (driver 595.84) at 26.6.0 and on nightly, against this
+#: checkpoint's 129280-wide ``lm_head``. Metal and CPU have no such limit.
+CUDA_MAX_GRID_Y = 65535
+
+
+def _projection_split(out_dim: int) -> int | None:
+    """Chunk width for an ``out_dim``-wide projection on CUDA, else ``None`` for one matmul.
+
+    Splitting the output dimension is arithmetically free -- every column is an
+    independent dot product over the shared K -- so the concatenated result is
+    bitwise the undivided one. It is still gated to CUDA: the graph Metal serves
+    is the one the transcript gate validated, and it stays that graph.
+    """
+    if out_dim <= CUDA_MAX_GRID_Y or accelerator_api() != "cuda":
+        return None
+    return math.ceil(out_dim / math.ceil(out_dim / CUDA_MAX_GRID_Y))
+
+
 class Projection(Module):
     """A bias-free ``[out_dim, in_dim]`` bf16 weight applied as ``x @ w.T`` to an fp32 activation."""
 
@@ -83,7 +107,12 @@ class Projection(Module):
         self.weight = Weight("weight", dtype, [out_dim, in_dim], device=device)
 
     def __call__(self, x: TensorValue) -> TensorValue:
-        return x @ self.weight.T
+        out_dim = int(self.weight.shape[0])
+        width = _projection_split(out_dim)
+        if width is None:
+            return x @ self.weight.T
+        starts = range(0, out_dim, width)
+        return ops.concat([x @ self.weight[s : min(s + width, out_dim)].T for s in starts], axis=-1)
 
 
 class EmbeddingTable(Module):
