@@ -206,6 +206,13 @@ class _ProbeFailingMidRun(_FakeProbe):
         return super().stats()
 
 
+def _idle_gpu(monkeypatch: pytest.MonkeyPatch, probe: Any) -> None:
+    """Patch ``open_device_probe`` to ``probe`` (a class or a zero-arg factory) and stub
+    ``foreign_gpu_processes`` so a guarded ``--devices gpu`` run treats the GPU as otherwise idle."""
+    monkeypatch.setattr(profile_sampling, "open_device_probe", probe)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+
+
 def _no_spawn(self: Any) -> None:
     pytest.fail("profile started a server although it had to refuse first")
 
@@ -440,8 +447,7 @@ def test_a_wrong_page_is_counted_not_hidden(stub: Stub, tmp_path: Path, monkeypa
 def test_int8_weights_are_also_compared_against_the_pinned_int8_references(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(profile_sampling, "open_device_probe", _FakeProbe)
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    _idle_gpu(monkeypatch, _FakeProbe)
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port(), "--weights", "int8", devices="gpu"), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -1078,8 +1084,7 @@ def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")  # page windows long enough for several device samples
-    monkeypatch.setattr(profile_sampling, "open_device_probe", _TwoGpuProbe)
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    _idle_gpu(monkeypatch, _TwoGpuProbe)
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -1100,8 +1105,7 @@ def test_device_figures_are_marked_partial_when_device_sampling_stops_mid_run(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")
-    monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: _ProbeFailingMidRun(stub))
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    _idle_gpu(monkeypatch, lambda: _ProbeFailingMidRun(stub))
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -1137,8 +1141,7 @@ class _ProbeFailingAfterTheBaseline(_FakeProbe):
 def test_device_sampling_that_fails_before_its_first_sample_is_said_not_silent(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(profile_sampling, "open_device_probe", _ProbeFailingAfterTheBaseline)
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    _idle_gpu(monkeypatch, _ProbeFailingAfterTheBaseline)
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -1171,8 +1174,7 @@ def test_gpu_utilisation_without_device_memory_is_still_printed(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")
-    monkeypatch.setattr(profile_sampling, "open_device_probe", _UtilisationOnlyProbe)
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    _idle_gpu(monkeypatch, _UtilisationOnlyProbe)
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
     captured = capsys.readouterr()
