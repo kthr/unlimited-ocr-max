@@ -1,6 +1,24 @@
 # Changelog
 
-## [Unreleased]
+## [0.3.1] — 2026-09-22
+
+### Fixed
+- **NVIDIA: the `lm_head` projection is split so the GEMV launch fits CUDA's
+  grid limit.** v0.3.0 aborts on the first request on every CUDA device with
+  `CUDA_ERROR_INVALID_VALUE` — MAX's GEMV dispatcher guards on
+  `ceildiv(n, 2) <= MAX_GRID_DIM_Y` but then launches `ceildiv(n, tile_n)`
+  blocks in grid-Y with a `tile_n` as low as 1, so this checkpoint's 129280-wide
+  vocabulary projection asks for 129280 blocks against the hardware's 65535.
+  `unlimited_ocr_max.decoder.Projection` now splits any projection wider than
+  65535 into equal-width matmuls concatenated on the last axis, and only when
+  `max.driver.accelerator_api() == "cuda"`. `lm_head` is the only projection in
+  this model that is wide enough; the others are 64, 1280 and 6848. The split is
+  **bitwise identical** to the unsplit matmul — each output column is the same
+  dot product of the same two rows, and no accumulation crosses a split boundary
+  — which `tests/test_projection_split.py` asserts on the `uint32` bit patterns
+  with the cap monkeypatched low enough to force a split. Metal, CPU and AMD
+  take the unsplit path unchanged. Upstream defect, not this port's; the guard
+  and the launch are in MAX's own dispatcher.
 
 ### Behavior
 - **torch is no longer a runtime dependency.** It moves from `[project].dependencies`
@@ -37,6 +55,17 @@
 - **`weight_adapters.load_checkpoint` is gone** — an exported (`__all__`) function
   that read a safetensors shard into torch tensors and had no callers anywhere in
   the shipped package.
+### Documentation
+- **The CUDA math libraries are a prerequisite, and they are not installed by
+  `pip`.** MAX binds `libcublas`, `libcublasLt` and `libnvrtc` at runtime but
+  neither ships nor declares them, so on a machine without them a serve aborts
+  at the first request with `symbol not found: cublasCreate_v2`. README and the
+  model card now say to install them as system libraries (NVIDIA's CUDA apt
+  repository, then `ldconfig`) rather than as pip wheels, which land in
+  `site-packages/nvidia/` where the dynamic loader does not look.
+- **The README now records what has been run on which hardware**, with the
+  quantisation and the measured decode rate, prefill and text-fidelity figures
+  per row, rather than describing the Apple machine alone.
 
 ## [0.3.0] — 2026-09-18
 

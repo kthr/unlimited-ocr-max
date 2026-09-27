@@ -1,123 +1,142 @@
 # unlimited-ocr-max
 
 [`baidu/Unlimited-OCR`](https://huggingface.co/baidu/Unlimited-OCR) served through
-[MAX](https://docs.modular.com/max/) on Apple Silicon. The vision tower, the MoE
-decoder and its sliding-window attention are rebuilt as a MAX custom architecture
-with a [Mojo](https://docs.modular.com/mojo/) custom op (`ngram_block`, the
-no-repeat-n-gram guard), and exposed as an OpenAI-compatible endpoint on the
-Metal GPU or the CPU. The weights are baidu's, unchanged, served from
-[`kthierbach/unlimited-ocr-max`](https://huggingface.co/kthierbach/unlimited-ocr-max).
+[MAX](https://docs.modular.com/max/) as an OpenAI-compatible endpoint on Metal,
+CUDA, ROCm or CPU. Weights: [`kthierbach/unlimited-ocr-max`](https://huggingface.co/kthierbach/unlimited-ocr-max).
 
-## Install
+* **bf16** — baidu's `model.safetensors`, unchanged.
+* **int8** — `model-int8.safetensors`, this port's weight-only quantisation of
+  the routed experts (symmetric, per-group G=128).
+* `config.json` is baidu's minus `auto_map` and `model_type`, so MAX loads it
+  without remote code.
+
+## Prerequisites
+
+Python 3.12 or 3.13, plus one of:
+
+### Apple silicon — M1–M5, macOS 15+, 24 GB recommended
 
 ```bash
-uv tool install unlimited-ocr-max
-# or, into a venv
-pip install unlimited-ocr-max
+# requires full Xcode (App Store); the Command Line Tools alone are not enough
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+# MAX compiles Metal kernels with `xcrun metallib`, shipped in the Metal Toolchain
+xcodebuild -downloadComponent MetalToolchain
+xcrun -f metallib          # must print a path
 ```
 
-**From v0.3.0 on, PyPI alone is enough:** the package pins one exact MAX release
-(`max[all]==26.6.0`), and that release — with the `mojo` it depends on — is
-published on PyPI. Up to and including v0.2.1 the pin was a `26.6.0.dev*`
-nightly, because the 26.6 fixes this port needs had not reached a stable release
-yet — so installing **those** versions needs
-`--extra-index-url https://whl.modular.com/nightly/simple/` (and `--pre` with
-`pip`, for the pre-release `mojo`). From v0.3.0, and from this source tree,
-neither is needed.
+### NVIDIA — Linux (glibc 2.34+, e.g. Ubuntu 22.04+), Ampere or newer, driver 580+
 
-**Runtime dependencies are `max[all]`, `numpy` and `pillow` — nothing else.**
-torch is not installed by `pip install unlimited-ocr-max`; it is only needed
-for development (the `test` extra), as the bit-exactness oracle a couple of
-tests check numpy's bf16 round-trip against.
+Follow NVIDIA's [package-manager installation](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/#package-manager-installation);
+for example, on Ubuntu 24.04 x86_64:
+
+```bash
+# MAX loads these at runtime but does not ship them; without them the
+# first request fails with: symbol not found: cublasCreate_v2
+# 1. add NVIDIA's CUDA repository (ubuntu2404/x86_64 shown; use your distro/arch)
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt-get update
+# 2. libcublas + libcublasLt (one package) and libnvrtc, CUDA 13
+sudo apt-get install -y libcublas-13-0 cuda-nvrtc-13-0
+# 3. check they are on the loader path
+ldconfig -p | grep -E "libcublas|libnvrtc"
+```
+
+Use these system packages, not the `nvidia-*-cu13` pip wheels — the loader does
+not find those. NVIDIA needs **v0.3.1 or later**: v0.3.0 aborts on the first
+request with `CUDA_ERROR_INVALID_VALUE`.
+
+### AMD — Linux, driver 6.3.3+ (MI355X: ROCm 7+)
+
+Nothing beyond the driver is known to be needed; untested beyond compilation.
+
+### CPU
+
+Nothing beyond Python. Supported, slow.
 
 ## Serve
 
 ```bash
-unlimited-ocr-max serve --devices gpu   # Metal
-unlimited-ocr-max serve --devices cpu   # supported, slow
+uv tool install unlimited-ocr-max        # or: pip install unlimited-ocr-max
+unlimited-ocr-max serve --devices gpu
 ```
 
-This downloads the model repository once (6.2 GiB) and runs `max serve` with
-this port's flags, on `http://127.0.0.1:8010` under the model id
+This installs `max[all]==26.6.0`, `numpy` and `pillow` from PyPI (no extra
+index). The first run downloads the weights (6.2 GiB bf16, 4.0 GiB int8) and
+compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, model
 `unlimited-ocr-max`.
 
-* `--revision` defaults to `DEFAULT_REVISION` in `unlimited_ocr_max/cli.py`
-  (tied by a package test to the package's own version) — the model-repo tag
-  this package version was validated against, so a fixed
-  package version serves fixed weights; the tag must exist or the download fails
-  before MAX starts. Ignored for a local directory. `unlimited-ocr-max serve
-  --help` prints the value the installed build carries.
-* `--model <dir>` serves a local copy with the repository's layout
-  (`config.json`, the tokenizer files, `model.safetensors`).
-* `--weights bf16` (default) selects the unquantised `model.safetensors`; it
-  serves on `--devices cpu` or `gpu`. `--weights int8` selects
-  `model-int8.safetensors`, a symmetric per-group int8 quantisation of the 64
-  routed experts (group size 128, along the input dimension; every other tensor
-  stays bf16), and is **GPU only** — the dequantise-and-matmul runs in a Mojo
-  custom op (`moe_int8`), since MAX's own int8 matmul is gated to a later Apple
-  GPU. The chosen file is passed as `max serve --weight-path`; neither name
-  carries an encoding token, because MAX reads hints such as `bf16` out of weight
-  filenames and would refuse the CPU path or mislabel the GPU one (a package test
-  pins this). int8 reproduces bf16's transcribed **text byte-for-byte** on the
-  port's twelve-page set; only grounding bounding-box coordinates differ, by one
-  or two pixels. It cuts the served peak memory by ~2.5 GiB (16.7 → 14.2 GiB on
-  the M4 24 GB), which is what brings the model within reach of a 16 GB machine. It also
-  decodes about 1.8× faster (~37 vs ~21 tokens/second on that M4, greedy), because
-  the routed-expert decode is weight-bandwidth-bound and int8 halves the bytes read.
-* `--ngram-size` sets the no-repeat-n-gram guard, default 35; `0` switches it
-  off, which reproduces the PyTorch reference byte for byte.
+| flag | values | default | what it does |
+|---|---|---|---|
+| `--devices` | `gpu` \| `cpu` | **required** | `gpu` is Metal, CUDA or ROCm; `cpu` is slow |
+| `--weights` | `bf16` \| `int8` | `bf16` | `int8`: quantised routed experts, faster decode, **gpu only** |
+| `--model` | Hub repo or local dir | `kthierbach/unlimited-ocr-max` | a local dir needs this repository's layout |
+| `--revision` | tag | `v0.3.1` | the model-repo tag this package version was validated against |
+| `--port` | integer | `8010` | |
+| `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
 
-On the GPU the server holds one language graph at a time — the vision tower,
-the prefill graph and the decode graph together do not fit the Metal budget —
-so every request reloads a graph. With `--weights bf16` the language weights
-are bound as **one shared device registry** that both graphs declare
-device-side, which takes that per-request decode reload from ~10.5 s to **~1.5 s**
-and the time to first token from ~8.5 s to ~5.3 s. It is not free: holding the
-registry through decode costs about **+9 %** on the steady decode step, and the
-net is still **−7 to −15 s per page** on every page measured. `--weights int8`
-deliberately does **not** share: the same registry commit was falsified by the
-served identity gate on int8 (0 of 12 pages byte-identical in both request
-orders, including one page that returned an empty response), while a flag-off
-control on the same machine and harness served 12 of 12 — so int8 serves in the
-per-graph configuration its published transcripts were taken in, and reloads in
-the 3–6 s class (the measured population is the research port's, 3.1–6.5 s;
-this package's own int8 reload population has not been measured directly).
-Both variants reproduce their pinned transcripts byte for byte
-as shipped.
-
-One page per request, `base` mode, image first:
+One page to Markdown:
 
 ```bash
 curl -s http://127.0.0.1:8010/v1/chat/completions -H 'Content-Type: application/json' -d @- <<EOF
 {"model": "unlimited-ocr-max", "temperature": 0, "max_tokens": 1766,
  "messages": [{"role": "user", "content": [
    {"type": "text", "text": "<|grounding|>Convert the document to markdown."},
-   {"type": "image_url", "image_url": {"url": "data:image/png;base64,$(base64 < page.png)"}}]}]}
+   {"type": "image_url", "image_url": {"url": "data:image/png;base64,$(base64 < page.png | tr -d '\n')"}}]}]}
 EOF
 ```
 
-## Tested on
+Offline:
 
-Apple M4, 24 GB unified memory, macOS 26.5.2, Python 3.12,
-`max==26.6.0`. The GPU path needs full Xcode plus the Metal
-Toolchain (`xcodebuild -downloadComponent MetalToolchain`); the Command Line
-Tools do not ship the Metal compiler MAX shells out to. Greedy output with the
-guard off is byte-identical to the fp32 PyTorch reference on both devices. The
-server is large for a 24 GB machine; run one at a time and leave it the memory.
+```bash
+uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.1 --local-dir ocr-model
+unlimited-ocr-max serve --devices gpu --model ocr-model
+```
+
+## Where it has run
+
+`temperature 0`, default guard. Text is compared against the fp32 PyTorch
+reference (transformers 4.46.3, CPU); CER = edited characters / reference
+characters over all pages.
+
+| hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
+|---|---|---|---|---|---|---|
+| Apple M4 24 GB | bf16 | 12 pages | **19.86 tok/s** | 4.98 s | 19.55 / 1.7–2.0 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages | **36.44 tok/s** | 6.92 s | 16.14 / 8.0–8.2 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| NVIDIA A100 80 GB | bf16 | 1 page | **~96 tok/s** | 5.58 s | not measured | prose identical; 5 bbox digits off by 1–6 px |
+| NVIDIA A100 80 GB | int8 | not run | — | — | — | — |
+| NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
+| AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
+| CPU | bf16 | supported, slow | not measured | — | — | — |
+
+One draw per row. Apple: macOS 26.5.2, `max` 26.6.0, measured on v0.3.0; the
+v0.3.1 changes are covered by bit-exactness tests, the pages were not re-run.
+Peak memory is the first request's kernel compile; one model process at a time
+on 24 GB. ¹ Upstream: MAX's `ldmatrix` PTX needs sm_80, and Turing has no bf16
+tensor cores ([modular/modular#6653](https://github.com/modular/modular/issues/6653),
+[#6659](https://github.com/modular/modular/issues/6659)).
 
 ## Not supported
 
-`gundam` (tiled) mode — the tiling code is in the package and usable in-process,
-but the served batch holds one resolution; batch sizes above 1 (the prefill
-graph's sequence length is static); multi-GPU.
+`gundam` (tiled) mode; batch size > 1; multi-GPU.
 
 ## References
 
-The model is described in *Unlimited OCR Works* (Yin et al., 2026),
-[arXiv:2606.23050](https://arxiv.org/abs/2606.23050); this package changes the
-serving runtime only.
+*Unlimited OCR Works* (Yin et al., 2026), [arXiv:2606.23050](https://arxiv.org/abs/2606.23050).
+This port changes how the model is served, not the model (int8 excepted, as
+quantified above); model-level behaviour, limitations and biases are those of
+`baidu/Unlimited-OCR`.
 
-## License and authorship
+## Authorship
 
-MIT for this code; the weights, tokenizer and `config.json` are baidu's,
-redistributed unchanged under baidu's MIT (both notices in `LICENSE`).
+This port, its serve configuration and this documentation were written with
+substantial AI assistance (Claude, via Claude Code); Konstantin Thierbach
+reviewed them and is accountable for their contents. Assisted-by: AI.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE): this port's MIT notice and baidu's verbatim. The
+bf16 weights, tokenizer files and `config.json` are baidu's, from
+`baidu/Unlimited-OCR` (MIT, Copyright (c) 2026 Baidu), redistributed under that
+license; the bf16 weights are unchanged, `config.json` has two keys removed, and
+`model-int8.safetensors` is derived from those weights by this port's quantiser.

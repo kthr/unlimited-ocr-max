@@ -1,19 +1,20 @@
 [project]
 name = "unlimited-ocr-max"
-version = "0.3.0"
-description = "baidu/Unlimited-OCR as a MAX custom architecture with a Mojo custom op, served on Apple Silicon (Metal or CPU)"
+version = "0.3.1"
+description = "baidu/Unlimited-OCR served through MAX as an OpenAI-compatible endpoint on Metal, CUDA, ROCm or CPU"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12,<3.14"
 authors = [{ name = "Konstantin Thierbach" }]
-keywords = ["ocr", "document-ai", "max", "mojo", "apple-silicon", "metal", "moe", "unlimited-ocr"]
+keywords = ["ocr", "document-ai", "max", "mojo", "apple-silicon", "metal", "cuda", "rocm", "moe", "unlimited-ocr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: GPU",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

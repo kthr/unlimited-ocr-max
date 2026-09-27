@@ -13,7 +13,7 @@ from pathlib import Path
 
 DEFAULT_MODEL = "kthierbach/unlimited-ocr-max"
 #: The model-repo tag this package version was validated against; ignored for a local ``--model``.
-DEFAULT_REVISION = "v0.3.0"
+DEFAULT_REVISION = "v0.3.1"
 WEIGHT_VARIANTS = ("bf16", "int8")
 PACKAGE_DIR = Path(__file__).resolve().parent
 SERVED_MODEL_NAME = "unlimited-ocr-max"
@@ -97,12 +97,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="unlimited-ocr-max", description="Serve baidu/Unlimited-OCR through MAX on Apple Silicon (Metal GPU or CPU)."
+        prog="unlimited-ocr-max", description="Serve baidu/Unlimited-OCR through MAX on Metal, CUDA, ROCm or CPU."
     )
     sub = ap.add_subparsers(dest="command", required=True)
     srv = sub.add_parser("serve", help="run `max serve` with this port's flags")
     srv.add_argument("--devices", choices=("cpu", "gpu"), required=True,
-                     help="gpu (Metal; needs Xcode + Metal Toolchain) or cpu (supported, slow)")
+                     help="gpu (Metal, CUDA or ROCm; see the README prerequisites) or cpu (supported, slow)")
     srv.add_argument("--model", default=DEFAULT_MODEL,
                      help="Hub repository or a local directory with its layout (default: %(default)s)")
     srv.add_argument("--revision", default=DEFAULT_REVISION,
