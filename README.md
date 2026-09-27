@@ -84,7 +84,8 @@ unlimited-ocr-max profile --devices gpu            # add --weights int8, or --de
 
 Starts its own server, sends the 12 bundled pages, prints one row of the table
 below and writes `profile.json`. On a GPU it refuses to run unless no other
-process is using the GPU. `--out DIR` sets the output directory.
+process is using the GPU. `--out DIR` sets the output directory (default
+`./unlimited-ocr-max-profile-<UTC time>`).
 
 One page to Markdown:
 
@@ -118,10 +119,11 @@ characters over all pages.
 | NVIDIA A100 80 GB | int8 | not run | — | — | — | — |
 | NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
 | AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
-| CPU (Apple M4) | bf16 | 12 pages ² | 5.7 tok/s | 53.4 s | 16.0 / 6.3 GiB | **12/12 byte-identical** |
+| CPU (Apple M4) | bf16 | 12 pages ² | 5.7 tok/s | 53.6 s | 16.0 / 6.3 GiB | **12/12 byte-identical** |
 
-One draw per row, measured with `unlimited-ocr-max profile` on v0.3.1 (Apple:
-macOS 26.5.2, `max` 26.6.0). Peak memory is the first request's compile;
+The three Apple M4 rows are one draw each with `unlimited-ocr-max profile` on
+v0.3.1 (macOS 26.5.2, `max` 26.6.0); the other rows predate `profile` and were
+not re-run. Peak memory is the first request's compile;
 steady is the server idle after the last page. ¹ Upstream: MAX's `ldmatrix`
 PTX needs sm_80, and Turing has no bf16 tensor cores
 ([modular/modular#6653](https://github.com/modular/modular/issues/6653),
