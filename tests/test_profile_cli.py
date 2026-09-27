@@ -987,6 +987,75 @@ def test_only_the_serving_gpus_count_towards_utilisation() -> None:
     assert profile._serving_gpus({}, []) == []
 
 
+# --------------------------------------------------------------------------- #
+# host facts: _gpus() and _hardware()
+# --------------------------------------------------------------------------- #
+def test_gpus_parses_nvidia_smi_name_and_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(profile.shutil, "which", lambda name: name == "nvidia-smi")
+    monkeypatch.setattr(profile, "_command_text", lambda argv, **kw: (
+        "NVIDIA A100-SXM4-80GB, 81920 MiB\nNVIDIA A100-SXM4-80GB, 81920 MiB" if argv[0] == "nvidia-smi" else None
+    ))
+    assert profile._gpus({}) == [
+        {"name": "NVIDIA A100-SXM4-80GB", "memory_total_bytes": 81920 * MIB, "source": "nvidia-smi"},
+        {"name": "NVIDIA A100-SXM4-80GB", "memory_total_bytes": 81920 * MIB, "source": "nvidia-smi"},
+    ]
+
+
+def test_gpus_nvidia_smi_malformed_memory_field_keeps_the_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``[N/A]`` (no compute mode, or an old driver): the name still counts, memory is unknown."""
+    monkeypatch.setattr(profile.shutil, "which", lambda name: name == "nvidia-smi")
+    monkeypatch.setattr(profile, "_command_text", lambda argv, **kw: "NVIDIA A100-SXM4-80GB, [N/A]")
+    assert profile._gpus({}) == [{"name": "NVIDIA A100-SXM4-80GB", "memory_total_bytes": None, "source": "nvidia-smi"}]
+
+
+def test_gpus_parses_rocm_smi_showproductname(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(profile.shutil, "which", lambda name: name == "rocm-smi")
+    text = (
+        "====================System Management Interface====================\n"
+        "GPU[0]\t\t: Card series: \t\tInstinct MI250X\n"
+        "GPU[1]\t\t: Card series: \t\tInstinct MI250X\n"
+        "======================================================================\n"
+    )
+    monkeypatch.setattr(profile, "_command_text", lambda argv, **kw: text)
+    baseline = {"amd0": {"total_bytes": 64 * GIB}, "amd1": {"total_bytes": 64 * GIB}}
+    assert profile._gpus(baseline) == [
+        {"name": "Instinct MI250X", "memory_total_bytes": 64 * GIB, "source": "rocm-smi"},
+        {"name": "Instinct MI250X", "memory_total_bytes": 64 * GIB, "source": "rocm-smi"},
+    ]
+
+
+def test_gpus_rocm_smi_with_no_matching_baseline_leaves_memory_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(profile.shutil, "which", lambda name: name == "rocm-smi")
+    monkeypatch.setattr(profile, "_command_text", lambda argv, **kw: "GPU[0]\t: Card series: Instinct MI250X\n")
+    assert profile._gpus({}) == [{"name": "Instinct MI250X", "memory_total_bytes": None, "source": "rocm-smi"}]
+
+
+def test_hardware_picks_the_first_named_gpu() -> None:
+    host = {
+        "cpu_brand": "Test CPU", "ram_bytes": 32 * GIB,
+        "gpus": [
+            {"name": "NVIDIA A100", "memory_total_bytes": 80 * GIB},
+            {"name": "NVIDIA H100", "memory_total_bytes": 80 * GIB},
+        ],
+        "accelerator": {"api": "cuda", "architecture": "sm_90"},
+    }
+    assert profile._hardware(host, "gpu") == "Test CPU 32 GB, NVIDIA A100 80 GB"
+
+
+def test_hardware_falls_back_to_metal_when_no_gpu_is_named() -> None:
+    host = {"cpu_brand": "Apple M4", "ram_bytes": 16 * GIB, "gpus": [],
+            "accelerator": {"api": "metal", "architecture": None}}
+    assert profile._hardware(host, "gpu") == "Apple M4 16 GB, Metal"
+
+
+def test_hardware_falls_back_to_the_architecture_string_when_no_gpu_is_named_and_not_metal() -> None:
+    """The amd-smi-only case _gpus()'s docstring describes: no name found, so the accelerator
+    probe's architecture ends up in the hardware cell instead; the figures are unaffected."""
+    host = {"cpu_brand": "AMD EPYC", "ram_bytes": 64 * GIB, "gpus": [],
+            "accelerator": {"api": "hip", "architecture": "gfx90a"}}
+    assert profile._hardware(host, "gpu") == "AMD EPYC 64 GB, gfx90a"
+
+
 def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

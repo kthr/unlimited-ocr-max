@@ -648,6 +648,11 @@ def _accelerator() -> dict[str, Any]:
 
 
 def _gpus(baseline: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
+    """GPU names read from ``nvidia-smi`` and ``rocm-smi --showproductname`` only -- deliberately
+    no ``amd-smi`` parser here (unlike the idle-GPU guard, ``profile_sampling.foreign_gpu_processes``,
+    which tries it first): an amd-smi-only host falls back to the architecture/Metal string in
+    :func:`_hardware`'s GPU cell instead of a name; the figures themselves are unaffected either
+    way, since they come from :class:`profile_sampling.DeviceProbe`, not this list."""
     gpus: list[dict[str, Any]] = []
     if shutil.which("nvidia-smi"):
         text = _command_text(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"]) or ""
