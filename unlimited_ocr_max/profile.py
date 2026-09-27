@@ -9,8 +9,9 @@ into one row of the README's "Where it has run" table (:mod:`.profile_metrics`) 
 Three rules shape this module:
 
 * **It never measures someone else's server or someone else's GPU load.** A port that already
-  answers is refused (exit 2); on a GPU, another process on it refuses the run before the
-  server starts (exit 3) or voids it afterwards (exit 5).
+  answers is refused (exit 2). Every ``--devices gpu`` run is guarded: another process on the
+  GPU -- or a GPU whose processes cannot be listed -- refuses the run before the server starts
+  (exit 3) or voids it afterwards (exit 5).
 * **It never leaves the server behind.** ``max serve`` runs in its own session, so a Ctrl-C in
   the terminal reaches only this process; one teardown -- from ``finally``, from ``atexit`` as a
   fallback, and on SIGTERM/SIGHUP as well as Ctrl-C -- kills the server's process group, then
@@ -830,10 +831,12 @@ def run(args: argparse.Namespace, *, max_exe: str | None = None) -> int:
     probe = profile_sampling.open_device_probe()
     server: _Server | None = None
     try:
-        guarded = args.devices == "gpu" and probe.device_available
-        if args.devices == "gpu" and not guarded:
-            _say("no NVIDIA/AMD device statistics on this host (Metal, or none found): "
-                 "the idle-GPU guard and device figures do not apply")
+        # Every GPU run is guarded, whatever the probe found: on Metal the process list is
+        # legitimately empty, and a CUDA/ROCm host whose device diagnostics failed must be
+        # refused (GpuProcessListUnavailable), never measured unguarded.
+        guarded = args.devices == "gpu"
+        if guarded and not probe.device_available:
+            _say("no NVIDIA/AMD device statistics on this host (Metal, or none found): device figures do not apply")
         if guarded:
             reasons = _gpu_not_idle(set(), after_run=False)
             if reasons:

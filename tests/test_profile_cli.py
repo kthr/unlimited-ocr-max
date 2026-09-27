@@ -145,6 +145,18 @@ class _FakeProbe:
         self.closed = True
 
 
+class _NoDeviceProbe(_FakeProbe):
+    """What ``open_device_probe`` returns on Metal, or where MAX's GPU diagnostics failed."""
+
+    device_available = False
+
+    def stats(self) -> dict[str, dict[str, int]]:
+        return {}
+
+    def process_bytes(self, pids: Any) -> int | None:
+        return None
+
+
 def _no_spawn(self: Any) -> None:
     pytest.fail("profile started a server although it had to refuse first")
 
@@ -444,6 +456,90 @@ def test_gpu_guard_refuses_when_the_process_list_is_unavailable(
     err = capsys.readouterr().err
     assert code == 3
     assert "otherwise idle GPU" in err and "nvidia-smi is not on PATH" in err
+
+
+def test_gpu_guard_runs_without_device_statistics_and_refuses_an_unlistable_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A CUDA/ROCm host whose MAX GPU diagnostics failed: no device statistics, yet the guard
+    runs -- and a process list it cannot get refuses the run instead of measuring unguarded."""
+
+    def unavailable(own: set[int]) -> list[dict[str, Any]]:
+        raise profile_sampling.GpuProcessListUnavailable(
+            "cannot determine which GPUs are present: max.profiler.gpu's GPUDiagContext failed to report device stats"
+        )
+
+    probe = _NoDeviceProbe()
+    monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: probe)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", unavailable)
+    monkeypatch.setattr(profile._Server, "start", _no_spawn)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    err = capsys.readouterr().err
+    assert code == 3
+    assert "otherwise idle GPU" in err and "GPUDiagContext failed to report device stats" in err
+    assert probe.closed
+    assert not out.exists()
+
+
+def test_gpu_guard_runs_without_device_statistics_and_refuses_a_foreign_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[set[int]] = []
+
+    def foreign(own: set[int]) -> list[dict[str, Any]]:
+        calls.append(set(own))
+        return [{"pid": 4242, "name": "python", "used_bytes": 1536 * 2**20}]
+
+    monkeypatch.setattr(profile_sampling, "open_device_probe", _NoDeviceProbe)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", foreign)
+    monkeypatch.setattr(profile._Server, "start", _no_spawn)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    err = capsys.readouterr().err
+    assert code == 3
+    assert calls == [set()]
+    assert "otherwise idle GPU" in err and "pid 4242 python 1536 MiB" in err
+    assert not out.exists()
+
+
+def test_the_post_run_gpu_recheck_also_runs_without_device_statistics(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[set[int]] = []
+
+    def foreign(own: set[int]) -> list[dict[str, Any]]:
+        calls.append(set(own))
+        return [] if len(calls) == 1 else [{"pid": 4242, "name": "intruder", "used_bytes": None}]
+
+    monkeypatch.setattr(profile_sampling, "open_device_probe", _NoDeviceProbe)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", foreign)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 5, captured.err
+    assert _tree_gone(stub)
+    assert len(calls) == 2 and {stub.pids()["pid"], stub.pids()["child"]} <= calls[1]
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["gpu_guard"] is True
+    assert len(doc["void"]) == 1 and "pid 4242 intruder ? MiB" in doc["void"][0]
+    assert doc["figures"]["device_memory"] is None
+
+
+def test_a_cpu_run_never_consults_the_gpu_process_list(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def must_not_run(own: set[int]) -> list[dict[str, Any]]:
+        raise AssertionError("foreign_gpu_processes was called for a --devices cpu run")
+
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", must_not_run)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["gpu_guard"] is False and doc["void"] == []
 
 
 def test_a_foreign_gpu_process_found_after_the_run_voids_it(
