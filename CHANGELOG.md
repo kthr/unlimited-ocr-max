@@ -2,6 +2,18 @@
 
 ## [0.3.1] — 2026-09-22
 
+### Added
+- **`unlimited-ocr-max profile`**: starts its own server, sends a bundled
+  12-page corpus, and turns the scheduler log, host/device samples and the
+  returned text into one row of the README's "Where it has run" table plus a
+  complete `profile.json`. On `--devices gpu` it refuses to run unless the GPU
+  is otherwise idle, so a measurement is never diluted by another process's
+  load. The corpus (four pages of *Unlimited OCR Works* plus eight synthetic
+  pages) ships under `unlimited_ocr_max/profile_data/`, with attribution in
+  `profile_data/NOTICE.md`. Measured on this release's Apple M4: bf16 12/12
+  pages byte-identical to the reference; int8's text fidelity is unchanged
+  from the last measured run; CPU is now measured rather than "not measured".
+
 ### Fixed
 - **NVIDIA: the `lm_head` projection is split so the GEMV launch fits CUDA's
   grid limit.** v0.3.0 aborts on the first request on every CUDA device with
@@ -57,12 +69,18 @@
   the shipped package.
 ### Documentation
 - **The CUDA math libraries are a prerequisite, and they are not installed by
-  `pip`.** MAX binds `libcublas`, `libcublasLt` and `libnvrtc` at runtime but
-  neither ships nor declares them, so on a machine without them a serve aborts
-  at the first request with `symbol not found: cublasCreate_v2`. README and the
-  model card now say to install them as system libraries (NVIDIA's CUDA apt
-  repository, then `ldconfig`) rather than as pip wheels, which land in
-  `site-packages/nvidia/` where the dynamic loader does not look.
+  `pip`.** MAX binds `libcublas` and `libcublasLt` at runtime but neither ships
+  nor declares them, so on a machine without them a serve aborts at the first
+  request with `symbol not found: cublasCreate_v2`. Only `libcublas-13-0` is
+  needed: MAX loads the versioned sonames (`libcublas.so.13`,
+  `libcublasLt.so.13`) via `/usr/local/cuda-13.0/lib64`, which that package
+  ships; `nvrtc` is not referenced anywhere in the wheels, so `cuda-nvrtc-13-0`
+  is no longer in the install line. README and the model card say to install
+  it as a system library (NVIDIA's CUDA apt repository) rather than as a pip
+  wheel, which lands in `site-packages/nvidia/` where the dynamic loader does
+  not look.
+- **AMD's ROCm libraries are documented too**: MAX loads rocBLAS, hipBLASLt
+  and MIOpen from `/opt/rocm/lib`, the same way it loads cuBLAS on NVIDIA.
 - **The README now records what has been run on which hardware**, with the
   quantisation and the measured decode rate, prefill and text-fidelity figures
   per row, rather than describing the Apple machine alone.

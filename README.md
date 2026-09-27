@@ -36,10 +36,10 @@ for example, on Ubuntu 24.04 x86_64:
 wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt-get update
-# 2. libcublas + libcublasLt (one package) and libnvrtc, CUDA 13
-sudo apt-get install -y libcublas-13-0 cuda-nvrtc-13-0
-# 3. check they are on the loader path
-ldconfig -p | grep -E "libcublas|libnvrtc"
+# 2. libcublas + libcublasLt (one package), CUDA 13
+sudo apt-get install -y libcublas-13-0
+# 3. check: MAX loads these exact files
+ls -l /usr/local/cuda-13.0/lib64/libcublas.so.13 /usr/local/cuda-13.0/lib64/libcublasLt.so.13
 ```
 
 Use these system packages, not the `nvidia-*-cu13` pip wheels — the loader does
@@ -48,7 +48,8 @@ request with `CUDA_ERROR_INVALID_VALUE`.
 
 ### AMD — Linux, driver 6.3.3+ (MI355X: ROCm 7+)
 
-Nothing beyond the driver is known to be needed; untested beyond compilation.
+MAX also loads ROCm's rocBLAS, hipBLASLt and MIOpen from `/opt/rocm/lib`;
+untested beyond compilation.
 
 ### CPU
 
@@ -74,6 +75,16 @@ compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, mod
 | `--revision` | tag | `v0.3.1` | the model-repo tag this package version was validated against |
 | `--port` | integer | `8010` | |
 | `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
+
+### Measure it on your machine
+
+```bash
+unlimited-ocr-max profile --devices gpu            # add --weights int8, or --devices cpu
+```
+
+Starts its own server, sends the 12 bundled pages, prints one row of the table
+below and writes `profile.json`. On a GPU it refuses to run unless no other
+process is using the GPU. `--out DIR` sets the output directory.
 
 One page to Markdown:
 
@@ -101,20 +112,22 @@ characters over all pages.
 
 | hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
 |---|---|---|---|---|---|---|
-| Apple M4 24 GB | bf16 | 12 pages | **19.86 tok/s** | 4.98 s | 19.55 / 1.7–2.0 GiB | **12/12 byte-identical** |
-| Apple M4 24 GB | int8 | 12 pages | **36.44 tok/s** | 6.92 s | 16.14 / 8.0–8.2 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| Apple M4 24 GB | bf16 | 12 pages | **19.5 tok/s** | 4.96 s | 18.4 / 1.7–1.8 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages ² | **36.2 tok/s** | 7.04 s | 14.1 / 6.5 GiB | 6/12; CER 0.0011, all edits bbox digits |
 | NVIDIA A100 80 GB | bf16 | 1 page | **~96 tok/s** | 5.58 s | not measured | prose identical; 5 bbox digits off by 1–6 px |
 | NVIDIA A100 80 GB | int8 | not run | — | — | — | — |
 | NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
 | AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
-| CPU | bf16 | supported, slow | not measured | — | — | — |
+| CPU (Apple M4) | bf16 | 12 pages ² | 5.7 tok/s | 53.4 s | 16.0 / 6.3 GiB | **12/12 byte-identical** |
 
-One draw per row. Apple: macOS 26.5.2, `max` 26.6.0, measured on v0.3.0; the
-v0.3.1 changes are covered by bit-exactness tests, the pages were not re-run.
-Peak memory is the first request's kernel compile; one model process at a time
-on 24 GB. ¹ Upstream: MAX's `ldmatrix` PTX needs sm_80, and Turing has no bf16
-tensor cores ([modular/modular#6653](https://github.com/modular/modular/issues/6653),
-[#6659](https://github.com/modular/modular/issues/6659)).
+One draw per row, measured with `unlimited-ocr-max profile` on v0.3.1 (Apple:
+macOS 26.5.2, `max` 26.6.0). Peak memory is the first request's compile;
+steady is the server idle after the last page. ¹ Upstream: MAX's `ldmatrix`
+PTX needs sm_80, and Turing has no bf16 tensor cores
+([modular/modular#6653](https://github.com/modular/modular/issues/6653),
+[#6659](https://github.com/modular/modular/issues/6659)). ² System swap grew
+during these runs, so their timings are indicative; the text results are
+exact.
 
 ## Not supported
 
@@ -140,3 +153,5 @@ bf16 weights, tokenizer files and `config.json` are baidu's, from
 `baidu/Unlimited-OCR` (MIT, Copyright (c) 2026 Baidu), redistributed under that
 license; the bf16 weights are unchanged, `config.json` has two keys removed, and
 `model-int8.safetensors` is derived from those weights by this port's quantiser.
+The `profile` corpus bundles renders of four pages of that paper
+(arXiv:2606.23050); see `unlimited_ocr_max/profile_data/NOTICE.md`.
