@@ -1,0 +1,9 @@
+<|det|>list [108, 96, 893, 445]<|/det|>
+<|det|>ref_text [115, 101, 885, 137]<|/det|>[31] W. Wang, Z. Gao, L. Gu, et al. Internvl3.5: Advancing open-source multimodal models in versatility, reasoning, and efficiency. arXiv preprint arXiv:2508.18265, 2025.
+<|det|>ref_text [115, 144, 885, 194]<|/det|>[32] H. Wei, L. Kong, J. Chen, L. Zhao, Z. Ge, J. Yang, J. Sun, C. Han, and X. Zhang. Vary: Scaling up the vision vocabulary for large vision-language model. In European Conference on Computer Vision, pages 408–424. Springer, 2024.
+<|det|>ref_text [115, 203, 885, 252]<|/det|>[33] H. Wei, C. Liu, J. Chen, J. Wang, L. Kong, Y. Xu, Z. Ge, L. Zhao, J. Sun, Y. Peng, et al. General ocr theory: Towards ocr-2.0 via a unified end-to-end model. arXiv preprint arXiv:2409.01704, 2024.
+<|det|>ref_text [115, 261, 885, 295]<|/det|>[34] H. Wei, Y. Sun, and Y. Li. Deepseek-ocr: Contexts optical compression. arXiv preprint arXiv:2510.18234, 2025.
+<|det|>ref_text [115, 304, 885, 338]<|/det|>[35] H. Wei, Y. Sun, and Y. Li. Deepseek-ocr 2: Visual causal flow. arXiv preprint arXiv:2601.20552, 2026.
+<|det|>ref_text [115, 347, 885, 381]<|/det|>[36] H. Wu, H. Lou, X. Li, Z. Zhong, Z. Sun, P. Chen, X. Zhou, K. Zuo, Y. Chen, X. Tang, et al. Fiered-ocr technical report. arXiv preprint arXiv:2603.01840, 2026.
+<|det|>ref_text [115, 390, 885, 441]<|/det|>[37] J. Zhu, W. Wang, Z. Chen, Z. Liu, S. Ye, L. Gu, H. Tian, Y. Duan, W. Su, J. Shao, et al. Internv13: Exploring advanced training and test-time recipes for open-source multimodal models. arXiv preprint arXiv:2504.10479, 2025.
+<|det|>page_number [489, 923, 511, 935]<|/det|>14
