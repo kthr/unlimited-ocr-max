@@ -247,6 +247,12 @@ def test_text_stats_raises_on_key_mismatch() -> None:
         text_stats({"a": "x", "b": "y"}, {"a": "x"})
 
 
+def test_text_stats_raises_on_empty_corpus() -> None:
+    """No pages means no cer denominator; a clear ValueError, not a ZeroDivisionError."""
+    with pytest.raises(ValueError, match="no pages"):
+        text_stats({}, {})
+
+
 def test_memory_stats_excludes_pre_steady_after_samples() -> None:
     """A sample before `steady_after` is out of the steady population, even if it is the peak."""
     samples = [(0.0, 5000), (10.0, 1000), (20.0, 1100)]

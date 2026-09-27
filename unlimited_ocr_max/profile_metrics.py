@@ -163,7 +163,7 @@ def text_stats(refs: dict[str, str], cands: dict[str, str]) -> dict:
     call entirely, since its edit count is known to be 0 either way.
 
     Raises ``ValueError`` if ``refs`` and ``cands`` do not share the same set
-    of keys.
+    of keys, or if that shared set is empty (``cer`` has no denominator then).
     """
     if refs.keys() != cands.keys():
         only_ref = sorted(refs.keys() - cands.keys())
@@ -171,6 +171,8 @@ def text_stats(refs: dict[str, str], cands: dict[str, str]) -> dict:
         raise ValueError(
             f"refs and cands key sets differ: only in refs={only_ref}, only in cands={only_cand}"
         )
+    if not refs:
+        raise ValueError("refs and cands are both empty: no pages to compute text stats from")
     identical = 0
     edits = 0
     ref_chars = 0
