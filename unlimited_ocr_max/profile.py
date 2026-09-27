@@ -800,11 +800,26 @@ def _gpu_utilisation(device_stats: list[tuple[float, dict[str, dict[str, int]]]]
     return {"median_percent": statistics.median(values), "n": len(values), "gpus": gpus}
 
 
-def _text(refs: dict[str, str], responses: dict[str, str]) -> dict[str, Any]:
-    if responses.keys() != refs.keys():
-        raise ValueError(f"only {len(responses)} of {len(refs)} pages completed")
-    stats = profile_metrics.text_stats(refs, responses)
-    return {key: value for key, value in stats.items() if key != "pages"}
+def _text_stats_by_variant(refs: dict[str, dict[str, str]], responses: dict[str, str],
+                           done: list[str]) -> dict[str, dict[str, Any]]:
+    """``profile_metrics.text_stats``, computed once per variant over the pages that completed
+    (``done``) -- ``{}`` when none did, so a run that fails before any page calls it zero times,
+    same as before this and the aggregate figure (:func:`_text`) and the per-page detail
+    (:func:`_page_rows`) computed it separately. Both read this single result."""
+    if not done:
+        return {}
+    return {
+        variant: profile_metrics.text_stats(
+            {page: variant_refs[page] for page in done}, {page: responses[page] for page in done}
+        )
+        for variant, variant_refs in refs.items()
+    }
+
+
+def _text(text_by_variant: dict[str, dict[str, Any]], variant: str, n_done: int, n_total: int) -> dict[str, Any]:
+    if n_done != n_total:
+        raise ValueError(f"only {n_done} of {n_total} pages completed")
+    return {key: value for key, value in text_by_variant[variant].items() if key != "pages"}
 
 
 def _gib(n: int) -> str:
@@ -856,16 +871,15 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
     return "| " + " | ".join(cells) + " |"
 
 
-def _page_rows(pages: list[str], exchanges: dict[str, Exchange], refs: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+def _page_rows(pages: list[str], exchanges: dict[str, Exchange],
+               text_by_variant: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     done = [page for page in pages if page in exchanges]
     if not done:
         return []
-    detail: dict[str, dict[str, dict[str, Any]]] = {}
-    for variant, variant_refs in refs.items():
-        stats = profile_metrics.text_stats(
-            {page: variant_refs[page] for page in done}, {page: exchanges[page].text for page in done}
-        )
-        detail[variant] = {entry["page"]: entry for entry in stats["pages"]}
+    detail = {
+        variant: {entry["page"]: entry for entry in stats["pages"]}
+        for variant, stats in text_by_variant.items()
+    }
     rows = []
     for page in done:
         exchange = exchanges[page]
@@ -1135,6 +1149,8 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     if args.weights == "int8":
         refs["int8"] = {page: profile_corpus.reference(page, "int8") for page in pages}
     responses = {page: exchange.text for page, exchange in exchanges.items()}
+    done = [page for page in pages if page in exchanges]
+    text_by_variant = _text_stats_by_variant(refs, responses, done)
 
     figures = _Figures()
     _scheduler_figures(figures, server.log_path.read_bytes().decode("utf-8", "replace"))
@@ -1144,8 +1160,8 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
                     page_windows=page_windows)
     for variant, name in (("bf16", "text"), ("int8", "text_vs_int8")):
         if variant in refs:
-            figures.compute(name, lambda variant=variant: _text(refs[variant], responses))
-    page_rows = _page_rows(pages, exchanges, refs)
+            figures.compute(name, lambda variant=variant: _text(text_by_variant, variant, len(done), len(pages)))
+    page_rows = _page_rows(pages, exchanges, text_by_variant)
     swap = _swap((swap_start, swap_start_error), (swap_warm, swap_warm_error), sampler, page_windows)
     swap_moved = swap["growth_bytes"] is not None and swap["growth_bytes"] > SWAP_MOVED_BYTES
 
