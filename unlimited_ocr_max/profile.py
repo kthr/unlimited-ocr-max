@@ -914,7 +914,9 @@ def _out_dir(out: Path | None) -> Path:
 
 def run(args: argparse.Namespace, *, max_exe: str | None = None) -> int:
     """``unlimited-ocr-max profile``; returns the exit code (0 ok, 2 port in use or no ``ps``,
-    3 GPU not idle, 4 server never ready, 5 void -- figures still written, 130 interrupted).
+    3 GPU not idle, 4 server never ready, 5 void -- figures still written, 130 interrupted
+    (Ctrl-C/SIGINT), 129/143 hangup/terminated (SIGHUP/SIGTERM raise ``SystemExit(128 + signum)``
+    in :class:`_TerminateOnSignal` so the teardown in ``finally`` still runs).
 
     SIGCHLD is at its default disposition while it runs, and restored afterwards: ignored
     (inherited, or set by the caller), the kernel reaps an exiting server at once -- no zombie,

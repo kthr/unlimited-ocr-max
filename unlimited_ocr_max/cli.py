@@ -132,9 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
     srv = sub.add_parser("serve", help="run `max serve` with this port's flags")
     add_server_arguments(srv)
     srv.set_defaults(func=cmd_serve)
+    # Kept here, not read out of profile.py's EXIT_* constants: `profile --help` must not import
+    # profile.py (see cmd_profile) or MAX. test_profile_cli.py checks the two cannot drift apart.
     prof = sub.add_parser(
         "profile",
         help="start `max serve`, send the bundled 12-page corpus, print a row of the README's 'Where it has run' table",
+        epilog="exit codes: 0 ok, 2 port in use or no ps, 3 GPU busy, 4 server failed, "
+               "5 void run (profile.json still written), 129/130/143 hangup/interrupt/terminate",
     )
     add_server_arguments(prof)
     prof.add_argument("--out", type=Path, default=None, metavar="DIR",

@@ -255,6 +255,23 @@ def test_profile_help_through_the_console_script() -> None:
     assert "usage: unlimited-ocr-max profile" in result.stdout
 
 
+def test_profile_help_epilog_lists_every_exit_code() -> None:
+    """cli.py's epilog and profile.py's ``EXIT_*`` constants are kept in separate modules on
+    purpose (``profile --help`` must not import profile.py, see ``cmd_profile``), so nothing but a
+    test keeps them from drifting apart. This test may import profile.py; ``--help`` itself never
+    does (checked separately by ``test_profile_help_does_not_import_max``)."""
+    parser = cli.build_parser()
+    (subparsers,) = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
+    epilog = subparsers.choices["profile"].epilog
+    exit_codes = {
+        value for name, value in vars(profile).items()
+        if name.startswith("EXIT_") and isinstance(value, int) and not isinstance(value, bool)
+    }
+    assert exit_codes  # sanity: profile.py still defines some EXIT_* constants
+    for code in exit_codes:
+        assert re.search(rf"\b{code}\b", epilog), (code, epilog)
+
+
 def test_serve_and_profile_share_one_definition_of_the_server_flags() -> None:
     parser = cli.build_parser()
     (subparsers,) = [action for action in parser._actions if isinstance(action, argparse._SubParsersAction)]
