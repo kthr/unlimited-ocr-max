@@ -28,6 +28,9 @@ text delta (default 0.05 s). ``PROFILE_STUB_MODE`` selects a misbehaviour:
 ``ignore-term``       ignores SIGTERM, and so does its child (the disposition is inherited)
 ``choices-dict``      the text deltas carry ``choices`` as an object instead of a list
 ``choices-empty``     the text deltas carry ``choices: []`` (and no usage)
+``choice-not-object`` the text deltas carry ``choices: ["x"]``
+``delta-zero``        the text deltas carry ``delta: 0`` (falsy, and not an object)
+``event-list``        the text deltas are a JSON list instead of an object
 ``content-not-text``  the text deltas carry a number as ``delta.content``
 """
 
@@ -176,12 +179,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
 
 
-def _text_delta(piece: str) -> dict[str, object]:
+def _text_delta(piece: str) -> object:
     choice = {"index": 0, "delta": {"content": piece}, "finish_reason": None}
     if MODE == "choices-dict":
         return {"choices": {"0": choice}}
     if MODE == "choices-empty":
         return {"choices": []}
+    if MODE == "choice-not-object":
+        return {"choices": ["x"]}
+    if MODE == "delta-zero":
+        return {"choices": [{**choice, "delta": 0}]}
+    if MODE == "event-list":
+        return [{"choices": [choice]}]
     if MODE == "content-not-text":
         return {"choices": [{**choice, "delta": {"content": 7}}]}
     return {"choices": [choice]}

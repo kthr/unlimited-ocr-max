@@ -19,8 +19,9 @@ Three rules shape this module:
   held until it has finished.
 * **It never signals a pid it cannot prove is the server's.** The server process is reaped only
   at the very end of the teardown -- its exit is seen with ``waitid(..., WNOWAIT)``, which leaves
-  it a zombie, or, where Python has no ``os.waitid`` (macOS before 3.13), as a zombie in ``ps``
-  -- so until then its pid, which is also its process group id, cannot be reused,
+  it a zombie, or, where Python has no ``os.waitid`` (macOS before 3.13), as a zombie in ``ps``;
+  SIGCHLD is held at its default so that it does become one -- so until then its pid, which is
+  also its process group id, cannot be reused,
   and ``pgid == server pid`` proves membership. A process outside the group is signalled only
   while it is a descendant of the server, or while it has the pid *and* start time it had when
   it verifiably belonged to the server. Each such check reads one ``ps`` snapshot.
@@ -76,7 +77,7 @@ STRAGGLER_GRACE_S = 5.0
 #: Idle time after the last page, so the steady-memory population is not empty.
 STEADY_DWELL_S = 5.0
 LOG_TAIL_LINES = 40
-#: System swap growth over the run above which the timings are flagged (never voided).
+#: System swap growth during the page requests above which the timings are flagged (never voided).
 SWAP_MOVED_BYTES = 0.05 * 2**30
 #: Device memory rise over its baseline that makes a GPU a serving one: above the ~0.3-0.5 GiB
 #: context a server may open on a neighbour GPU, far below the model's weights.
@@ -278,9 +279,11 @@ class _Server:
     def leader_exited(self) -> bool:
         """Whether the server process has exited -- without reaping it (see the module docstring):
         ``waitid(WNOWAIT)`` leaves it a zombie, so its pid and process group id stay pinned. Where
-        Python has no ``os.waitid`` (macOS before 3.13) a zombie -- or no process at all -- in
-        ``ps`` counts as exited instead, which does not reap either. ``False`` while it cannot be
-        determined."""
+        Python has no ``os.waitid`` (macOS before 3.13) a zombie in ``ps`` counts as exited
+        instead, which does not reap either. A leader reaped behind ``Popen``'s back -- ``ECHILD``,
+        or no ``ps`` row at all: :func:`run` keeps SIGCHLD at its default, so an unreaped child is
+        always listed, at worst as a zombie -- is no longer pinned; ``poll()`` records that (it
+        maps ``ECHILD`` to returncode 0) for the teardown. ``False`` while it cannot be determined."""
         assert self.proc is not None
         if self.proc.returncode is not None:
             return True
@@ -289,12 +292,13 @@ class _Server:
                 row = _ps_table().get(self.proc.pid)
             except (OSError, subprocess.SubprocessError):
                 return False
-            return row is None or not row.alive
+            if row is None:
+                self.proc.poll()
+                return True
+            return not row.alive
         try:
             info = os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         except ChildProcessError:
-            # Reaped behind Popen's back, so no longer pinned: poll() records that (it maps ECHILD
-            # to returncode 0), and the teardown then treats it as unpinned.
             self.proc.poll()
             return True
         except OSError:
@@ -898,7 +902,21 @@ def _out_dir(out: Path | None) -> Path:
 
 def run(args: argparse.Namespace, *, max_exe: str | None = None) -> int:
     """``unlimited-ocr-max profile``; returns the exit code (0 ok, 2 port in use or no ``ps``,
-    3 GPU not idle, 4 server never ready, 5 void -- figures still written, 130 interrupted)."""
+    3 GPU not idle, 4 server never ready, 5 void -- figures still written, 130 interrupted).
+
+    SIGCHLD is at its default disposition while it runs, and restored afterwards: ignored
+    (inherited, or set by the caller), the kernel reaps an exiting server at once -- no zombie,
+    so nothing would pin its process group (see the module docstring)."""
+    main_thread = threading.current_thread() is threading.main_thread()  # handlers are main-thread only
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_DFL) if main_thread else None
+    try:
+        return _run(args, max_exe=max_exe)
+    finally:
+        if main_thread:
+            _restore(signal.SIGCHLD, previous)
+
+
+def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
     started_utc = _utc_now()
     # The teardown proves which processes are the server's from `ps`, and the sampler reads it.
     if shutil.which("ps") is None:
@@ -963,7 +981,8 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
     busy: list[tuple[float, float]] = []
     void: list[str] = []
     ready_s: float | None = None
-    swap_start, swap_start_error = _swap_now()
+    swap_start, swap_start_error = _swap_now("before the server started")
+    swap_warm, swap_warm_error = None, "the warmup request did not complete"
 
     atexit.register(server.stop)
     try:
@@ -997,6 +1016,8 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
                     busy.append((exchange.t_start, exchange.t_end))
                     if label == "warmup":
                         warmup = exchange
+                        # The pages' swap baseline: loading and compiling have paged by now, if at all.
+                        swap_warm, swap_warm_error = _swap_now("at the warmup's end")
                     else:
                         exchanges[page] = exchange
                         (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
@@ -1022,30 +1043,44 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
             atexit.unregister(server.stop)
     void += server.void
     return _report(args, server, out, pages, exchanges, warmup, busy, void, baseline=baseline, guarded=guarded,
-                   ready_s=ready_s, started_utc=started_utc, swap_start=swap_start, swap_start_error=swap_start_error)
+                   ready_s=ready_s, started_utc=started_utc, swap_start=swap_start, swap_start_error=swap_start_error,
+                   swap_warm=swap_warm, swap_warm_error=swap_warm_error)
 
 
-def _swap_now() -> tuple[int | None, str | None]:
-    """The system's swap in use now, or why it cannot be read."""
+def _swap_now(when: str) -> tuple[int | None, str | None]:
+    """The system's swap in use now, or why it cannot be read ``when``."""
     try:
         return profile_sampling.swap_used_bytes(), None
     except Exception as e:
-        return None, str(e) or type(e).__name__
+        return None, f"system swap cannot be read {when}: {str(e) or type(e).__name__}"
 
 
-def _swap(start: int | None, start_error: str | None, sampler: profile_sampling.Sampler) -> dict[str, Any]:
-    """System swap before the server started and its maximum over the run; ``None`` fields, with
-    the reason, where it cannot be read."""
-    if start is None:
-        return {"start_bytes": None, "max_bytes": None, "growth_bytes": None,
-                "reason": f"system swap cannot be read: {start_error}"}
-    samples = [used for _, used in list(sampler.swap)]
-    stopped = None if sampler.swap_error is None else f"swap sampling stopped: {sampler.swap_error}"
-    if not samples:  # the start reading alone says nothing about the run
-        return {"start_bytes": start, "max_bytes": None, "growth_bytes": None,
-                "reason": "no swap sample was taken during the run" + (f" ({stopped})" if stopped else "")}
-    peak = max([start, *samples])
-    return {"start_bytes": start, "max_bytes": peak, "growth_bytes": peak - start, "reason": stopped}
+def _swap(start: tuple[int | None, str | None], warm: tuple[int | None, str | None],
+          sampler: profile_sampling.Sampler, page_windows: list[tuple[float, float]]) -> dict[str, Any]:
+    """System swap, each ``(bytes, why not)`` reading as :func:`_swap_now` returns it.
+
+    ``growth_bytes`` -- what flags the timings -- is the maximum over the samples taken inside a
+    page request minus the reading at the warmup's end, so loading and compiling the model never
+    count; ``load_growth_bytes`` is that warmup-end reading minus the one before the server
+    started. A figure that cannot be computed is ``None``; ``reason`` says why, and also when
+    swap sampling stopped part-way."""
+    (start_bytes, start_error), (warm_bytes, warm_error) = start, warm
+    swap: dict[str, Any] = {"start_bytes": start_bytes, "warm_bytes": warm_bytes, "load_growth_bytes": None,
+                            "max_bytes": None, "growth_bytes": None}
+    reasons = [error for error in (start_error, warm_error) if error is not None]
+    if start_bytes is not None and warm_bytes is not None:
+        swap["load_growth_bytes"] = warm_bytes - start_bytes
+    if warm_bytes is not None:
+        in_pages = [used for t, used in list(sampler.swap) if any(s <= t <= e for s, e in page_windows)]
+        if in_pages:
+            swap["max_bytes"] = max(in_pages)
+            swap["growth_bytes"] = swap["max_bytes"] - warm_bytes
+        else:
+            reasons.append("no swap sample fell inside a page request")
+    if sampler.swap_error is not None:
+        reasons.append(f"swap sampling stopped: {sampler.swap_error}")
+    swap["reason"] = "; ".join(reasons) or None
+    return swap
 
 
 def _scheduler_figures(figures: _Figures, log: str) -> None:
@@ -1070,26 +1105,28 @@ def _device_figures(figures: _Figures, args: argparse.Namespace, sampler: profil
         return
     device_process = [(t, v) for t, v in list(sampler.device_process) if v is not None]
     device_stats = list(sampler.device_stats)
-    no_device = "no per-process device memory sampled on this host" + (
-        f" (device sampling stopped: {sampler.device_error})" if sampler.device_error is not None else ""
-    )
     # Per process: the server tree's own allocations, which are only on the GPU(s) it serves from.
     figures.compute("device_memory", lambda: _memory(
-        device_process, busy, steady_after, empty=no_device, figures=figures, name="device_memory"))
-    gpus = _serving_gpus(baseline, device_stats)
-    figures.compute("gpu_utilisation", lambda: _gpu_utilisation(device_stats, page_windows, gpus))
+        device_process, busy, steady_after, empty="no per-process device memory sampled on this host",
+        figures=figures, name="device_memory"))
+    # The GPU choice inside the guarded computation too: a malformed stats sample must not raise here.
+    figures.compute("gpu_utilisation", lambda: _gpu_utilisation(
+        device_stats, page_windows, _serving_gpus(baseline, device_stats)))
     for name in ("device_memory", "gpu_utilisation"):
         figure = figures.values[name]
         if figure is not None:
             figure["partial"] = sampler.device_error is not None
             if sampler.device_error is not None:
                 figure["device_error"] = sampler.device_error
+        elif sampler.device_error is not None:
+            figures.unavailable[name] += f" (device sampling stopped: {sampler.device_error})"
 
 
 def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[str], exchanges: dict[str, Exchange],
             warmup: Exchange | None, busy: list[tuple[float, float]], void: list[str], *,
             baseline: dict[str, dict[str, int]], guarded: bool, ready_s: float | None, started_utc: str,
-            swap_start: int | None, swap_start_error: str | None) -> int:
+            swap_start: int | None, swap_start_error: str | None,
+            swap_warm: int | None, swap_warm_error: str | None) -> int:
     sampler = server.sampler
     assert sampler is not None
     rss = list(sampler.rss)
@@ -1111,7 +1148,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         if variant in refs:
             figures.compute(name, lambda variant=variant: _text(refs[variant], responses))
     page_rows = _page_rows(pages, exchanges, refs)
-    swap = _swap(swap_start, swap_start_error, sampler)
+    swap = _swap((swap_start, swap_start_error), (swap_warm, swap_warm_error), sampler, page_windows)
     swap_moved = swap["growth_bytes"] is not None and swap["growth_bytes"] > SWAP_MOVED_BYTES
 
     host = _host(baseline)
@@ -1157,10 +1194,13 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         if sampler.device_error is not None:
             device_line += f" (partial: device sampling stopped: {sampler.device_error})"
         print(device_line)
+    elif sampler.device_error is not None and args.devices != "cpu":  # a CPU run reports no device figures anyway
+        print(f"note: device sampling stopped: {sampler.device_error}; no device figures")
     if "int8" in refs:
         print(f"vs pinned int8: {_text_cell(figures.values.get('text_vs_int8'))}")
     if swap_moved:
-        print(f"note: timings are unreliable: system swap grew {swap['growth_bytes'] / _GIB:.2f} GiB during the run")
+        print(f"note: timings are unreliable: system swap grew {swap['growth_bytes'] / _GIB:.2f} GiB "
+              "during the page requests")
     if swap["reason"] is not None:
         in_full = " in full" if swap["growth_bytes"] is not None else ""
         print(f"note: swap not measured{in_full}: {swap['reason']}")

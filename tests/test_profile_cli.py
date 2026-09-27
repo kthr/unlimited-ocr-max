@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import functools
 import json
 import math
 import os
@@ -39,6 +40,7 @@ TG_PER_REQUEST = 3
 CHUNK_CHARS = 7
 WRONG_PAGE = "dense_body"
 GIB = 2**30
+MIB = 2**20
 
 
 @dataclass
@@ -57,8 +59,10 @@ class Stub:
 @pytest.fixture
 def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
     """A wrapper named ``max`` that runs the stub under this interpreter; faster polling and dwell;
-    a constant system swap, so this machine paging during a test cannot flag its timings."""
+    a sampler ticking every 0.1 s, so the stub's short page requests (~0.06 s each) are sure to
+    hold swap samples; a constant system swap, so this machine paging cannot flag a test's timings."""
     monkeypatch.setattr(profile_sampling, "swap_used_bytes", lambda: GIB)
+    monkeypatch.setattr(profile_sampling, "Sampler", functools.partial(profile_sampling.Sampler, interval_s=0.1))
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir()
     exe = tmp_path / "bin" / "max"
@@ -372,7 +376,8 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
     assert memory["n_steady"] >= 1 and memory["steady_min_bytes"] <= memory["steady_max_bytes"] <= memory["peak_bytes"]
     assert figures["device_memory"] is None and doc["unavailable"]["device_memory"] == "--devices cpu"
     assert figures["gpu_utilisation"] is None and doc["unavailable"]["gpu_utilisation"] == "--devices cpu"
-    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": GIB, "growth_bytes": 0, "reason": None}
+    assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB, "load_growth_bytes": 0, "max_bytes": GIB,
+                           "growth_bytes": 0, "reason": None}
     assert doc["sampling"]["swap_samples"] > 0
     assert doc["warmup"]["completion_tokens"] == 8 and doc["warmup"]["finish_reason"] == "length"
 
@@ -865,14 +870,12 @@ def test_a_stopped_leader_is_not_taken_for_an_exited_one(tmp_path: Path, leader_
 
 @pytest.mark.parametrize("reaped", ["before-a-check", "before-the-teardown", "after-sigterm"])
 def test_a_leader_reaped_behind_popens_back_unpins_its_group(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reaped: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leader_check: str, reaped: str
 ) -> None:
-    """``waitid`` answers ``ECHILD`` for a leader someone else reaped. ``leader_exited`` records that
-    through ``poll()`` (returncode 0, Popen's mapping of ``ECHILD``) -- whether a check, the
-    teardown's first look or its wait after SIGTERM sees it first -- and from then on no group is
-    signalled: that pid may no longer be the group id."""
-    if not hasattr(os, "waitid"):
-        pytest.skip("this Python has no os.waitid")
+    """A leader someone else reaped: ``waitid`` answers ``ECHILD``, ``ps`` has no row for it.
+    ``leader_exited`` records that through ``poll()`` (returncode 0, Popen's mapping of ``ECHILD``)
+    -- whether a check, the teardown's first look or its wait after SIGTERM sees it first -- and
+    from then on no group is signalled: that pid may no longer be the group id."""
     server = profile._Server(["sleep", "30"], dict(os.environ), tmp_path / "serve.log", _NoDeviceProbe())
     server.start()
     pid = server.proc.pid
@@ -901,6 +904,39 @@ def test_a_leader_reaped_behind_popens_back_unpins_its_group(
         server.stop()
     assert server.stopped and server.proc.returncode == 0 and server.warnings == []
     assert signalled == ([signal.SIGTERM] if reaped == "after-sigterm" else [])
+
+
+@pytest.mark.parametrize(("mode", "expected"), [("", 0), ("exit-early", 4)])
+def test_sigchld_ignored_at_entry_is_reset_so_the_leader_still_pins_its_group(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    leader_check: str, mode: str, expected: int,
+) -> None:
+    """With SIGCHLD ignored, the kernel reaps an exiting child at once: no zombie, nothing pins its
+    group. ``run`` holds SIGCHLD at its default and restores it after. So exit-early's child, left
+    in the group, is still reached through the group -- and every group signal goes to a group
+    whose leader is still listed (alive, or a zombie)."""
+    monkeypatch.setenv("PROFILE_STUB_MODE", mode)
+    real_killpg = os.killpg
+    group_signals: list[tuple[int, bool]] = []  # (signal, whether the group's leader was still listed)
+
+    def checked_killpg(pgid: int, sig: int) -> None:
+        row = profile._ps_table().get(pgid)
+        group_signals.append((sig, row is not None and row.pgid == pgid))
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(profile.os, "killpg", checked_killpg)
+    previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    try:
+        code = profile.run(_args(tmp_path / "run", _free_port()), max_exe=stub.exe)
+        restored = signal.getsignal(signal.SIGCHLD)
+    finally:
+        signal.signal(signal.SIGCHLD, previous)
+    captured = capsys.readouterr()
+    assert code == expected, captured.err
+    assert restored == signal.SIG_IGN
+    assert _tree_gone(stub)
+    assert group_signals and all(pinned for _, pinned in group_signals), group_signals
+    assert "WARNING" not in captured.err
 
 
 def test_a_server_that_exits_during_the_run_voids_it(
@@ -997,6 +1033,53 @@ def test_device_figures_are_marked_partial_when_device_sampling_stops_mid_run(
     assert lines[1].endswith(", median GPU utilisation 40 % (partial: device sampling stopped: the device went away)")
 
 
+class _ProbeFailingAfterTheBaseline(_FakeProbe):
+    """Device statistics raise on every call after the pre-start baseline: no device sample at all."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def stats(self) -> dict[str, dict[str, int]]:
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("the device went away")
+        return super().stats()
+
+
+def test_device_sampling_that_fails_before_its_first_sample_is_said_not_silent(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(profile_sampling, "open_device_probe", _ProbeFailingAfterTheBaseline)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["sampling"]["device_error"] == "the device went away" and doc["sampling"]["device_samples"] == 0
+    stopped = " (device sampling stopped: the device went away)"
+    assert doc["figures"]["device_memory"] is None and doc["figures"]["gpu_utilisation"] is None
+    assert doc["unavailable"]["device_memory"] == "no per-process device memory sampled on this host" + stopped
+    assert doc["unavailable"]["gpu_utilisation"] == "no device statistics sampled on this host" + stopped
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[5] == profile._memory_cell(doc["figures"]["host_memory"])
+    assert lines[1:] == ["note: device sampling stopped: the device went away; no device figures",
+                         f"profile.json: {out / 'profile.json'}"]
+
+
+def test_a_malformed_device_sample_is_an_unavailable_figure_not_a_crash() -> None:
+    sampler = argparse.Namespace(device_process=[(1.0, 3 * GIB)], device_error=None,
+                                 device_stats=[(1.0, {"nv0": {"gpu_usage_percent": 40}})])  # no used_bytes
+    figures = profile._Figures()
+    profile._device_figures(figures, argparse.Namespace(devices="gpu"), sampler, baseline={"nv0": _gpu(1, 0)},
+                            busy=[(0.5, 1.5)], steady_after=0.0, page_windows=[(0.5, 1.5)])
+    assert figures.values["gpu_utilisation"] is None
+    assert figures.unavailable["gpu_utilisation"] == "'used_bytes'"
+    assert figures.values["device_memory"]["peak_bytes"] == 3 * GIB  # the other figure is unaffected
+
+
 def test_gpu_utilisation_without_device_memory_is_still_printed(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1029,11 +1112,30 @@ def test_the_row_memory_cell_is_device_memory_where_it_was_measured_else_host_rs
     assert _cells(metal_or_cpu)[5] == "2.0 / 1.0 GiB"
 
 
-def test_swap_growth_flags_the_timings_without_voiding_the_run(
+def _requests_seen(stub: Stub) -> int:
+    """How many requests the stub has received; counted by line ends, so a line being written is not one."""
+    path = stub.dir / "requests.jsonl"
+    return path.read_text().count("\n") if path.exists() else 0
+
+
+def _swap_fake(main: list[int | Exception], sampled: Any) -> Any:
+    """A system swap: the main thread's readings -- before the server starts, at the warmup's end --
+    in turn from ``main``; the sampler thread's from ``sampled()``. An exception is raised."""
+    readings = iter(main)
+
+    def swap() -> int:
+        value = next(readings) if threading.current_thread() is threading.main_thread() else sampled()
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return swap
+
+
+def test_swap_growth_during_the_pages_flags_the_timings_without_voiding_the_run(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    readings = iter([GIB])  # read once before the server starts; 200 MiB more on every sample after
-    monkeypatch.setattr(profile_sampling, "swap_used_bytes", lambda: next(readings, GIB + 200 * 2**20))
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", _swap_fake([GIB, GIB], lambda: GIB + 200 * MIB))
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -1041,12 +1143,39 @@ def test_swap_growth_flags_the_timings_without_voiding_the_run(
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
     assert doc["void"] == []
-    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": GIB + 200 * 2**20, "growth_bytes": 200 * 2**20,
-                           "reason": None}
+    assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB, "load_growth_bytes": 0,
+                           "max_bytes": GIB + 200 * MIB, "growth_bytes": 200 * MIB, "reason": None}
     lines = captured.out.splitlines()
     assert _cells(lines[0])[2] == "profiled, 12 pages, swap moved"
     assert doc["row"] == lines[0]
-    assert "note: timings are unreliable: system swap grew 0.20 GiB during the run" in lines
+    assert [line for line in lines if line.startswith("note:")] == [
+        "note: timings are unreliable: system swap grew 0.20 GiB during the page requests"
+    ]
+
+
+def test_swap_that_moved_only_outside_the_page_requests_does_not_flag_the_timings(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The model's load and compile page 500 MiB out before the warmup ends, and swap spikes while
+    loading and in the idle dwell after the last page; during the page requests it stays at the
+    warmup's-end reading. Only the load figure records it."""
+    out = tmp_path / "run"
+
+    def sampled() -> int:
+        outside = _requests_seen(stub) == 0 or (out / "pages" / f"{PAGES[-1]}.md").exists()
+        return GIB + (900 if outside else 500) * MIB
+
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", _swap_fake([GIB, GIB + 500 * MIB], sampled))
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB + 500 * MIB, "load_growth_bytes": 500 * MIB,
+                           "max_bytes": GIB + 500 * MIB, "growth_bytes": 0, "reason": None}
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[2] == "profiled, 12 pages"
+    assert not any(line.startswith("note:") for line in lines)
 
 
 def test_unreadable_swap_is_null_with_its_reason(
@@ -1062,36 +1191,31 @@ def test_unreadable_swap_is_null_with_its_reason(
     assert code == 0, captured.err
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
-    assert doc["swap"] == {"start_bytes": None, "max_bytes": None, "growth_bytes": None,
-                           "reason": "system swap cannot be read: no swap accounting here"}
+    reason = ("system swap cannot be read before the server started: no swap accounting here; "
+              "system swap cannot be read at the warmup's end: no swap accounting here; "
+              "swap sampling stopped: no swap accounting here")
+    assert doc["swap"] == {"start_bytes": None, "warm_bytes": None, "load_growth_bytes": None,
+                           "max_bytes": None, "growth_bytes": None, "reason": reason}
     assert doc["sampling"]["swap_samples"] == 0
     lines = captured.out.splitlines()
     assert _cells(lines[0])[2] == "profiled, 12 pages"
-    assert [line for line in lines if line.startswith("note:")] == [
-        "note: swap not measured: system swap cannot be read: no swap accounting here"
-    ]
+    assert [line for line in lines if line.startswith("note:")] == [f"note: swap not measured: {reason}"]
 
 
-def test_swap_read_at_the_start_but_never_sampled_is_null_not_zero_growth(
+def test_swap_never_sampled_inside_a_page_request_is_null_not_zero_growth(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    readings = iter([GIB])  # the reading before the server starts works; every sample after fails
-
-    def fails_after_the_first() -> int:
-        value = next(readings, None)
-        if value is None:
-            raise OSError("swap went away")
-        return value
-
-    monkeypatch.setattr(profile_sampling, "swap_used_bytes", fails_after_the_first)
+    """Both readings work, the sampler's never do: the warmup's-end reading alone says nothing about the pages."""
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", _swap_fake([GIB, GIB], lambda: OSError("swap went away")))
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
-    reason = "no swap sample was taken during the run (swap sampling stopped: swap went away)"
-    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": None, "growth_bytes": None, "reason": reason}
+    reason = "no swap sample fell inside a page request; swap sampling stopped: swap went away"
+    assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB, "load_growth_bytes": 0,
+                           "max_bytes": None, "growth_bytes": None, "reason": reason}
     assert doc["sampling"]["swap_samples"] == 0
     lines = captured.out.splitlines()
     assert _cells(lines[0])[2] == "profiled, 12 pages"
@@ -1101,27 +1225,25 @@ def test_swap_read_at_the_start_but_never_sampled_is_null_not_zero_growth(
 def test_swap_sampling_that_stops_mid_run_keeps_its_growth_and_says_so(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    readings = iter([GIB, GIB + 100 * 2**20])  # the start, one sample, then every read fails
+    monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")  # page windows long enough for several swap samples
 
-    def fails_after_two() -> int:
-        value = next(readings, None)
-        if value is None:
-            raise OSError("swap went away")
-        return value
+    def sampled() -> int | Exception:  # 100 MiB above the warmup's end, until the stub sees its 8th request
+        return OSError("swap went away") if _requests_seen(stub) >= 8 else GIB + 100 * MIB
 
-    monkeypatch.setattr(profile_sampling, "swap_used_bytes", fails_after_two)
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", _swap_fake([GIB, GIB], sampled))
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
-    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": GIB + 100 * 2**20, "growth_bytes": 100 * 2**20,
+    assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB, "load_growth_bytes": 0,
+                           "max_bytes": GIB + 100 * MIB, "growth_bytes": 100 * MIB,
                            "reason": "swap sampling stopped: swap went away"}
     lines = captured.out.splitlines()
     assert _cells(lines[0])[2] == "profiled, 12 pages, swap moved"
     assert [line for line in lines if line.startswith("note:")] == [
-        "note: timings are unreliable: system swap grew 0.10 GiB during the run",
+        "note: timings are unreliable: system swap grew 0.10 GiB during the page requests",
         "note: swap not measured in full: swap sampling stopped: swap went away",
     ]
 
@@ -1192,6 +1314,9 @@ def test_an_interrupt_is_reported_and_the_probe_closed_only_as_far_as_the_teardo
 @pytest.mark.parametrize(("mode", "why"), [
     ("choices-dict", "choices is not a list"),
     ("choices-empty", "an event with neither choices nor usage"),
+    ("choice-not-object", "choices[0] is not a choice object with a delta object"),
+    ("delta-zero", "choices[0] is not a choice object with a delta object"),
+    ("event-list", "an event that is not a JSON object"),
     ("content-not-text", "delta content is not text"),
 ])
 def test_a_malformed_stream_fails_the_request_instead_of_crashing(
