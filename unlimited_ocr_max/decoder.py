@@ -16,9 +16,13 @@ Invariants the emitted graph depends on:
   enforced by the config). The routed experts are three stacked ``[64, N, K]`` tensors with
   slice ``j`` == expert ``j``; the dense accumulation runs over ascending ``j``
   as one unfused 64-term chain, and the hand-rolled top-6 decode path reuses that
-  exact chain so it is bitwise equal to the dense path. The native decode path
+  exact chain so it is bitwise equal to the dense path. The native path
   (``moe_create_indices`` + ``grouped_matmul_ragged``) is GPU-only on this MAX
-  build and is not bitwise equal to either.
+  build, is not bitwise equal to either, and is what bf16 runs at every
+  sequence length on an accelerator: the dense chain consumes each expert as a
+  weight-only ``x_fp32 @ w_bf16.T``, which MAX compile-folds into an fp32 copy
+  of the whole expert stack on the device (9.02 GiB at prefill), while
+  ``grouped_matmul_ragged`` reads the bf16 stack directly.
 * With ``DecoderConfig.int8_experts`` the three stacks are int8 next to fp32
   per-group scales (``…experts.<proj>_scales``, group size
   :data:`~unlimited_ocr_max.model_config.INT8_GROUP_SIZE`) and reach the
@@ -350,11 +354,11 @@ class MoEGate(Module):
 class MoE(Module):
     """64 routed experts, top-6, plus the shared experts.
 
-    At ``seq > 1`` (prefill) every expert runs and a dense ``[seq, 64]`` router
-    matrix weights them. At ``seq == 1`` (decode) only the six selected experts
-    run: on CPU through the hand-rolled gather that reuses the dense 64-term
-    accumulation (bitwise equal to it), on an accelerator through MAX's grouped
-    kernels (``native_decode``).
+    On an accelerator (``native_routing``) only the six selected experts run,
+    through MAX's grouped kernels, at every sequence length. On CPU, prefill
+    (``seq > 1``) runs every expert weighted by a dense ``[seq, 64]`` router
+    matrix, and decode runs the hand-rolled top-6 gather that reuses the same
+    64-term accumulation (bitwise equal to it).
 
     In int8 mode (``config.int8_experts``) the prefill chain dequantizes each
     expert through ``int8_dequant_expert`` and the decode step runs
@@ -368,7 +372,7 @@ class MoE(Module):
         self.num_experts = config.n_routed_experts
         self.num_experts_per_token = config.num_experts_per_tok
         self.hidden_dim = config.hidden_size
-        self.native_decode = not device.is_cpu()
+        self.native_routing = not device.is_cpu()
         self.int8 = config.int8_experts
         self.gate = MoEGate(
             config.hidden_size, config.n_routed_experts, config.num_experts_per_tok, dtype=dtype, device=device
@@ -473,13 +477,12 @@ class MoE(Module):
     def __call__(self, x: TensorValue) -> TensorValue:
         indices, weights = self.gate(x)
         router = self.router_matrix(indices, weights)
-        if x.shape[0] == 1:
-            if self.int8:
-                routed = self._routed_int8(x, indices, weights)
-            elif self.native_decode:
-                routed = self._routed_native(x, indices, weights)
-            else:
-                routed = self._routed_sparse(x, indices, router)
+        if self.int8:
+            routed = self._routed_int8(x, indices, weights) if x.shape[0] == 1 else self._routed_dense(x, router)
+        elif self.native_routing:
+            routed = self._routed_native(x, indices, weights)
+        elif x.shape[0] == 1:
+            routed = self._routed_sparse(x, indices, router)
         else:
             routed = self._routed_dense(x, router)
         return routed + self.shared_experts(x)
