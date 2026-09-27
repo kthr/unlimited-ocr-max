@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.1] — 2026-09-22
+## [0.3.1] — 2026-09-27
 
 ### Added
 - **`unlimited-ocr-max profile`**: starts its own server, sends a bundled
@@ -41,7 +41,7 @@
   `nvidia-*` CUDA wheels, which torch pulls in as its own dependencies regardless
   of whether a GPU is present: several gigabytes an installing user was paying for
   a library this port's runtime never touched. The dependency declaration is
-  catching up with the code: `unlimited_ocr_max/bf16.py` (new this run) does the
+  catching up with the code: `unlimited_ocr_max/bf16.py` (new in this release) does the
   fp32↔bf16 conversion in numpy, bit-exact against torch per its own test, and the
   checkpoint-tensor path already moved onto `max.driver.Buffer`; between them
   nothing left in `unlimited_ocr_max/` imports torch. Guarded by
