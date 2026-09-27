@@ -45,11 +45,34 @@ __all__ = [
     "DeviceProbe",
     "GpuProcessListUnavailable",
     "Sampler",
+    "descendants",
     "foreign_gpu_processes",
     "open_device_probe",
     "process_tree",
     "swap_used_bytes",
 ]
+
+
+def descendants(children: dict[int, list[int]], root: int) -> set[int]:
+    """``root`` and everything reachable from it by walking ``children`` (``ppid -> [pid, ...]``)
+    down, with an explicit stack so a cycle in ``children`` cannot loop forever (each pid is added
+    to the result at most once, and only pushed again if not already in it).
+
+    ``root`` is always included, whether or not it has an entry in ``children`` -- shared by both
+    of this module's process-tree walks (:func:`process_tree` here; ``profile._tree`` builds
+    ``children`` from its own ``ps`` columns and calls this too). Whether ``root`` itself should
+    count at all (e.g. because it is not in the process snapshot ``children`` was built from) is
+    for each caller to decide before calling this, from its own snapshot -- this function has no
+    such snapshot to check against.
+    """
+    tree: set[int] = set()
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid not in tree:
+            tree.add(pid)
+            stack.extend(children.get(pid, ()))
+    return tree
 
 
 def process_tree(root_pid: int) -> dict[int, int]:
@@ -89,15 +112,7 @@ def process_tree(root_pid: int) -> dict[int, int]:
     if root_pid not in rss_kib_by_pid:
         return {}
 
-    tree: dict[int, int] = {}
-    stack = [root_pid]
-    while stack:
-        pid = stack.pop()
-        if pid in tree:
-            continue
-        tree[pid] = rss_kib_by_pid[pid] * 1024
-        stack.extend(children_by_ppid.get(pid, ()))
-    return tree
+    return {pid: rss_kib_by_pid[pid] * 1024 for pid in descendants(children_by_ppid, root_pid)}
 
 
 class DeviceProbe:

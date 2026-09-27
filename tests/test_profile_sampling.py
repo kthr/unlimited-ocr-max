@@ -31,6 +31,7 @@ from unlimited_ocr_max.profile_sampling import (
     DeviceProbe,
     GpuProcessListUnavailable,
     Sampler,
+    descendants,
     foreign_gpu_processes,
     open_device_probe,
     process_tree,
@@ -170,6 +171,21 @@ def test_process_tree_sees_a_real_grandchild_and_root_gone_is_empty() -> None:
 def test_process_tree_unknown_root_is_empty() -> None:
     """A pid that (almost certainly) never existed yields an empty tree, not an error."""
     assert process_tree(2**30 - 1) == {}
+
+
+def test_descendants_walks_children_from_root_and_always_includes_root() -> None:
+    """The shared walk both process-tree readers (this module's and profile.py's) build on."""
+    children = {1: [2, 3], 2: [4], 3: [5]}
+    assert descendants(children, 1) == {1, 2, 3, 4, 5}
+    assert descendants(children, 2) == {2, 4}
+    # A leaf, or a root with no entry in `children` at all, is still included on its own.
+    assert descendants(children, 4) == {4}
+    assert descendants({}, 42) == {42}
+
+
+def test_descendants_tolerates_a_cycle() -> None:
+    """A cycle in `children` must not loop forever; each pid is still visited only once."""
+    assert descendants({1: [2], 2: [1]}, 1) == {1, 2}
 
 
 def test_open_device_probe_on_this_metal_host_is_unavailable() -> None:

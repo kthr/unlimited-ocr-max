@@ -162,14 +162,7 @@ def _tree(table: dict[int, _Ps], root: int) -> set[int]:
     children: dict[int, list[int]] = {}
     for pid, row in table.items():
         children.setdefault(row.ppid, []).append(pid)
-    tree: set[int] = set()
-    stack = [root]
-    while stack:
-        pid = stack.pop()
-        if pid not in tree:
-            tree.add(pid)
-            stack.extend(children.get(pid, ()))
-    return tree
+    return profile_sampling.descendants(children, root)
 
 
 def _snapshot(pids: set[int]) -> set[int]:
