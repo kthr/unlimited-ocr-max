@@ -33,12 +33,13 @@ import pytest
 
 from unlimited_ocr_max import cli, profile, profile_corpus, profile_sampling
 
+# profile_stub_max.py lives beside this test module in tests/, which has no __init__.py: pytest's
+# default import mode puts tests/ on sys.path for a module collected from it, so this (like the
+# test modules themselves) is a plain top-level import, not a package-relative one.
+from profile_stub_max import CHUNK_CHARS, TG_PER_REQUEST, WRONG_PAGE
+
 STUB = Path(__file__).resolve().with_name("profile_stub_max.py")
 PAGES = profile_corpus.page_names()
-#: Mirrors of tests/profile_stub_max.py's constants.
-TG_PER_REQUEST = 3
-CHUNK_CHARS = 7
-WRONG_PAGE = "dense_body"
 GIB = 2**30
 MIB = 2**20
 
