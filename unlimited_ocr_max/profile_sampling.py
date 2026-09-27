@@ -163,6 +163,29 @@ class DeviceProbe:
         self.close()
 
 
+def _try_open(ctx_factory: Any) -> Any:
+    """Construct and ``__enter__`` a vendor context; ``None`` if either step fails.
+
+    If construction succeeds but ``__enter__`` raises, the partially-acquired
+    context still gets its ``__exit__`` called (best-effort) before the
+    reference is dropped, so a failure after partial acquisition cannot leak
+    whatever the context picked up.
+    """
+    try:
+        ctx = ctx_factory()
+    except Exception:
+        return None
+    try:
+        ctx.__enter__()
+    except Exception:
+        try:
+            ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        return None
+    return ctx
+
+
 def open_device_probe() -> DeviceProbe:
     """Build a :class:`DeviceProbe`, trying (and tolerating the absence of) every vendor backend.
 
@@ -178,12 +201,7 @@ def open_device_probe() -> DeviceProbe:
     except Exception:
         return DeviceProbe(diag=None, nvml=None, rsmi=None)
 
-    diag: Any = None
-    try:
-        diag = GPUDiagContext()
-        diag.__enter__()
-    except Exception:
-        diag = None
+    diag = _try_open(GPUDiagContext)
 
     if diag is not None:
         try:
@@ -197,19 +215,8 @@ def open_device_probe() -> DeviceProbe:
                 pass
             diag = None
 
-    nvml: Any = None
-    try:
-        nvml = NVMLContext()
-        nvml.__enter__()
-    except Exception:
-        nvml = None
-
-    rsmi: Any = None
-    try:
-        rsmi = RSMIContext()
-        rsmi.__enter__()
-    except Exception:
-        rsmi = None
+    nvml = _try_open(NVMLContext)
+    rsmi = _try_open(RSMIContext)
 
     return DeviceProbe(diag=diag, nvml=nvml, rsmi=rsmi)
 
@@ -224,17 +231,26 @@ class GpuProcessListUnavailable(RuntimeError):
     """
 
 
-def _gpu_reported() -> bool:
-    """Whether MAX's own GPU diagnostics see any GPU at all (NVIDIA or AMD)."""
+def _reported_gpu_vendors() -> set[str]:
+    """Which vendors (a subset of ``{"nv", "amd"}``) MAX's own GPU diagnostics report a GPU for.
+
+    ``GPUDiagContext().get_stats()`` keys are vendor-prefixed GPU ids
+    (``"nv0"``, ``"amd0"``, ...; wheel ``max/profiler/gpu/multi.py``), so the
+    vendor is just the non-digit prefix of each key. Used to decide, per
+    vendor, whether that vendor's own tool is *required* to be on ``PATH`` --
+    a single combined bool would let one vendor's present-but-unrelated tool
+    (or its own GPU-less ``[]``) mask the other vendor's missing tool.
+    """
     try:
         from max.profiler.gpu import GPUDiagContext
     except Exception:
-        return False
+        return set()
     try:
         with GPUDiagContext() as ctx:
-            return bool(ctx.get_stats())
+            gpu_ids = list(ctx.get_stats())
     except Exception:
-        return False
+        return set()
+    return {gpu_id.rstrip("0123456789") for gpu_id in gpu_ids}
 
 
 def _run_smi(argv: list[str]) -> str:
@@ -382,37 +398,42 @@ def foreign_gpu_processes(own_pids: set[int]) -> list[dict[str, Any]]:
     independently and concatenates whichever are on ``PATH``, so a
     heterogeneous host is covered by both.
 
-    Returns ``[]`` only when no vendor tool is on ``PATH`` *and* MAX's own GPU
-    diagnostics see no GPU either (a Metal or CPU-only host). If no tool is on
-    ``PATH`` but a GPU is reported, or if a tool exits non-zero, raises
-    :class:`GpuProcessListUnavailable` -- this guard refuses to report a
-    measurement it cannot back up rather than assume no other process is
-    using the GPU.
+    The guard is per vendor, not a single combined flag: :func:`_reported_gpu_vendors`
+    says which of ``{"nv", "amd"}`` MAX's own GPU diagnostics see a GPU for,
+    and EACH reported vendor's own tool must be present *and* succeed, or this
+    raises :class:`GpuProcessListUnavailable` -- regardless of what the other
+    vendor's tool reported. So an NVIDIA GPU plus only ``rocm-smi`` on
+    ``PATH`` raises, even though ``rocm-smi`` runs fine and returns ``[]``; a
+    vendor tool that happens to be present with no GPU of that vendor
+    reported is still consulted (its results are concatenated in), but its
+    ``[]`` never satisfies the other vendor's requirement.
+
+    Returns ``[]`` only when no vendor tool is on ``PATH`` *and* no vendor is
+    reported at all (a Metal or CPU-only host). A present tool that exits
+    non-zero, or returns output in an unrecognised shape, also raises.
     """
+    reported_vendors = _reported_gpu_vendors()
     processes: list[dict[str, Any]] = []
-    found_tool = False
 
     if shutil.which("nvidia-smi"):
-        found_tool = True
         processes.extend(_nvidia_foreign_processes(own_pids))
+    elif "nv" in reported_vendors:
+        raise GpuProcessListUnavailable(
+            "an NVIDIA GPU is reported but nvidia-smi is not on PATH"
+        )
 
     if shutil.which("amd-smi"):
-        found_tool = True
         processes.extend(_amd_foreign_processes("amd-smi", ["amd-smi", "process", "--json"], own_pids))
     elif shutil.which("rocm-smi"):
-        found_tool = True
         processes.extend(
             _amd_foreign_processes("rocm-smi", ["rocm-smi", "--showpids", "--json"], own_pids)
         )
-
-    if found_tool:
-        return processes
-
-    if _gpu_reported():
+    elif "amd" in reported_vendors:
         raise GpuProcessListUnavailable(
-            "a GPU is reported but no vendor tool (nvidia-smi/amd-smi/rocm-smi) is on PATH"
+            "an AMD GPU is reported but neither amd-smi nor rocm-smi is on PATH"
         )
-    return []
+
+    return processes
 
 
 class Sampler:
@@ -480,8 +501,14 @@ class Sampler:
         if self._device_ok and self.probe.device_available:
             try:
                 process_bytes = self.probe.process_bytes(pids)
-                self.device_process.append((now, process_bytes))
-                self.device_stats.append((now, self.probe.stats()))
+                stats = self.probe.stats()
             except Exception as e:
                 self.device_error = str(e)
                 self._device_ok = False
+            else:
+                # Only append once BOTH calls succeeded, so device_process and
+                # device_stats can never end up different lengths (a stats()
+                # failure right after a successful process_bytes() must not
+                # leave a process_bytes sample with no matching stats sample).
+                self.device_process.append((now, process_bytes))
+                self.device_stats.append((now, stats))

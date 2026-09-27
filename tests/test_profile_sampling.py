@@ -55,6 +55,30 @@ class _FakeProbe:
         return {"nv0": {"used_bytes": 123, "total_bytes": 456, "gpu_usage_percent": 7}}
 
 
+class _FakeProbeStatsFails:
+    """process_bytes always succeeds; stats() starts raising after ``fail_after`` calls.
+
+    Used to test that a ``stats()`` failure right after a successful
+    ``process_bytes()`` on the SAME tick leaves ``device_process`` and
+    ``device_stats`` equal length -- neither call's result is appended unless
+    both succeed.
+    """
+
+    def __init__(self, fail_after: int) -> None:
+        self.device_available = True
+        self._fail_after = fail_after
+        self._calls = 0
+
+    def process_bytes(self, pids) -> int | None:
+        return 0
+
+    def stats(self) -> dict[str, dict[str, int]]:
+        self._calls += 1
+        if self._calls > self._fail_after:
+            raise RuntimeError("stats went away mid-run")
+        return {"nv0": {"used_bytes": 1, "total_bytes": 2, "gpu_usage_percent": 3}}
+
+
 def test_process_tree_sees_a_real_grandchild_and_root_gone_is_empty() -> None:
     """A shell spawns a python grandchild in its OWN process group; the parent/child walk still sees it.
 
@@ -175,6 +199,53 @@ def test_sampler_probe_failure_mid_run_sets_device_error_once_and_rss_continues(
         child.wait(timeout=5)
 
 
+def test_sampler_stats_failure_after_process_bytes_keeps_lists_equal_length() -> None:
+    """(e) stats() raising right after a successful process_bytes() on the same tick: lists stay equal length.
+
+    Before the fix, ``device_process`` was appended before ``stats()`` ran, so
+    a ``stats()`` failure left it one entry longer than ``device_stats``.
+    """
+    child = subprocess.Popen(["sleep", "5"])
+    try:
+        probe = _FakeProbeStatsFails(fail_after=2)
+        with Sampler(child.pid, probe, interval_s=0.05) as sampler:
+            time.sleep(0.4)
+        assert sampler.device_error == "stats went away mid-run"
+        assert len(sampler.device_process) == len(sampler.device_stats) == 2
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+def test_sampler_ps_failure_on_one_tick_is_skipped_and_rss_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(f) A single ``ps`` (``process_tree``) failure mid-run is skipped; RSS sampling keeps going after it."""
+    child = subprocess.Popen(["sleep", "5"])
+    real_process_tree = profile_sampling.process_tree
+    calls = {"n": 0}
+
+    def flaky_process_tree(root_pid: int) -> dict[int, int]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("ps went away for one tick")
+        return real_process_tree(root_pid)
+
+    monkeypatch.setattr(profile_sampling, "process_tree", flaky_process_tree)
+    probe = open_device_probe()
+    try:
+        with Sampler(child.pid, probe, interval_s=0.05) as sampler:
+            time.sleep(0.5)
+        assert calls["n"] >= 3, "expected the flaky process_tree to be called past its one failure"
+        # The failed tick (call #2) contributed no RSS sample, but ticks before and after it did.
+        assert len(sampler.rss) >= 2
+        assert child.pid in sampler.pids_seen
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        probe.close()
+
+
 def test_private_max_profiler_gpu_process_api_pin() -> None:
     """Pin check for max[all]==26.6.0's private per-process GPU memory API.
 
@@ -238,15 +309,126 @@ def test_foreign_gpu_processes_parses_nvidia_csv_fixture(monkeypatch: pytest.Mon
 
 def test_foreign_gpu_processes_empty_on_no_gpu_host_with_no_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(profile_sampling.shutil, "which", lambda name: None)
-    monkeypatch.setattr(profile_sampling, "_gpu_reported", lambda: False)
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: set())
     assert foreign_gpu_processes(set()) == []
 
 
 def test_foreign_gpu_processes_raises_when_gpu_present_but_no_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(profile_sampling.shutil, "which", lambda name: None)
-    monkeypatch.setattr(profile_sampling, "_gpu_reported", lambda: True)
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
     with pytest.raises(GpuProcessListUnavailable):
         foreign_gpu_processes(set())
+
+
+def test_foreign_gpu_processes_raises_nvidia_reported_only_rocm_smi_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(a) An NVIDIA GPU is reported, but only ``rocm-smi`` is on PATH -- must raise, not return ``[]``.
+
+    A single combined "found some tool" flag would let ``rocm-smi``'s clean
+    ``[]`` mask the missing ``nvidia-smi``; the guard is per vendor, so this
+    must raise regardless of rocm-smi succeeding.
+    """
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
+    monkeypatch.setattr(
+        profile_sampling.shutil,
+        "which",
+        lambda name: "/usr/bin/rocm-smi" if name == "rocm-smi" else None,
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="{}", stderr=""),
+    )
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes(set())
+
+
+def test_foreign_gpu_processes_raises_amd_reported_only_nvidia_smi_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) An AMD GPU is reported, but only ``nvidia-smi`` is on PATH -- must raise."""
+    own_pid = 111
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"amd"})
+    monkeypatch.setattr(
+        profile_sampling.shutil,
+        "which",
+        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes({own_pid})
+
+
+def test_foreign_gpu_processes_both_vendors_reported_both_tools_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) Both vendors reported, both tools on PATH -- processes from both come back."""
+    nvidia_pid, amd_pid = 201, 202
+    nvidia_csv = f"{nvidia_pid}, python3, 1024\n"
+    amd_payload = json.dumps(
+        [
+            {
+                "gpu": 0,
+                "process_list": [
+                    {
+                        "process_info": {
+                            "pid": amd_pid,
+                            "name": "other",
+                            "memory_usage": {"vram_mem": {"value": 256, "unit": "MB"}},
+                        }
+                    }
+                ],
+            }
+        ]
+    )
+
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv", "amd"})
+    monkeypatch.setattr(
+        profile_sampling.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in ("nvidia-smi", "amd-smi") else None,
+    )
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(argv, 0, stdout=nvidia_csv, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout=amd_payload, stderr="")
+
+    monkeypatch.setattr(profile_sampling.subprocess, "run", fake_run)
+
+    result = foreign_gpu_processes(set())
+    pids = {p["pid"] for p in result}
+    assert pids == {nvidia_pid, amd_pid}
+
+
+def test_foreign_gpu_processes_nvidia_reported_rocm_smi_present_and_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(d) NVIDIA reported + nvidia-smi present; rocm-smi also present but returns ``[]`` -- NVIDIA result counts."""
+    foreign_pid = 301
+    nvidia_csv = f"{foreign_pid}, python3, 2048\n"
+
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
+    monkeypatch.setattr(
+        profile_sampling.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in ("nvidia-smi", "rocm-smi") else None,
+    )
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(argv, 0, stdout=nvidia_csv, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(profile_sampling.subprocess, "run", fake_run)
+
+    result = foreign_gpu_processes(set())
+    assert result == [{"pid": foreign_pid, "name": "python3", "used_bytes": 2048 * 2**20}]
 
 
 def test_foreign_gpu_processes_raises_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
