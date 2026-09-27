@@ -114,15 +114,57 @@ def test_verify_raises_naming_the_file_on_a_missing_file(tmp_path: Path) -> None
         profile_corpus.verify(root=tmp_data)
 
 
-_COLD_CACHE_NO_NETWORK_MARKERS = (
+_NETWORK_FAILURE_MARKERS = (
     "failed to fetch",
-    "failed to download",
-    "failed to resolve",
-    "no such host",
-    "network is disabled",
-    "could not find a version",
-    "requires network",
+    "dns error",
+    "failed to lookup address",
+    "connection refused",
+    "connection reset",
+    "timed out",
+    "network is unreachable",
+    "was disabled",  # uv's offline wording: "network connectivity was disabled"
+    "--offline",
 )
+
+
+def _is_network_failure(combined_output: str) -> bool:
+    """True iff `combined_output` (uv build's stdout+stderr, concatenated) demonstrably
+    reflects a network/offline problem rather than an ordinary resolution failure (e.g. an
+    unsatisfiable build-backend pin), so the wheel-build test may skip instead of fail."""
+    lowered = combined_output.lower()
+    return any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS)
+
+
+def test_network_failure_classifier_skips_offline_cold_cache() -> None:
+    """A cold-cache build with no network reachable is uv's offline wording, not a real
+    resolution failure: this must be classified as a network failure (skip)."""
+    stderr = (
+        "error: Failed to install: hatchling-1.24.2-py3-none-any.whl (hatchling==1.24.2)\n"
+        "  Caused by: network connectivity was disabled"
+    )
+    assert _is_network_failure(stderr)
+
+
+def test_network_failure_classifier_does_not_skip_unsatisfiable_pin() -> None:
+    """An unsatisfiable build-backend pin is a real resolution failure with no network text
+    anywhere in the output: this must NOT be classified as a network failure (fail, not skip)."""
+    stderr = (
+        "error: Failed to resolve requirements from build-system.requires\n"
+        "  Caused by: No solution found when resolving: hatchling==9999.0.0\n"
+        "  Caused by: Because only hatchling<=1.24.2 is available and you require "
+        "hatchling==9999.0.0, we can conclude that your requirements are unsatisfiable."
+    )
+    assert not _is_network_failure(stderr)
+
+
+def test_network_failure_classifier_skips_dns_error() -> None:
+    """A DNS resolution failure is a network problem: this must be classified as a network
+    failure (skip)."""
+    stderr = (
+        "error: dns error: failed to lookup address information: "
+        "Temporary failure in name resolution"
+    )
+    assert _is_network_failure(stderr)
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not on PATH")
@@ -142,11 +184,11 @@ def test_the_wheel_bundles_the_corpus(tmp_path: Path) -> None:
         cwd=ROOT, capture_output=True, text=True, timeout=300, env=env,
     )
     if result.returncode != 0:
-        stderr_lower = result.stderr.lower()
-        if any(marker in stderr_lower for marker in _COLD_CACHE_NO_NETWORK_MARKERS):
+        if _is_network_failure(result.stdout + result.stderr):
             pytest.skip(
                 "uv build needs to fetch its build backend (e.g. hatchling) and could not "
-                f"reach the network from a cold UV_CACHE_DIR: stderr={result.stderr!r}"
+                f"reach the network from a cold UV_CACHE_DIR: stdout={result.stdout!r} "
+                f"stderr={result.stderr!r}"
             )
         assert False, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     wheels = list((tmp_path / "dist").glob("*.whl"))
@@ -168,6 +210,20 @@ def test_notice_names_the_paper_and_the_four_page_files() -> None:
     assert "2606.23050" in notice
     for name in ("plain_text", "dense_body", "toc_dotted", "figure_wide"):
         assert f"{name}.png" in notice, name
+
+
+def test_notice_does_not_claim_the_transcripts_are_not_the_papers_text() -> None:
+    """The four paper-derived transcripts reproduce the paper's own text as this model
+    transcribed it; NOTICE.md must not claim otherwise (round-2 review: this was inverted)."""
+    notice = (DATA_DIR / "NOTICE.md").read_text()
+    assert "not text taken from the paper" not in notice
+    assert "reproduce the text of those paper pages" in notice
+
+
+def test_manifest_provenance_has_no_internal_ticket_id() -> None:
+    """manifest.json is public; its provenance string must not leak an internal ticket id."""
+    manifest = profile_corpus.load_manifest()
+    assert "KON-" not in manifest["provenance"]
 
 
 def test_manifest_matches_the_committed_data_bytes() -> None:

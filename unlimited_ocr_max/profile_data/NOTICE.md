@@ -14,12 +14,12 @@ Tengyu Du, Lei Jia; 2026), [arXiv:2606.23050](https://arxiv.org/abs/2606.23050):
 | `pages/plain_text.png` | page 14 (references tail) |
 
 The matching `references/bf16/{name}.md` and `references/int8/{name}.md` files
-for those four pages are this model's own OCR output of those renders, not
-text taken from the paper.
+for those four pages reproduce the text of those paper pages as transcribed by
+this model (its OCR output of the renders).
 
 The same paper is distributed by Baidu as `Unlimited-OCR.pdf` in the
 MIT-licensed `baidu/Unlimited-OCR` repository (MIT, Copyright (c) 2026 Baidu),
 <https://huggingface.co/baidu/Unlimited-OCR>.
 
-The remaining 8 `syn_*` pages, and all of their reference transcripts, are
-this project's own synthetic pages.
+The other 8 pages (`syn_*`) are synthetic pages made for this project; their
+reference transcripts are this model's OCR output of them.
