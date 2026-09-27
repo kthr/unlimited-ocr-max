@@ -114,10 +114,22 @@ def test_verify_raises_naming_the_file_on_a_missing_file(tmp_path: Path) -> None
         profile_corpus.verify(root=tmp_data)
 
 
+_COLD_CACHE_NO_NETWORK_MARKERS = (
+    "failed to fetch",
+    "failed to download",
+    "failed to resolve",
+    "no such host",
+    "network is disabled",
+    "could not find a version",
+    "requires network",
+)
+
+
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not on PATH")
 def test_the_wheel_bundles_the_corpus(tmp_path: Path) -> None:
-    """A wheel built with `uv build` contains the manifest and all 36 pinned data files, so the
-    corpus reaches an installed environment and not just this checkout.
+    """A wheel built with `uv build` contains the manifest, NOTICE.md, and all 36 pinned data
+    files, so the corpus (and its attribution) reaches an installed environment and not just
+    this checkout.
 
     Uses a private `UV_CACHE_DIR` under `tmp_path`: this worktree shares uv's default cache with
     every other concurrent agent session on the machine, and a build-environment cache entry
@@ -129,15 +141,33 @@ def test_the_wheel_bundles_the_corpus(tmp_path: Path) -> None:
         ["uv", "build", "--wheel", "--out-dir", str(tmp_path / "dist")],
         cwd=ROOT, capture_output=True, text=True, timeout=300, env=env,
     )
-    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    if result.returncode != 0:
+        stderr_lower = result.stderr.lower()
+        if any(marker in stderr_lower for marker in _COLD_CACHE_NO_NETWORK_MARKERS):
+            pytest.skip(
+                "uv build needs to fetch its build backend (e.g. hatchling) and could not "
+                f"reach the network from a cold UV_CACHE_DIR: stderr={result.stderr!r}"
+            )
+        assert False, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     wheels = list((tmp_path / "dist").glob("*.whl"))
     assert len(wheels) == 1, wheels
     with zipfile.ZipFile(wheels[0]) as wheel:
         names = set(wheel.namelist())
     manifest = profile_corpus.load_manifest()
     assert "unlimited_ocr_max/profile_data/manifest.json" in names
+    assert "unlimited_ocr_max/profile_data/NOTICE.md" in names
     for rel_path in manifest["files"]:
         assert f"unlimited_ocr_max/profile_data/{rel_path}" in names, rel_path
+
+
+def test_notice_names_the_paper_and_the_four_page_files() -> None:
+    """NOTICE.md must exist and carry the attribution: the arXiv id and each of the four
+    paper-derived page files, so a reader of the shipped data (not just the manifest string)
+    can see which pages are the paper's and which are this project's own synthetic pages."""
+    notice = (DATA_DIR / "NOTICE.md").read_text()
+    assert "2606.23050" in notice
+    for name in ("plain_text", "dense_body", "toc_dotted", "figure_wide"):
+        assert f"{name}.png" in notice, name
 
 
 def test_manifest_matches_the_committed_data_bytes() -> None:
