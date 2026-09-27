@@ -17,10 +17,12 @@ import math
 import os
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,7 +56,9 @@ class Stub:
 
 @pytest.fixture
 def stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Stub:
-    """A wrapper named ``max`` that runs the stub under this interpreter; faster polling and dwell."""
+    """A wrapper named ``max`` that runs the stub under this interpreter; faster polling and dwell;
+    a constant system swap, so this machine paging during a test cannot flag its timings."""
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", lambda: GIB)
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir()
     exe = tmp_path / "bin" / "max"
@@ -155,6 +159,37 @@ class _NoDeviceProbe(_FakeProbe):
 
     def process_bytes(self, pids: Any) -> int | None:
         return None
+
+
+class _TwoGpuProbe(_FakeProbe):
+    """Two NVIDIA GPUs: nv0 stays idle at its baseline; nv1 serves -- 3 GiB above its baseline and
+    90 % busy from the first sample after the pre-start baseline on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def stats(self) -> dict[str, dict[str, int]]:
+        self.calls += 1
+        serving = self.calls > 1  # the first call is the pre-start baseline
+        return {
+            "nv0": {"used_bytes": GIB, "total_bytes": 80 * GIB, "gpu_usage_percent": 0},
+            "nv1": {"used_bytes": (4 if serving else 1) * GIB, "total_bytes": 80 * GIB,
+                    "gpu_usage_percent": 90 if serving else 0},
+        }
+
+
+class _ProbeFailingMidRun(_FakeProbe):
+    """Device statistics raise once the stub has received the warmup and seven pages."""
+
+    def __init__(self, stub: Stub) -> None:
+        super().__init__()
+        self.stub = stub
+
+    def stats(self) -> dict[str, dict[str, int]]:
+        if len(self.stub.requests()) >= 8:
+            raise RuntimeError("the device went away")
+        return super().stats()
 
 
 def _no_spawn(self: Any) -> None:
@@ -319,13 +354,17 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
                                  "n_whole_second_excluded": 1}
     # The warmup's 30 s CE line is skipped; the 12 page prefills are 5.00 s each.
     assert figures["prefill"] == {"median_s": 5.0, "floor_s": 5.0, "n": 12}
+    # ... and kept in prefill_all_ce, the population the figures published before `profile` used.
+    assert figures["prefill_all_ce"] == {"median_s": 5.0, "floor_s": 5.0, "n": 13}
     assert figures["text"] == {"identical": 12, "n": 12, "edits": 0,
                                "ref_chars": sum(len(profile_corpus.reference(p)) for p in PAGES), "cer": 0.0}
     memory = figures["host_memory"]
     assert memory["peak_bytes"] > 0 and memory["n"] > 0
     assert memory["n_steady"] >= 1 and memory["steady_min_bytes"] <= memory["steady_max_bytes"] <= memory["peak_bytes"]
-    assert figures["device_memory"] is None and "device memory" in doc["unavailable"]["device_memory"]
-    assert figures["gpu_utilisation"] is None and doc["unavailable"]["gpu_utilisation"]
+    assert figures["device_memory"] is None and doc["unavailable"]["device_memory"] == "--devices cpu"
+    assert figures["gpu_utilisation"] is None and doc["unavailable"]["gpu_utilisation"] == "--devices cpu"
+    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": GIB, "growth_bytes": 0, "reason": None}
+    assert doc["sampling"]["swap_samples"] > 0
     assert doc["warmup"]["completion_tokens"] == 8 and doc["warmup"]["finish_reason"] == "length"
 
     assert [row["page"] for row in doc["pages"]] == PAGES
@@ -346,6 +385,7 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
     assert re.fullmatch(r"\d+\.\d / \d+\.\d(–\d+\.\d)? GiB", memory_cell)
     assert text == "12/12 byte-identical, CER 0"
     assert lines[1:] == [f"profile.json: {out / 'profile.json'}"]
+    assert captured.err.count("stopping the server") == 1  # said once, by the teardown itself
 
 
 def test_a_wrong_page_is_counted_not_hidden(stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -526,13 +566,17 @@ def test_the_post_run_gpu_recheck_also_runs_without_device_statistics(
     assert doc["figures"]["device_memory"] is None
 
 
-def test_a_cpu_run_never_consults_the_gpu_process_list(
+def test_a_cpu_run_never_consults_the_gpu_process_list_and_reports_no_device_figures(
     stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """On a host with a GPU (the fake probe samples one), a --devices cpu run still has no device
+    figures: whatever the GPU did meanwhile is not the server's work."""
+
     def must_not_run(own: set[int]) -> list[dict[str, Any]]:
         raise AssertionError("foreign_gpu_processes was called for a --devices cpu run")
 
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", must_not_run)
+    monkeypatch.setattr(profile_sampling, "open_device_probe", _FakeProbe)
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
@@ -540,6 +584,12 @@ def test_a_cpu_run_never_consults_the_gpu_process_list(
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
     assert doc["gpu_guard"] is False and doc["void"] == []
+    assert doc["sampling"]["device_samples"] > 0  # sampled, and deliberately not reported
+    for name in ("device_memory", "gpu_utilisation"):
+        assert doc["figures"][name] is None and doc["unavailable"][name] == "--devices cpu"
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[5] == profile._memory_cell(doc["figures"]["host_memory"])  # host RSS, not "device ..."
+    assert lines[1:] == [f"profile.json: {out / 'profile.json'}"]
 
 
 def test_a_foreign_gpu_process_found_after_the_run_voids_it(
@@ -567,10 +617,16 @@ def test_a_foreign_gpu_process_found_after_the_run_voids_it(
     assert doc["gpu_guard"] is True
     assert doc["device_baseline"] == probe.stats()
     assert doc["figures"]["device_memory"]["peak_bytes"] == 3 * GIB
+    assert doc["figures"]["device_memory"]["partial"] is False
+    # nv0's used_bytes never rises above its baseline, so the first (only) id is the serving GPU.
     assert doc["figures"]["gpu_utilisation"]["median_percent"] == 40
+    assert doc["figures"]["gpu_utilisation"]["gpus"] == ["nv0"]
     lines = captured.out.splitlines()
-    assert _cells(lines[0])[2] == "void, 12 pages"
-    assert lines[1] == "device memory peak / steady 3.0 / 3.0 GiB, median GPU utilisation 40 %"
+    cells = _cells(lines[0])
+    assert cells[2] == "void, 12 pages"
+    assert cells[5] == "device 3.0 / 3.0 GiB"
+    assert lines[1] == (f"host RSS peak / steady {profile._memory_cell(doc['figures']['host_memory'])}, "
+                        "median GPU utilisation 40 %")
     assert lines[2] == f"void: {doc['void'][0]}"
     assert probe.closed
 
@@ -642,6 +698,7 @@ def test_ctrl_c_during_the_teardown_is_held_until_it_has_finished(
     captured = capsys.readouterr()
     assert code == 130  # re-delivered once the teardown finished
     assert "SIGINT received; still stopping the server" in captured.err
+    assert "interrupted; the server is stopped" in captured.err
     assert _tree_gone(stub)
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
@@ -689,3 +746,338 @@ def test_a_server_that_ignores_sigterm_is_sigkilled_after_the_grace(
     code = profile.run(_args(tmp_path / "run", _free_port()), max_exe=stub.exe)
     assert code == 0, capsys.readouterr().err
     assert _tree_gone(stub)
+
+
+# --------------------------------------------------------------------------- #
+# hardening before the real measurements (KON-210)
+# --------------------------------------------------------------------------- #
+def _ps_field(pid: int, field: str) -> str:
+    return subprocess.run(["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+
+
+def _poll(condition: Any, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def test_a_host_without_ps_is_refused_before_any_probe_or_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real_which = shutil.which
+    monkeypatch.setattr(profile.shutil, "which",
+                        lambda name, *a, **k: None if name == "ps" else real_which(name, *a, **k))
+    monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: pytest.fail("the device probe was opened"))
+    monkeypatch.setattr(profile._Server, "start", _no_spawn)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    assert code == 2
+    assert "`ps` is required (install procps)" in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_the_leader_exit_is_seen_without_reaping_it_so_its_group_stays_pinned(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """exit-early: the stub exits and leaves its child in its process group. ``waitid(WNOWAIT)``
+    sees the exit, yet the leader stays an unreaped zombie -- so its pid is still the group id,
+    the group signal reaches the child, and the straggler pass finds nothing left."""
+    monkeypatch.setenv("PROFILE_STUB_MODE", "exit-early")
+    server = profile._Server([stub.exe, "serve", "--port", str(_free_port())], dict(os.environ),
+                             tmp_path / "serve.log", _NoDeviceProbe())
+    server.start()
+    try:
+        assert _poll(server.leader_exited)
+        pids = stub.pids()
+        assert server.proc.returncode is None  # seen, not reaped
+        assert _ps_field(pids["pid"], "stat").startswith("Z")
+        assert _ps_field(pids["child"], "pgid") == str(pids["pid"])
+        os.killpg(pids["pid"], 0)  # the group can still be signalled
+    finally:
+        server.stop()
+    assert server.proc.returncode == 1  # reaped, at the very end of the teardown
+    assert _tree_gone(stub)
+    assert "still alive after its process group was killed" not in capsys.readouterr().err
+
+
+def test_a_stopped_leader_is_not_taken_for_an_exited_one(tmp_path: Path) -> None:
+    """macOS answers ``waitid(WEXITED)`` for a stopped child too (``CLD_STOPPED``); only an exit counts."""
+    server = profile._Server(["sleep", "30"], dict(os.environ), tmp_path / "serve.log", _NoDeviceProbe())
+    server.start()
+    try:
+        os.kill(server.proc.pid, signal.SIGSTOP)
+        assert _poll(lambda: _ps_field(server.proc.pid, "stat").startswith("T"))
+        assert not server.leader_exited()
+        os.kill(server.proc.pid, signal.SIGCONT)
+        assert not server.leader_exited()
+    finally:
+        server.stop()
+    assert server.proc.returncode == -signal.SIGTERM
+    assert server.leader_exited()
+
+
+def test_a_server_that_exits_during_the_run_voids_it(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The port race: our server fails to bind and exits while whatever holds the port answers.
+    Here every page is answered, and only the exit shows that the answers are not our server's."""
+    monkeypatch.setenv("PROFILE_STUB_MODE", "exit-after-pages")
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 5, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["void"] == ["the server exited during the run; another process may have answered on the port"]
+    assert doc["figures"]["text"]["identical"] == 12
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[2] == "void, 12 pages"
+    assert lines[1] == f"void: {doc['void'][0]}"
+
+
+def _gpu(used_gib: int, percent: int) -> dict[str, int]:
+    return {"used_bytes": used_gib * GIB, "total_bytes": 80 * GIB, "gpu_usage_percent": percent}
+
+
+def test_only_the_serving_gpus_count_towards_utilisation() -> None:
+    baseline = {"nv0": _gpu(1, 0), "nv1": _gpu(1, 0)}
+    stats = [
+        (1.0, {"nv0": _gpu(1, 0), "nv1": _gpu(4, 90)}),
+        (2.0, {"nv0": _gpu(1, 2), "nv1": _gpu(4, 80)}),
+        (9.0, {"nv0": _gpu(1, 0), "nv1": _gpu(4, 10)}),  # outside every page request
+    ]
+    gpus = profile._serving_gpus(baseline, stats)
+    assert gpus == ["nv1"]
+    assert profile._gpu_utilisation(stats, [(0.5, 2.5)], gpus) == {"median_percent": 85, "n": 2, "gpus": ["nv1"]}
+    # Every GPU that rose counts; with none risen, the first id does.
+    both = [(1.0, {"nv0": _gpu(2, 50), "nv1": _gpu(4, 90)})]
+    assert profile._serving_gpus(baseline, both) == ["nv0", "nv1"]
+    assert profile._gpu_utilisation(both, [(0.5, 2.5)], ["nv0", "nv1"])["median_percent"] == 70
+    assert profile._serving_gpus(baseline, [(1.0, baseline)]) == ["nv0"]
+    assert profile._serving_gpus({}, []) == []
+
+
+def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")  # page windows long enough for several device samples
+    monkeypatch.setattr(profile_sampling, "open_device_probe", _TwoGpuProbe)
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    utilisation = doc["figures"]["gpu_utilisation"]
+    assert utilisation["gpus"] == ["nv1"] and utilisation["median_percent"] == 90  # not 45: idle nv0 is left out
+    assert utilisation["partial"] is False
+    assert doc["figures"]["host_memory"] is not None  # JSON keeps both memories
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[5] == "device 3.0 / 3.0 GiB"
+    assert lines[1] == (f"host RSS peak / steady {profile._memory_cell(doc['figures']['host_memory'])}, "
+                        "median GPU utilisation 90 %")
+
+
+def test_device_figures_are_marked_partial_when_device_sampling_stops_mid_run(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")
+    monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: _ProbeFailingMidRun(stub))
+    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err  # partial is marked, not void
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["sampling"]["device_error"] == "the device went away"
+    for name in ("device_memory", "gpu_utilisation"):
+        figure = doc["figures"][name]
+        assert figure is not None, doc["unavailable"]
+        assert figure["partial"] is True and figure["device_error"] == "the device went away"
+    assert captured.out.splitlines()[1].endswith(
+        ", median GPU utilisation 40 % (partial: device sampling stopped: the device went away)"
+    )
+
+
+def test_the_row_memory_cell_is_device_memory_where_it_was_measured_else_host_rss() -> None:
+    host = {"peak_bytes": 2 * GIB, "steady_min_bytes": GIB, "steady_max_bytes": GIB}
+    device = {"peak_bytes": 3 * GIB, "steady_min_bytes": GIB * 5 // 2, "steady_max_bytes": GIB * 5 // 2}
+    discrete = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": device})
+    metal_or_cpu = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": None})
+    assert _cells(discrete)[5] == "device 3.0 / 2.5 GiB"
+    assert _cells(metal_or_cpu)[5] == "2.0 / 1.0 GiB"
+
+
+def test_swap_growth_flags_the_timings_without_voiding_the_run(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    readings = iter([GIB])  # read once before the server starts; 200 MiB more on every sample after
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", lambda: next(readings, GIB + 200 * 2**20))
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["void"] == []
+    assert doc["swap"] == {"start_bytes": GIB, "max_bytes": GIB + 200 * 2**20, "growth_bytes": 200 * 2**20,
+                           "reason": None}
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[2] == "profiled, 12 pages, swap moved"
+    assert doc["row"] == lines[0]
+    assert "note: timings are unreliable: system swap grew 0.20 GiB during the run" in lines
+
+
+def test_unreadable_swap_is_null_with_its_reason(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unreadable() -> int:
+        raise OSError("no swap accounting here")
+
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", unreadable)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert doc["swap"] == {"start_bytes": None, "max_bytes": None, "growth_bytes": None,
+                           "reason": "system swap cannot be read: no swap accounting here"}
+    assert doc["sampling"]["swap_samples"] == 0
+    lines = captured.out.splitlines()
+    assert _cells(lines[0])[2] == "profiled, 12 pages"
+    assert not any(line.startswith("note:") for line in lines)
+
+
+def _ce_line(execution: str) -> str:
+    return (f"12:00:00.000 INFO: Executed CE batch with 1 reqs | Batch creation: 1.00ms, Execution: {execution} | "
+            "KVCache usage: 18.8% of 16 blocks")
+
+
+def test_prefill_all_ce_is_the_median_over_every_ce_line_the_warmups_included() -> None:
+    figures = profile._Figures()
+    profile._scheduler_figures(figures, "\n".join(_ce_line(v) for v in ("30.00s", "1.00s", "2.00s", "3.00s")))
+    assert figures.values["prefill"] == {"median_s": 2.0, "floor_s": 1.0, "n": 3}  # the warmup's line skipped
+    assert figures.values["prefill_all_ce"] == {"median_s": 2.5, "floor_s": 1.0, "n": 4}  # median(30, 1, 2, 3)
+    assert _cells(profile.row("hw", "bf16", "s", figures.values))[4] == "2.00 s"  # the row keeps the primary
+
+
+def test_the_stop_message_is_said_while_signals_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[tuple[str, Any]] = []
+    monkeypatch.setattr(profile, "_say", lambda message: events.append((message, signal.getsignal(signal.SIGINT))))
+    monkeypatch.setattr(profile._Server, "_teardown",
+                        lambda self: events.append(("teardown", signal.getsignal(signal.SIGINT))))
+    server = profile._Server(["unused"], {}, Path("unused.log"), _NoDeviceProbe())
+    server.proc = object()  # type: ignore[assignment]  # "started"
+    server.stop()
+    assert [event for event, _ in events] == ["stopping the server", "teardown"]
+    held = events[0][1]
+    assert isinstance(getattr(held, "__self__", None), profile._HeldSignals)
+    assert events[1][1] == held
+
+
+class _FakeSampler:
+    def __init__(self, alive: bool) -> None:
+        self.alive = alive
+
+
+@pytest.mark.parametrize(("stopped", "sampler_alive", "interrupted", "said", "probe_closed"), [
+    (True, False, True, "interrupted; the server is stopped", True),
+    (False, True, True, "interrupted; the server's teardown did not finish, and continues at exit", False),
+    (True, True, False, None, False),  # the sampler thread outlived its stop bound
+    (True, False, False, None, True),
+])
+def test_an_interrupt_is_reported_and_the_probe_closed_only_as_far_as_the_teardown_got(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    stopped: bool, sampler_alive: bool, interrupted: bool, said: str | None, probe_closed: bool,
+) -> None:
+    probe = _FakeProbe()
+    monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: probe)
+
+    def fake_profile(args: argparse.Namespace, server: profile._Server, out: Path, **kwargs: Any) -> int:
+        server.proc = object()  # type: ignore[assignment]  # started
+        server._stopped = stopped
+        server.sampler = _FakeSampler(sampler_alive)  # type: ignore[assignment]
+        if interrupted:
+            raise KeyboardInterrupt
+        return profile.EXIT_OK
+
+    monkeypatch.setattr(profile, "_profile", fake_profile)
+    code = profile.run(_args(tmp_path / "run", _free_port()), max_exe="/nonexistent/max")
+    err = capsys.readouterr().err
+    assert code == (130 if interrupted else 0)
+    assert [line for line in err.splitlines() if "interrupted" in line] == (
+        [f"[unlimited-ocr-max profile] {said}"] if said else []
+    )
+    assert probe.closed is probe_closed
+
+
+@pytest.mark.parametrize(("mode", "why"), [
+    ("choices-dict", "choices is not a list"),
+    ("choices-empty", "an event with neither choices nor usage"),
+    ("content-not-text", "delta content is not text"),
+])
+def test_a_malformed_stream_fails_the_request_instead_of_crashing(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    mode: str, why: str,
+) -> None:
+    monkeypatch.setenv("PROFILE_STUB_MODE", mode)
+    out = tmp_path / "run"
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 5, captured.err
+    assert _tree_gone(stub)
+    doc = json.loads((out / "profile.json").read_text())
+    assert len(doc["void"]) == 1 and doc["void"][0].startswith(f"request warmup failed: {why}: "), doc["void"]
+
+
+def test_each_teardown_check_reads_one_ps_snapshot(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Tree membership is walked in the same ``ps`` snapshot the alive/pgid checks read. ``detach``
+    runs every check: the group kill, then the straggler pass for the child that left the group."""
+    monkeypatch.setenv("PROFILE_STUB_MODE", "detach")
+    snapshots: list[int] = []
+    real_table = profile._ps_table
+
+    def counted_table() -> dict[int, Any]:
+        snapshots.append(1)
+        return real_table()
+
+    main_thread_walks: list[int] = []
+    real_tree = profile_sampling.process_tree
+
+    def watched_tree(root: int) -> dict[int, int]:
+        if threading.current_thread() is threading.main_thread():  # the sampler thread keeps its own
+            main_thread_walks.append(root)
+        return real_tree(root)
+
+    monkeypatch.setattr(profile, "_ps_table", counted_table)
+    monkeypatch.setattr(profile_sampling, "process_tree", watched_tree)
+    per_check: dict[str, list[int]] = {}
+    for name in ("_record_identities", "_group_alive", "_verified_alive", "leader_exited"):
+        def counting(self: Any, *args: Any, _original: Any = getattr(profile._Server, name), _name: str = name) -> Any:
+            before = len(snapshots)
+            try:
+                return _original(self, *args)
+            finally:
+                per_check.setdefault(_name, []).append(len(snapshots) - before)
+
+        monkeypatch.setattr(profile._Server, name, counting)
+
+    code = profile.run(_args(tmp_path / "run", _free_port()), max_exe=stub.exe)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert f"SIGTERM to pid(s) [{stub.pids()['child']}]" in captured.err  # the straggler pass ran
+    assert _tree_gone(stub)
+    assert per_check["_record_identities"] == [1]
+    assert per_check["_group_alive"] and set(per_check["_group_alive"]) == {1}
+    assert len(per_check["_verified_alive"]) >= 2 and set(per_check["_verified_alive"]) == {1}
+    assert set(per_check["leader_exited"]) == {0}  # waitid, no ps at all
+    assert len(snapshots) == sum(map(sum, per_check.values()))  # no other snapshot was taken
+    assert main_thread_walks == []

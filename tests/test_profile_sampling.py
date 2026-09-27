@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -347,6 +348,29 @@ def test_foreign_gpu_processes_parses_nvidia_csv_fixture(monkeypatch: pytest.Mon
     assert {"pid": foreign_pid, "name": "python3", "used_bytes": 1024 * 2**20} in result
     na_entry = next(p for p in result if p["pid"] == na_pid)
     assert na_entry["used_bytes"] is None
+
+
+@pytest.mark.parametrize("bad_line", [
+    "444, python3",                 # a field missing
+    "445, /opt/my,app/bin/x, 100",  # a comma in the name: four fields
+    "[N/A], python3, 100",          # no pid
+])
+def test_foreign_gpu_processes_refuses_a_malformed_nvidia_csv_line(
+    monkeypatch: pytest.MonkeyPatch, bad_line: str
+) -> None:
+    """A line it cannot parse could be a foreign process: it raises (quoting the line), never skips it."""
+    csv_out = f"222, python3, 1024\n{bad_line}\n"
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
+    monkeypatch.setattr(
+        profile_sampling.shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=csv_out, stderr=""),
+    )
+    with pytest.raises(GpuProcessListUnavailable, match=re.escape(repr(bad_line))):
+        foreign_gpu_processes(set())
 
 
 def test_foreign_gpu_processes_empty_on_no_gpu_host_with_no_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -729,3 +753,59 @@ def test_sampler_stop_is_bounded_and_flags_timeout_when_a_tick_blocks() -> None:
         sampler._thread.join(timeout=5)
         child.kill()
         child.wait(timeout=5)
+    assert sampler.alive is False
+
+
+# --- system swap ---------------------------------------------------------------
+
+
+def test_swap_used_from_macos_swapusage() -> None:
+    parse = profile_sampling._swap_used_from_swapusage
+    assert parse("total = 3072.00M  used = 1776.31M  free = 1295.69M  (encrypted)") == round(1776.31 * 2**20)
+    assert parse("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n") == 0
+    assert parse("total = 4.00G  used = 1.50G  free = 2.50G") == 3 * 2**29
+    with pytest.raises(ValueError, match="unrecognised vm.swapusage"):
+        parse("vm.swapusage: unknown oid")
+
+
+def test_swap_used_from_linux_meminfo() -> None:
+    parse = profile_sampling._swap_used_from_meminfo
+    meminfo = (
+        "MemTotal:       16384000 kB\nSwapCached:        1024 kB\n"
+        "SwapTotal:       2097148 kB\nSwapFree:        1048572 kB\n"
+    )
+    assert parse(meminfo) == (2097148 - 1048572) * 1024
+    with pytest.raises(ValueError, match="SwapTotal/SwapFree"):
+        parse("MemTotal:       16384000 kB\n")
+
+
+@pytest.mark.skipif(not (sys.platform == "darwin" or sys.platform.startswith("linux")), reason="macOS/Linux only")
+def test_swap_used_bytes_reads_this_host() -> None:
+    used = profile_sampling.swap_used_bytes()
+    assert isinstance(used, int) and used >= 0
+
+
+def test_sampler_records_swap_and_a_failing_swap_read_stops_only_swap_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readings = iter([5 * 2**20, 6 * 2**20])
+
+    def swap() -> int:
+        value = next(readings, None)
+        if value is None:
+            raise OSError("swap went away")
+        return value
+
+    monkeypatch.setattr(profile_sampling, "swap_used_bytes", swap)
+    child = subprocess.Popen(["sleep", "5"])
+    probe = open_device_probe()
+    try:
+        with Sampler(child.pid, probe, interval_s=0.05) as sampler:
+            assert _poll_until(lambda: sampler.swap_error is not None and len(sampler.rss) >= 5)
+        assert [value for _, value in sampler.swap] == [5 * 2**20, 6 * 2**20]
+        assert sampler.swap_error == "swap went away"
+        assert len(sampler.rss) > len(sampler.swap)  # host RSS sampling went on
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        probe.close()

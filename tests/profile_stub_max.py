@@ -20,11 +20,15 @@ It also spawns one child of its own (``sleep``), so a test can prove the whole t
 ``requests.jsonl`` line per request; ``PROFILE_STUB_PREFILL_S`` sets the delay before the first
 text delta (default 0.05 s). ``PROFILE_STUB_MODE`` selects a misbehaviour:
 
-``wrong-page``   one page's text has its first character changed
-``exit-early``   exits 1 before serving, leaving its child behind in the process group
-``never-ready``  ``/v1/models`` never lists the model
-``detach``       the child starts its own session, i.e. leaves the process group
-``ignore-term``  ignores SIGTERM, and so does its child (the disposition is inherited)
+``wrong-page``        one page's text has its first character changed
+``exit-early``        exits 1 before serving, leaving its child behind in the process group
+``exit-after-pages``  exits 0 right after answering the last page, leaving its child behind
+``never-ready``       ``/v1/models`` never lists the model
+``detach``            the child starts its own session, i.e. leaves the process group
+``ignore-term``       ignores SIGTERM, and so does its child (the disposition is inherited)
+``choices-dict``      the text deltas carry ``choices`` as an object instead of a list
+``choices-empty``     the text deltas carry ``choices: []`` (and no usage)
+``content-not-text``  the text deltas carry a number as ``delta.content``
 """
 
 from __future__ import annotations
@@ -159,15 +163,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._event({"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
         time.sleep(PREFILL_S)
         for piece in streamed:
-            self._event({"choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
+            self._event(_text_delta(piece))
         finish = "length" if len(streamed) < len(chunks) else "stop"
         self._event({"choices": [{"index": 0, "delta": {"content": None}, "finish_reason": finish}]})
         self._event({"choices": [], "usage": {"prompt_tokens": 276, "completion_tokens": len(streamed),
                                               "total_tokens": 276 + len(streamed)}})
-        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.write(b"data: [DONE]\n\n")  # unbuffered: in the socket before the exit below
+        if MODE == "exit-after-pages" and index == len(profile_corpus.page_names()):  # the warmup, then every page
+            os._exit(0)
 
     def _event(self, payload: object) -> None:
         self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+
+
+def _text_delta(piece: str) -> dict[str, object]:
+    choice = {"index": 0, "delta": {"content": piece}, "finish_reason": None}
+    if MODE == "choices-dict":
+        return {"choices": {"0": choice}}
+    if MODE == "choices-empty":
+        return {"choices": []}
+    if MODE == "content-not-text":
+        return {"choices": [{**choice, "delta": {"content": 7}}]}
+    return {"choices": [choice]}
 
 
 def main(argv: list[str]) -> int:

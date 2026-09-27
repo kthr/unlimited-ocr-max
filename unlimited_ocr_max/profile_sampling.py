@@ -8,7 +8,9 @@ report 0 bytes for exactly that shape), and samples that carry a timestamp at
 all, so they can be aligned against a request window afterwards.
 ``BackgroundRecorder`` gives neither: it walks by process group, and its
 samples are unstamped. Hence :func:`process_tree` (parent/child links, one
-``ps`` call) and :class:`Sampler` (a plain background thread) instead.
+``ps`` call) and :class:`Sampler` (a plain background thread) instead. Its
+tick also records the system's swap in use (:func:`swap_used_bytes`), so a
+run whose timings were taken while the host was paging can say so.
 
 The owner's rule for device sampling: *"the measurement is only doable if
 there are no other processes running on the GPU."* :func:`foreign_gpu_processes`
@@ -29,8 +31,10 @@ and monkeypatching rather than real hardware.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -43,6 +47,7 @@ __all__ = [
     "foreign_gpu_processes",
     "open_device_probe",
     "process_tree",
+    "swap_used_bytes",
 ]
 
 
@@ -300,14 +305,18 @@ def _nvidia_foreign_processes(own_pids: set[int]) -> list[dict[str, Any]]:
         line = line.strip()
         if not line:
             continue
+        # A line in any other shape is refused, never skipped: a skipped line could be a
+        # foreign process, and the guard must not under-report (the AMD parsers refuse too).
         fields = [field.strip() for field in line.split(",")]
         if len(fields) != 3:
-            continue
+            raise GpuProcessListUnavailable(
+                f"unrecognised nvidia-smi line (expected pid, process_name, used_memory): {line!r}"
+            )
         pid_field, name, mem_field = fields
         try:
             pid = int(pid_field)
         except ValueError:
-            continue
+            raise GpuProcessListUnavailable(f"unrecognised nvidia-smi pid in line: {line!r}") from None
         if pid in own_pids:
             continue
         processes.append(
@@ -461,6 +470,44 @@ def foreign_gpu_processes(own_pids: set[int]) -> list[dict[str, Any]]:
     return processes
 
 
+_SWAPUSAGE_USED = re.compile(r"\bused = ([0-9]+(?:\.[0-9]+)?)([KMGT])\b")
+_SWAPUSAGE_UNIT = {"K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+
+
+def _swap_used_from_swapusage(text: str) -> int:
+    """Bytes of swap in use from macOS ``sysctl -n vm.swapusage``:
+    ``total = 3072.00M  used = 1776.31M  free = 1295.69M  (encrypted)``."""
+    match = _SWAPUSAGE_USED.search(text)
+    if match is None:
+        raise ValueError(f"unrecognised vm.swapusage: {text.strip()!r}")
+    return round(float(match.group(1)) * _SWAPUSAGE_UNIT[match.group(2)])
+
+
+def _swap_used_from_meminfo(text: str) -> int:
+    """Bytes of swap in use from Linux ``/proc/meminfo``: ``SwapTotal`` - ``SwapFree`` (both in kB)."""
+    kib: dict[str, int] = {}
+    for line in text.splitlines():
+        name, _, value = line.partition(":")
+        if name in ("SwapTotal", "SwapFree"):
+            kib[name] = int(value.split()[0])
+    if kib.keys() != {"SwapTotal", "SwapFree"}:
+        raise ValueError("/proc/meminfo has no SwapTotal/SwapFree")
+    return (kib["SwapTotal"] - kib["SwapFree"]) * 1024
+
+
+def swap_used_bytes() -> int:
+    """System-wide swap in use, in bytes (macOS and Linux). Raises when it cannot be read."""
+    if sys.platform == "darwin":
+        result = subprocess.run(
+            ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, check=True, timeout=10
+        )
+        return _swap_used_from_swapusage(result.stdout)
+    if sys.platform.startswith("linux"):
+        with open("/proc/meminfo", encoding="ascii", errors="replace") as meminfo:
+            return _swap_used_from_meminfo(meminfo.read())
+    raise OSError(f"system swap is not readable on {sys.platform}")
+
+
 class Sampler:
     """Background thread sampling host RSS and (if available) device memory/utilisation.
 
@@ -469,13 +516,15 @@ class Sampler:
     sample -- ``(time.monotonic(), value)`` -- to :attr:`rss` (summed process-tree
     RSS bytes) and every pid seen to :attr:`pids_seen`. When ``probe.device_available``,
     it also appends to :attr:`device_process` (``probe.process_bytes`` over the
-    tree's pids) and :attr:`device_stats` (``probe.stats()``).
+    tree's pids) and :attr:`device_stats` (``probe.stats()``). Every tick also
+    appends the system's swap in use (:func:`swap_used_bytes`) to :attr:`swap`.
 
     A ``ps`` failure on a single tick is skipped (RSS sampling just continues
     on the next tick). A device-probe exception is recorded once, as a string,
     in :attr:`device_error`, and device sampling stops for the rest of the run
-    -- RSS sampling is unaffected. The background thread never raises into the
-    caller.
+    -- RSS sampling is unaffected. A swap read that fails is recorded the same
+    way, in :attr:`swap_error`, and stops swap sampling only. The background
+    thread never raises into the caller.
 
     :meth:`stop` is bounded: it never waits longer than
     ``max(5.0, 10 * interval_s)`` for the thread to finish, even if a tick is
@@ -495,6 +544,8 @@ class Sampler:
         self.device_process: list[tuple[float, int | None]] = []
         self.device_stats: list[tuple[float, dict[str, dict[str, int]]]] = []
         self.device_error: str | None = None
+        self.swap: list[tuple[float, int]] = []
+        self.swap_error: str | None = None
         self.stop_timed_out = False
 
         self._device_ok = True
@@ -524,12 +575,18 @@ class Sampler:
             if self._thread.is_alive():
                 self.stop_timed_out = True
 
+    @property
+    def alive(self) -> bool:
+        """Whether the sampling thread is running -- and so may be inside a probe call right now."""
+        return self._thread.is_alive()
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             self._tick()
             self._stop_event.wait(self.interval_s)
 
     def _tick(self) -> None:
+        self._sample_swap()  # first, so its subprocess does not sit between `now` and the ps sample
         now = time.monotonic()
         try:
             tree = process_tree(self.root_pid)
@@ -546,7 +603,7 @@ class Sampler:
                 process_bytes = self.probe.process_bytes(pids)
                 stats = self.probe.stats()
             except Exception as e:
-                self.device_error = str(e)
+                self.device_error = str(e) or type(e).__name__  # never "": callers test it for None
                 self._device_ok = False
             else:
                 # Only append once BOTH calls succeeded, so device_process and
@@ -555,3 +612,13 @@ class Sampler:
                 # leave a process_bytes sample with no matching stats sample).
                 self.device_process.append((now, process_bytes))
                 self.device_stats.append((now, stats))
+
+    def _sample_swap(self) -> None:
+        if self.swap_error is not None:
+            return
+        try:
+            used = swap_used_bytes()
+        except Exception as e:
+            self.swap_error = str(e) or type(e).__name__
+            return
+        self.swap.append((time.monotonic(), used))

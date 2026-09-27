@@ -18,10 +18,11 @@ Three rules shape this module:
   every process of its tree that left the group. Signals that arrive during the teardown are
   held until it has finished.
 * **It never signals a pid it cannot prove is the server's.** The server process is reaped only
-  at the very end of the teardown, so until then its pid -- which is also its process group id
-  -- cannot be reused, and ``pgid == server pid`` proves membership. A process outside the group
-  is signalled only while it is a descendant of the server, or while it has the pid *and* start
-  time it had when it verifiably belonged to the server.
+  at the very end of the teardown -- its exit is seen with ``waitid(..., WNOWAIT)``, which leaves
+  it a zombie -- so until then its pid, which is also its process group id, cannot be reused,
+  and ``pgid == server pid`` proves membership. A process outside the group is signalled only
+  while it is a descendant of the server, or while it has the pid *and* start time it had when
+  it verifiably belonged to the server. Each such check reads one ``ps`` snapshot.
 
 Stdlib only at import, like :mod:`.cli`: MAX is touched only through the server subprocess,
 :func:`.profile_sampling.open_device_probe`, and a short-lived subprocess that asks
@@ -74,9 +75,12 @@ STRAGGLER_GRACE_S = 5.0
 #: Idle time after the last page, so the steady-memory population is not empty.
 STEADY_DWELL_S = 5.0
 LOG_TAIL_LINES = 40
+#: System swap growth over the run above which the timings are flagged (never voided).
+SWAP_MOVED_BYTES = 0.05 * 2**30
 
 EXIT_OK = 0
 EXIT_PORT_IN_USE = 2
+EXIT_NO_PS = 2
 EXIT_GPU_BUSY = 3
 EXIT_NOT_READY = 4
 EXIT_VOID = 5
@@ -85,6 +89,8 @@ EXIT_INTERRUPTED = 130
 SCHEMA = 1
 _GIB = 2**30
 _MIB = 2**20
+#: ``waitid`` ``si_code`` values that mean the child has terminated.
+_EXITED = (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)
 #: No proxies: the server is on 127.0.0.1, and a system proxy must never sit in between.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 _ACCELERATOR_PROBE = (
@@ -124,7 +130,8 @@ class _Ps:
 
 
 def _ps_table() -> dict[int, _Ps]:
-    """Every process: ``{pid: (ppid, pgid, stat, start time)}``, zombies included (stat ``Z``)."""
+    """Every process: ``{pid: (ppid, pgid, stat, start time)}``, zombies included (stat ``Z``).
+    One ``ps`` call: every membership check of the teardown reads one such consistent snapshot."""
     result = subprocess.run(
         ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
         capture_output=True, text=True, errors="replace", check=True, env={**os.environ, "LC_ALL": "C"},
@@ -140,6 +147,24 @@ def _ps_table() -> dict[int, _Ps]:
             continue
         table[pid] = _Ps(ppid, pgid, fields[3], fields[4].strip())
     return table
+
+
+def _tree(table: dict[int, _Ps], root: int) -> set[int]:
+    """``root`` and all of its descendants in ``table``, by walking ``ppid`` links; empty when
+    ``root`` is not in it."""
+    if root not in table:
+        return set()
+    children: dict[int, list[int]] = {}
+    for pid, row in table.items():
+        children.setdefault(row.ppid, []).append(pid)
+    tree: set[int] = set()
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid not in tree:
+            tree.add(pid)
+            stack.extend(children.get(pid, ()))
+    return tree
 
 
 def _snapshot(pids: set[int]) -> set[int]:
@@ -235,8 +260,6 @@ class _Server:
         self.void: list[str] = []
         #: Anything the teardown could not guarantee, e.g. a process it could not stop.
         self.warnings: list[str] = []
-        #: The sampler thread outlived its stop bound and may still be inside a probe call.
-        self.sampler_stuck = False
         self._identity: dict[int, str] = {}
         self._stopped = False
 
@@ -249,16 +272,20 @@ class _Server:
         self.sampler.__enter__()
 
     def leader_exited(self) -> bool:
-        """Whether the server process has exited -- without reaping it (see the module docstring).
-        ``False`` while that cannot be determined."""
+        """Whether the server process has exited -- without reaping it (see the module docstring):
+        ``WNOWAIT`` leaves it a zombie, so its pid and process group id stay pinned. ``False``
+        while that cannot be determined."""
         assert self.proc is not None
         if self.proc.returncode is not None:
             return True
         try:
-            row = _ps_table().get(self.proc.pid)
-        except (OSError, subprocess.SubprocessError):
+            info = os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:  # no longer our child to wait for: it exited and was reaped
+            return True
+        except OSError:
             return False
-        return row is None or not row.alive
+        # macOS also answers WEXITED for a *stopped* child (si_code CLD_STOPPED); only an exit counts.
+        return info is not None and info.si_code in _EXITED
 
     @property
     def stopped(self) -> bool:
@@ -268,6 +295,7 @@ class _Server:
         if self.stopped:
             return
         with _HeldSignals("stopping the server"):
+            _say("stopping the server")
             self._teardown()
 
     def _warn(self, message: str) -> None:
@@ -281,7 +309,6 @@ class _Server:
         if self.sampler is not None:
             self.sampler.stop()
             if self.sampler.stop_timed_out:
-                self.sampler_stuck = True
                 self.void.append("the sampler thread did not stop within its bound; its samples may be incomplete")
             seen = _snapshot(self.sampler.pids_seen)
         # Unreaped, the server's pid is still its process group id and cannot belong to anyone else.
@@ -305,10 +332,10 @@ class _Server:
         assert self.proc is not None
         try:
             table = _ps_table()
-            tree = set(profile_sampling.process_tree(self.proc.pid)) if pinned else set()
         except (OSError, subprocess.SubprocessError) as e:
             self._warn(f"cannot list processes ({e}); only the server's process group is signalled")
             return
+        tree = _tree(table, self.proc.pid) if pinned else set()
         for pid, row in table.items():
             if pid in tree or (pinned and row.pgid == self.proc.pid):
                 self._identity.setdefault(pid, row.lstart)
@@ -334,9 +361,9 @@ class _Server:
         pinned = self.proc.returncode is None
         try:
             table = _ps_table()
-            tree = set(profile_sampling.process_tree(self.proc.pid)) if pinned else set()
         except (OSError, subprocess.SubprocessError):
             return set()
+        tree = _tree(table, self.proc.pid) if pinned else set()
         me = os.getpid()
         return {
             pid
@@ -452,7 +479,8 @@ def _stream_chat(port: int, png: bytes, max_tokens: int) -> Exchange:
     """Send one page and read its SSE stream to ``[DONE]``.
 
     The text is every ``choices[0].delta.content`` concatenated (``None`` skipped); TTFT is the
-    first non-empty delta; ``completion_tokens`` comes from the usage chunk.
+    first non-empty delta; ``completion_tokens`` comes from the usage chunk. Every event but the
+    usage chunk must carry a non-empty ``choices`` list; any other shape fails the exchange.
     """
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -472,20 +500,32 @@ def _stream_chat(port: int, png: bytes, max_tokens: int) -> Exchange:
                     done = True
                     break
                 event = json.loads(data)
+                if not isinstance(event, dict):
+                    raise ExchangeFailed(f"an event that is not a JSON object: {data[:200]}")
                 if event.get("error"):
                     raise ExchangeFailed(f"error event: {event['error']}")
                 usage = event.get("usage")
                 if usage and usage.get("completion_tokens") is not None:
                     exchange.completion_tokens = int(usage["completion_tokens"])
-                choices = event.get("choices") or []
-                if choices:
-                    content = (choices[0].get("delta") or {}).get("content")
-                    if content is not None:
-                        if content and exchange.t_first is None:
-                            exchange.t_first = time.monotonic()
-                        pieces.append(content)
-                    if choices[0].get("finish_reason"):
-                        exchange.finish_reason = str(choices[0]["finish_reason"])
+                choices = event.get("choices", [])
+                if not isinstance(choices, list):
+                    raise ExchangeFailed(f"choices is not a list: {data[:200]}")
+                if not choices:
+                    if usage is None:  # only the closing usage chunk carries no choice
+                        raise ExchangeFailed(f"an event with neither choices nor usage: {data[:200]}")
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict) or not isinstance(choice.get("delta"), dict | None):
+                    raise ExchangeFailed(f"choices[0] is not a choice object with a delta object: {data[:200]}")
+                content = (choice.get("delta") or {}).get("content")
+                if content is not None:
+                    if not isinstance(content, str):
+                        raise ExchangeFailed(f"delta content is not text: {data[:200]}")
+                    if content and exchange.t_first is None:
+                        exchange.t_first = time.monotonic()
+                    pieces.append(content)
+                if choice.get("finish_reason"):
+                    exchange.finish_reason = str(choice["finish_reason"])
     except urllib.error.HTTPError as e:
         try:
             detail = e.read()[:500].decode("utf-8", "replace")
@@ -702,20 +742,36 @@ def _memory(samples: list[tuple[float, int]], busy: list[tuple[float, float]], s
     }
 
 
+def _serving_gpus(baseline: dict[str, dict[str, int]],
+                  device_stats: list[tuple[float, dict[str, dict[str, int]]]]) -> list[str]:
+    """The GPUs the server ran on: every id whose ``used_bytes`` rose above its pre-start baseline
+    in some sample; if none rose, the first id. An idle GPU next to it must not dilute its figures."""
+    ids = list(dict.fromkeys([*baseline, *(gpu_id for _, per_gpu in device_stats for gpu_id in per_gpu)]))
+    rose = [
+        gpu_id for gpu_id in ids
+        if gpu_id in baseline and any(
+            gpu_id in per_gpu and per_gpu[gpu_id]["used_bytes"] > baseline[gpu_id]["used_bytes"]
+            for _, per_gpu in device_stats
+        )
+    ]
+    return rose or ids[:1]
+
+
 def _gpu_utilisation(device_stats: list[tuple[float, dict[str, dict[str, int]]]],
-                     windows: list[tuple[float, float]]) -> dict[str, Any]:
-    """Median ``gpu_usage_percent`` over the samples taken during a page request, across all GPUs."""
+                     windows: list[tuple[float, float]], gpus: list[str]) -> dict[str, Any]:
+    """Median ``gpu_usage_percent`` of the serving ``gpus`` over the samples taken during a page request."""
     if not device_stats:
         raise ValueError("no device statistics sampled on this host")
     values = [
-        gpu["gpu_usage_percent"]
+        per_gpu[gpu_id]["gpu_usage_percent"]
         for t, per_gpu in device_stats
         if any(start <= t <= end for start, end in windows)
-        for gpu in per_gpu.values()
+        for gpu_id in gpus
+        if gpu_id in per_gpu
     ]
     if not values:
         raise ValueError("no device utilisation sample fell inside a page request")
-    return {"median_percent": statistics.median(values), "n": len(values)}
+    return {"median_percent": statistics.median(values), "n": len(values), "gpus": gpus}
 
 
 def _text(refs: dict[str, str], responses: dict[str, str]) -> dict[str, Any]:
@@ -752,15 +808,18 @@ def _text_cell(text: dict[str, Any] | None) -> str:
 
 def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> str:
     """One row in the README's column order:
-    ``| hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |``."""
-    decode, prefill = figures.get("decode"), figures.get("prefill")
+    ``| hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |``.
+
+    The memory cell is the server's device memory where it was measured (a discrete GPU), else
+    its host RSS (Metal, where device memory is host memory, and CPU)."""
+    decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
     cells = [
         hardware,
         weights,
         status,
         f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})" if decode else "—",
         f"{prefill['median_s']:.2f} s" if prefill else "—",
-        _memory_cell(figures.get("host_memory")),
+        f"device {_memory_cell(device_memory)}" if device_memory else _memory_cell(figures.get("host_memory")),
         _text_cell(figures.get("text")),
     ]
     return "| " + " | ".join(cells) + " |"
@@ -809,9 +868,13 @@ def _out_dir(out: Path | None) -> Path:
 
 
 def run(args: argparse.Namespace, *, max_exe: str | None = None) -> int:
-    """``unlimited-ocr-max profile``; returns the exit code (0 ok, 2 port in use, 3 GPU not idle,
-    4 server never ready, 5 void -- figures still written, 130 interrupted)."""
+    """``unlimited-ocr-max profile``; returns the exit code (0 ok, 2 port in use or no ``ps``,
+    3 GPU not idle, 4 server never ready, 5 void -- figures still written, 130 interrupted)."""
     started_utc = _utc_now()
+    # The teardown proves which processes are the server's from `ps`, and the sampler reads it.
+    if shutil.which("ps") is None:
+        _say("refusing: `ps` is required (install procps)")
+        return EXIT_NO_PS
     cli.check_devices_support_variant(args.weights, args.devices)
     model, weight_path, revision = cli.resolve_model(args.model, args.weights, args.revision)
     out = _out_dir(args.out)
@@ -848,10 +911,17 @@ def run(args: argparse.Namespace, *, max_exe: str | None = None) -> int:
         server = _Server(cmd, cli.serve_env(args.ngram_size), out / "serve.log", probe)
         return _profile(args, server, out, baseline=baseline, guarded=guarded, started_utc=started_utc)
     except KeyboardInterrupt:
-        _say("interrupted" + ("; the server is stopped" if server is not None and server.proc is not None else ""))
+        if server is None or server.proc is None:
+            _say("interrupted")
+        elif server.stopped:
+            _say("interrupted; the server is stopped")
+        else:
+            _say("interrupted; the server's teardown did not finish, and continues at exit")
         return EXIT_INTERRUPTED
     finally:
-        if server is None or not server.sampler_stuck:  # a stuck sampler thread may still be inside the probe
+        # Only once the sampler thread has stopped: one that outlived its stop bound, or that no
+        # teardown stopped yet, may be inside a probe call right now.
+        if server is None or server.sampler is None or not server.sampler.alive:
             probe.close()
 
 
@@ -864,6 +934,7 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
     busy: list[tuple[float, float]] = []
     void: list[str] = []
     ready_s: float | None = None
+    swap_start, swap_start_error = _swap_now()
 
     atexit.register(server.stop)
     try:
@@ -911,25 +982,84 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
                     except (OSError, subprocess.SubprocessError):
                         pass
                     void += _gpu_not_idle(own, after_run=True)
+                # Last, so it covers the whole run. A server that could not bind the port (taken
+                # after the check in `run`) exits -- while whatever took it answers the requests.
+                if server.leader_exited():
+                    void.append("the server exited during the run; another process may have answered on the port")
             finally:
-                _say("stopping the server")
                 server.stop()
     finally:
         if server.stopped:  # otherwise the teardown failed part-way; leave atexit to retry it
             atexit.unregister(server.stop)
     void += server.void
-    return _report(args, server, out, pages, exchanges, warmup, busy, void,
-                   baseline=baseline, guarded=guarded, ready_s=ready_s, started_utc=started_utc)
+    return _report(args, server, out, pages, exchanges, warmup, busy, void, baseline=baseline, guarded=guarded,
+                   ready_s=ready_s, started_utc=started_utc, swap_start=swap_start, swap_start_error=swap_start_error)
+
+
+def _swap_now() -> tuple[int | None, str | None]:
+    """The system's swap in use now, or why it cannot be read."""
+    try:
+        return profile_sampling.swap_used_bytes(), None
+    except Exception as e:
+        return None, str(e) or type(e).__name__
+
+
+def _swap(start: int | None, start_error: str | None, sampler: profile_sampling.Sampler) -> dict[str, Any]:
+    """System swap before the server started and its maximum over the run; ``None`` fields, with
+    the reason, where it cannot be read."""
+    if start is None:
+        return {"start_bytes": None, "max_bytes": None, "growth_bytes": None,
+                "reason": f"system swap cannot be read: {start_error}"}
+    peak = max([start, *(used for _, used in list(sampler.swap))])
+    return {"start_bytes": start, "max_bytes": peak, "growth_bytes": peak - start,
+            "reason": None if sampler.swap_error is None else f"swap sampling stopped: {sampler.swap_error}"}
+
+
+def _scheduler_figures(figures: _Figures, log: str) -> None:
+    """Decode and prefill from the server's scheduler log."""
+    sched = profile_metrics.parse_scheduler_log(log)
+    figures.compute("decode", lambda: profile_metrics.decode_stats(sched["TG"]))
+    figures.compute("prefill", lambda: profile_metrics.prefill_stats(sched["CE"], skip_first=1))
+    # Every CE line, the warmup's included: how the figures published before `profile` existed
+    # were computed, so a new row can be compared with them like for like.
+    figures.compute("prefill_all_ce", lambda: profile_metrics.prefill_stats(sched["CE"], skip_first=0))
+
+
+def _device_figures(figures: _Figures, args: argparse.Namespace, sampler: profile_sampling.Sampler, *,
+                    baseline: dict[str, dict[str, int]], busy: list[tuple[float, float]],
+                    steady_after: float | None, page_windows: list[tuple[float, float]]) -> None:
+    """Device memory and GPU utilisation, counted on the serving GPU(s) only; ``partial`` once
+    device sampling stopped early."""
+    if args.devices == "cpu":  # the server ran on no GPU: whatever a GPU did meanwhile is not its work
+        for name in ("device_memory", "gpu_utilisation"):
+            figures.values[name] = None
+            figures.unavailable[name] = "--devices cpu"
+        return
+    device_process = [(t, v) for t, v in list(sampler.device_process) if v is not None]
+    device_stats = list(sampler.device_stats)
+    no_device = "no per-process device memory sampled on this host" + (
+        f" (device sampling stopped: {sampler.device_error})" if sampler.device_error is not None else ""
+    )
+    # Per process: the server tree's own allocations, which are only on the GPU(s) it serves from.
+    figures.compute("device_memory", lambda: _memory(
+        device_process, busy, steady_after, empty=no_device, figures=figures, name="device_memory"))
+    gpus = _serving_gpus(baseline, device_stats)
+    figures.compute("gpu_utilisation", lambda: _gpu_utilisation(device_stats, page_windows, gpus))
+    for name in ("device_memory", "gpu_utilisation"):
+        figure = figures.values[name]
+        if figure is not None:
+            figure["partial"] = sampler.device_error is not None
+            if sampler.device_error is not None:
+                figure["device_error"] = sampler.device_error
 
 
 def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[str], exchanges: dict[str, Exchange],
             warmup: Exchange | None, busy: list[tuple[float, float]], void: list[str], *,
-            baseline: dict[str, dict[str, int]], guarded: bool, ready_s: float | None, started_utc: str) -> int:
+            baseline: dict[str, dict[str, int]], guarded: bool, ready_s: float | None, started_utc: str,
+            swap_start: int | None, swap_start_error: str | None) -> int:
     sampler = server.sampler
     assert sampler is not None
     rss = list(sampler.rss)
-    device_process = [(t, v) for t, v in list(sampler.device_process) if v is not None]
-    device_stats = list(sampler.device_stats)
     steady_after = warmup.t_end if warmup is not None else None
     page_windows = [(e.t_start, e.t_end) for e in exchanges.values()]
 
@@ -939,25 +1069,21 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     responses = {page: exchange.text for page, exchange in exchanges.items()}
 
     figures = _Figures()
-    sched = profile_metrics.parse_scheduler_log(server.log_path.read_bytes().decode("utf-8", "replace"))
-    figures.compute("decode", lambda: profile_metrics.decode_stats(sched["TG"]))
-    figures.compute("prefill", lambda: profile_metrics.prefill_stats(sched["CE"], skip_first=1))
+    _scheduler_figures(figures, server.log_path.read_bytes().decode("utf-8", "replace"))
     figures.compute("host_memory", lambda: _memory(
         rss, busy, steady_after, empty="no host RSS samples", figures=figures, name="host_memory"))
-    no_device = "no per-process device memory sampled on this host" + (
-        f" (device sampling stopped: {sampler.device_error})" if sampler.device_error else ""
-    )
-    figures.compute("device_memory", lambda: _memory(
-        device_process, busy, steady_after, empty=no_device, figures=figures, name="device_memory"))
-    figures.compute("gpu_utilisation", lambda: _gpu_utilisation(device_stats, page_windows))
+    _device_figures(figures, args, sampler, baseline=baseline, busy=busy, steady_after=steady_after,
+                    page_windows=page_windows)
     for variant, name in (("bf16", "text"), ("int8", "text_vs_int8")):
         if variant in refs:
             figures.compute(name, lambda variant=variant: _text(refs[variant], responses))
     page_rows = _page_rows(pages, exchanges, refs)
+    swap = _swap(swap_start, swap_start_error, sampler)
+    swap_moved = swap["growth_bytes"] is not None and swap["growth_bytes"] > SWAP_MOVED_BYTES
 
     host = _host(baseline)
     hardware = _hardware(host, args.devices)
-    status = f"{'void' if void else 'profiled'}, {len(exchanges)} pages"
+    status = f"{'void' if void else 'profiled'}, {len(exchanges)} pages" + (", swap moved" if swap_moved else "")
     table_row = row(hardware, args.weights, status, figures.values)
     profile_path = out / "profile.json"
     document = {
@@ -977,9 +1103,10 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         "figures": figures.values,
         "unavailable": figures.unavailable,
         "sampling": {
-            "interval_s": sampler.interval_s, "host_samples": len(rss), "device_samples": len(device_stats),
-            "device_error": sampler.device_error,
+            "interval_s": sampler.interval_s, "host_samples": len(rss), "device_samples": len(sampler.device_stats),
+            "device_error": sampler.device_error, "swap_samples": len(sampler.swap),
         },
+        "swap": swap,
         "warmup": warmup.summary() if warmup is not None else None,
         "pages": page_rows,
         "void": void,
@@ -989,13 +1116,17 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     profile_path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print(table_row)
-    device_memory = figures.values.get("device_memory")
-    if device_memory is not None:
+    if figures.values.get("device_memory") is not None:  # the row's memory cell is the device's
         utilisation = figures.values.get("gpu_utilisation")
-        print(f"device memory peak / steady {_memory_cell(device_memory)}, median GPU utilisation "
-              + (f"{utilisation['median_percent']:.0f} %" if utilisation else "—"))
+        device_line = (f"host RSS peak / steady {_memory_cell(figures.values.get('host_memory'))}, "
+                       "median GPU utilisation " + (f"{utilisation['median_percent']:.0f} %" if utilisation else "—"))
+        if sampler.device_error is not None:
+            device_line += f" (partial: device sampling stopped: {sampler.device_error})"
+        print(device_line)
     if "int8" in refs:
         print(f"vs pinned int8: {_text_cell(figures.values.get('text_vs_int8'))}")
+    if swap_moved:
+        print(f"note: timings are unreliable: system swap grew {swap['growth_bytes'] / _GIB:.2f} GiB during the run")
     for reason in void:
         print(f"void: {reason}")
     print(f"profile.json: {profile_path}", flush=True)
