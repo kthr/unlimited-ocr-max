@@ -1427,7 +1427,11 @@ def test_each_teardown_check_reads_one_ps_snapshot(
     leader_check: str,
 ) -> None:
     """Tree membership is walked in the same ``ps`` snapshot the alive/pgid checks read. ``detach``
-    runs every check: the group kill, then the straggler pass for the child that left the group."""
+    runs every check: the group kill, then the straggler pass for the child that left the group.
+
+    A pin test: it patches ``_Server``'s private check methods by name to count ``ps`` snapshots,
+    so renaming one of them fails this test by design -- update the patched names alongside the
+    rename, not the invariant it pins (one ``ps`` snapshot per teardown check)."""
     monkeypatch.setenv("PROFILE_STUB_MODE", "detach")
     snapshots: list[int] = []
     real_table = profile._ps_table
