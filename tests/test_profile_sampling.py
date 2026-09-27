@@ -297,8 +297,9 @@ def test_private_max_profiler_gpu_process_api_pin() -> None:
     depends on directly. If this test fails after a MAX version bump, that
     API moved or disappeared upstream and ``profile_sampling.py`` needs a
     matching update -- not a silently-empty result. Needs no GPU: it is an
-    import plus a ``hasattr`` check.
+    import plus a ``hasattr`` check. Skipped only where MAX is not installed.
     """
+    pytest.importorskip("max.profiler.gpu")
     from max.profiler.gpu._nvml import NVMLContext
     from max.profiler.gpu._rsmi import RSMIContext
 
@@ -350,10 +351,31 @@ def test_foreign_gpu_processes_parses_nvidia_csv_fixture(monkeypatch: pytest.Mon
     assert na_entry["used_bytes"] is None
 
 
+def test_foreign_gpu_processes_takes_a_comma_in_the_nvidia_process_name_as_part_of_the_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """nvidia-smi does not quote the name: the pid is the first field, used_memory the last."""
+    csv_out = "1234, /opt/a,b/python, 512\n1235, a, b, c, [N/A]\n"
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
+    monkeypatch.setattr(
+        profile_sampling.shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout=csv_out, stderr=""),
+    )
+    assert foreign_gpu_processes(set()) == [
+        {"pid": 1234, "name": "/opt/a,b/python", "used_bytes": 512 * 2**20},
+        {"pid": 1235, "name": "a, b, c", "used_bytes": None},
+    ]
+
+
 @pytest.mark.parametrize("bad_line", [
     "444, python3",                 # a field missing
-    "445, /opt/my,app/bin/x, 100",  # a comma in the name: four fields
+    "445",                          # only a pid
     "[N/A], python3, 100",          # no pid
+    "/opt/a,b/python, 446, 100",    # no pid first
 ])
 def test_foreign_gpu_processes_refuses_a_malformed_nvidia_csv_line(
     monkeypatch: pytest.MonkeyPatch, bad_line: str
@@ -423,7 +445,7 @@ def test_reported_gpu_vendors_get_stats_failure_after_successful_enter_is_unknow
     make ``_reported_gpu_vendors`` return ``None`` -- and ``foreign_gpu_processes``
     must then raise, whether or not a vendor tool happens to be on ``PATH``.
     """
-    import max.profiler.gpu as gpu_module
+    gpu_module = pytest.importorskip("max.profiler.gpu")
 
     class _FakeGPUDiagContext:
         def __enter__(self) -> "_FakeGPUDiagContext":
@@ -762,10 +784,40 @@ def test_sampler_stop_is_bounded_and_flags_timeout_when_a_tick_blocks() -> None:
 def test_swap_used_from_macos_swapusage() -> None:
     parse = profile_sampling._swap_used_from_swapusage
     assert parse("total = 3072.00M  used = 1776.31M  free = 1295.69M  (encrypted)") == round(1776.31 * 2**20)
+    # sysctl follows the locale's decimal separator (de_DE, fr_FR, ...) unless LC_ALL=C.
+    assert parse("total = 3072,00M  used = 1776,31M  free = 1295,69M  (encrypted)") == round(1776.31 * 2**20)
     assert parse("total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)\n") == 0
     assert parse("total = 4.00G  used = 1.50G  free = 2.50G") == 3 * 2**29
+    assert parse("total = 4,00G  used = 1,50G  free = 2,50G") == 3 * 2**29
     with pytest.raises(ValueError, match="unrecognised vm.swapusage"):
         parse("vm.swapusage: unknown oid")
+
+
+def test_swap_used_bytes_asks_sysctl_in_the_c_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append({"argv": argv, **kwargs})
+        stdout = "total = 3072,00M  used = 1776,31M  free = 1295,69M  (encrypted)"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    monkeypatch.setattr(profile_sampling.sys, "platform", "darwin")
+    monkeypatch.setattr(profile_sampling.subprocess, "run", run)
+    assert profile_sampling.swap_used_bytes() == round(1776.31 * 2**20)
+    (call,) = calls
+    assert call["argv"] == ["sysctl", "-n", "vm.swapusage"]
+    assert call["env"]["LC_ALL"] == "C"
+    assert {k: v for k, v in call["env"].items() if k != "LC_ALL"} == {
+        k: v for k, v in os.environ.items() if k != "LC_ALL"
+    }
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sysctl")
+def test_swap_used_bytes_reads_this_mac_under_a_comma_locale(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    used = profile_sampling.swap_used_bytes()
+    assert isinstance(used, int) and used >= 0
 
 
 def test_swap_used_from_linux_meminfo() -> None:

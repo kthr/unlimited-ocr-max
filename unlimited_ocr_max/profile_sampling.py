@@ -31,6 +31,7 @@ and monkeypatching rather than real hardware.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -307,12 +308,14 @@ def _nvidia_foreign_processes(own_pids: set[int]) -> list[dict[str, Any]]:
             continue
         # A line in any other shape is refused, never skipped: a skipped line could be a
         # foreign process, and the guard must not under-report (the AMD parsers refuse too).
-        fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 3:
+        # nvidia-smi does not quote the name, which may itself hold commas: the pid is the
+        # first field, used_memory the last, and the name everything in between.
+        fields = line.split(",")
+        if len(fields) < 3:
             raise GpuProcessListUnavailable(
                 f"unrecognised nvidia-smi line (expected pid, process_name, used_memory): {line!r}"
             )
-        pid_field, name, mem_field = fields
+        pid_field, name, mem_field = fields[0].strip(), ",".join(fields[1:-1]).strip(), fields[-1].strip()
         try:
             pid = int(pid_field)
         except ValueError:
@@ -470,17 +473,18 @@ def foreign_gpu_processes(own_pids: set[int]) -> list[dict[str, Any]]:
     return processes
 
 
-_SWAPUSAGE_USED = re.compile(r"\bused = ([0-9]+(?:\.[0-9]+)?)([KMGT])\b")
+_SWAPUSAGE_USED = re.compile(r"\bused = ([0-9]+(?:[.,][0-9]+)?)([KMGT])\b")
 _SWAPUSAGE_UNIT = {"K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
 
 
 def _swap_used_from_swapusage(text: str) -> int:
     """Bytes of swap in use from macOS ``sysctl -n vm.swapusage``:
-    ``total = 3072.00M  used = 1776.31M  free = 1295.69M  (encrypted)``."""
+    ``total = 3072.00M  used = 1776.31M  free = 1295.69M  (encrypted)``. The decimal separator
+    follows the locale (``1776,31M`` under ``de_DE``), so either is accepted."""
     match = _SWAPUSAGE_USED.search(text)
     if match is None:
         raise ValueError(f"unrecognised vm.swapusage: {text.strip()!r}")
-    return round(float(match.group(1)) * _SWAPUSAGE_UNIT[match.group(2)])
+    return round(float(match.group(1).replace(",", ".")) * _SWAPUSAGE_UNIT[match.group(2)])
 
 
 def _swap_used_from_meminfo(text: str) -> int:
@@ -499,7 +503,8 @@ def swap_used_bytes() -> int:
     """System-wide swap in use, in bytes (macOS and Linux). Raises when it cannot be read."""
     if sys.platform == "darwin":
         result = subprocess.run(
-            ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, check=True, timeout=10
+            ["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True, check=True, timeout=10,
+            env={**os.environ, "LC_ALL": "C"},  # its numbers follow the locale otherwise
         )
         return _swap_used_from_swapusage(result.stdout)
     if sys.platform.startswith("linux"):

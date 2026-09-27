@@ -19,7 +19,8 @@ Three rules shape this module:
   held until it has finished.
 * **It never signals a pid it cannot prove is the server's.** The server process is reaped only
   at the very end of the teardown -- its exit is seen with ``waitid(..., WNOWAIT)``, which leaves
-  it a zombie -- so until then its pid, which is also its process group id, cannot be reused,
+  it a zombie, or, where Python has no ``os.waitid`` (macOS before 3.13), as a zombie in ``ps``
+  -- so until then its pid, which is also its process group id, cannot be reused,
   and ``pgid == server pid`` proves membership. A process outside the group is signalled only
   while it is a descendant of the server, or while it has the pid *and* start time it had when
   it verifiably belonged to the server. Each such check reads one ``ps`` snapshot.
@@ -77,6 +78,9 @@ STEADY_DWELL_S = 5.0
 LOG_TAIL_LINES = 40
 #: System swap growth over the run above which the timings are flagged (never voided).
 SWAP_MOVED_BYTES = 0.05 * 2**30
+#: Device memory rise over its baseline that makes a GPU a serving one: above the ~0.3-0.5 GiB
+#: context a server may open on a neighbour GPU, far below the model's weights.
+SERVING_GPU_RISE_BYTES = 2**30
 
 EXIT_OK = 0
 EXIT_PORT_IN_USE = 2
@@ -273,14 +277,25 @@ class _Server:
 
     def leader_exited(self) -> bool:
         """Whether the server process has exited -- without reaping it (see the module docstring):
-        ``WNOWAIT`` leaves it a zombie, so its pid and process group id stay pinned. ``False``
-        while that cannot be determined."""
+        ``waitid(WNOWAIT)`` leaves it a zombie, so its pid and process group id stay pinned. Where
+        Python has no ``os.waitid`` (macOS before 3.13) a zombie -- or no process at all -- in
+        ``ps`` counts as exited instead, which does not reap either. ``False`` while it cannot be
+        determined."""
         assert self.proc is not None
         if self.proc.returncode is not None:
             return True
+        if not hasattr(os, "waitid"):
+            try:
+                row = _ps_table().get(self.proc.pid)
+            except (OSError, subprocess.SubprocessError):
+                return False
+            return row is None or not row.alive
         try:
             info = os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        except ChildProcessError:  # no longer our child to wait for: it exited and was reaped
+        except ChildProcessError:
+            # Reaped behind Popen's back, so no longer pinned: poll() records that (it maps ECHILD
+            # to returncode 0), and the teardown then treats it as unpinned.
+            self.proc.poll()
             return True
         except OSError:
             return False
@@ -312,13 +327,15 @@ class _Server:
                 self.void.append("the sampler thread did not stop within its bound; its samples may be incomplete")
             seen = _snapshot(self.sampler.pids_seen)
         # Unreaped, the server's pid is still its process group id and cannot belong to anyone else.
+        self.leader_exited()  # records a leader already reaped behind Popen's back: not pinned
         pinned = proc.returncode is None
         self._record_identities(seen, pinned)
         if pinned:
             self._killpg(signal.SIGTERM)
             _wait_until(self.leader_exited, STOP_GRACE_S)
-            self._killpg(signal.SIGKILL)
-            _wait_until(lambda: not self._group_alive(), STRAGGLER_GRACE_S)  # SIGKILL is not instantaneous
+            if proc.returncode is None:  # still pinned
+                self._killpg(signal.SIGKILL)
+                _wait_until(lambda: not self._group_alive(), STRAGGLER_GRACE_S)  # SIGKILL is not instantaneous
         self._stop_stragglers()
         try:
             proc.wait(timeout=STOP_GRACE_S)
@@ -744,17 +761,24 @@ def _memory(samples: list[tuple[float, int]], busy: list[tuple[float, float]], s
 
 def _serving_gpus(baseline: dict[str, dict[str, int]],
                   device_stats: list[tuple[float, dict[str, dict[str, int]]]]) -> list[str]:
-    """The GPUs the server ran on: every id whose ``used_bytes`` rose above its pre-start baseline
-    in some sample; if none rose, the first id. An idle GPU next to it must not dilute its figures."""
+    """The GPUs the server ran on: every id whose ``used_bytes`` rose by at least
+    :data:`SERVING_GPU_RISE_BYTES` over its pre-start baseline in some sample; if none did, the
+    single largest riser; if none rose at all, the first id. An idle GPU next to it -- or one
+    holding only a small context the server opened on it -- must not dilute its figures."""
     ids = list(dict.fromkeys([*baseline, *(gpu_id for _, per_gpu in device_stats for gpu_id in per_gpu)]))
-    rose = [
-        gpu_id for gpu_id in ids
-        if gpu_id in baseline and any(
-            gpu_id in per_gpu and per_gpu[gpu_id]["used_bytes"] > baseline[gpu_id]["used_bytes"]
-            for _, per_gpu in device_stats
-        )
-    ]
-    return rose or ids[:1]
+    rise: dict[str, int] = {}
+    for gpu_id in ids:
+        if gpu_id not in baseline:
+            continue
+        peak = max((per_gpu[gpu_id]["used_bytes"] for _, per_gpu in device_stats if gpu_id in per_gpu), default=None)
+        if peak is not None and peak > baseline[gpu_id]["used_bytes"]:
+            rise[gpu_id] = peak - baseline[gpu_id]["used_bytes"]
+    serving = [gpu_id for gpu_id, grew in rise.items() if grew >= SERVING_GPU_RISE_BYTES]
+    if serving:
+        return serving
+    if rise:
+        return [max(rise, key=rise.__getitem__)]
+    return ids[:1]
 
 
 def _gpu_utilisation(device_stats: list[tuple[float, dict[str, dict[str, int]]]],
@@ -811,15 +835,20 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
     ``| hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |``.
 
     The memory cell is the server's device memory where it was measured (a discrete GPU), else
-    its host RSS (Metal, where device memory is host memory, and CPU)."""
+    its host RSS (Metal, where device memory is host memory, and CPU); device memory from a
+    device sampler that stopped mid-run is marked ``(partial)``."""
     decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
+    if device_memory:
+        memory = f"device {_memory_cell(device_memory)}" + (" (partial)" if device_memory.get("partial") else "")
+    else:
+        memory = _memory_cell(figures.get("host_memory"))
     cells = [
         hardware,
         weights,
         status,
         f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})" if decode else "—",
         f"{prefill['median_s']:.2f} s" if prefill else "—",
-        f"device {_memory_cell(device_memory)}" if device_memory else _memory_cell(figures.get("host_memory")),
+        memory,
         _text_cell(figures.get("text")),
     ]
     return "| " + " | ".join(cells) + " |"
@@ -1010,9 +1039,13 @@ def _swap(start: int | None, start_error: str | None, sampler: profile_sampling.
     if start is None:
         return {"start_bytes": None, "max_bytes": None, "growth_bytes": None,
                 "reason": f"system swap cannot be read: {start_error}"}
-    peak = max([start, *(used for _, used in list(sampler.swap))])
-    return {"start_bytes": start, "max_bytes": peak, "growth_bytes": peak - start,
-            "reason": None if sampler.swap_error is None else f"swap sampling stopped: {sampler.swap_error}"}
+    samples = [used for _, used in list(sampler.swap)]
+    stopped = None if sampler.swap_error is None else f"swap sampling stopped: {sampler.swap_error}"
+    if not samples:  # the start reading alone says nothing about the run
+        return {"start_bytes": start, "max_bytes": None, "growth_bytes": None,
+                "reason": "no swap sample was taken during the run" + (f" ({stopped})" if stopped else "")}
+    peak = max([start, *samples])
+    return {"start_bytes": start, "max_bytes": peak, "growth_bytes": peak - start, "reason": stopped}
 
 
 def _scheduler_figures(figures: _Figures, log: str) -> None:
@@ -1116,10 +1149,11 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     profile_path.write_text(json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print(table_row)
-    if figures.values.get("device_memory") is not None:  # the row's memory cell is the device's
-        utilisation = figures.values.get("gpu_utilisation")
-        device_line = (f"host RSS peak / steady {_memory_cell(figures.values.get('host_memory'))}, "
-                       "median GPU utilisation " + (f"{utilisation['median_percent']:.0f} %" if utilisation else "—"))
+    device_memory, utilisation = figures.values.get("device_memory"), figures.values.get("gpu_utilisation")
+    if device_memory is not None or utilisation is not None:
+        device_line = "median GPU utilisation " + (f"{utilisation['median_percent']:.0f} %" if utilisation else "—")
+        if device_memory is not None:  # the row's memory cell is the device's: host RSS goes here
+            device_line = f"host RSS peak / steady {_memory_cell(figures.values.get('host_memory'))}, {device_line}"
         if sampler.device_error is not None:
             device_line += f" (partial: device sampling stopped: {sampler.device_error})"
         print(device_line)
@@ -1127,6 +1161,9 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         print(f"vs pinned int8: {_text_cell(figures.values.get('text_vs_int8'))}")
     if swap_moved:
         print(f"note: timings are unreliable: system swap grew {swap['growth_bytes'] / _GIB:.2f} GiB during the run")
+    if swap["reason"] is not None:
+        in_full = " in full" if swap["growth_bytes"] is not None else ""
+        print(f"note: swap not measured{in_full}: {swap['reason']}")
     for reason in void:
         print(f"void: {reason}")
     print(f"profile.json: {profile_path}", flush=True)
