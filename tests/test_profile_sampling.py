@@ -18,8 +18,10 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -34,6 +36,26 @@ from unlimited_ocr_max.profile_sampling import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
+
+_POLL_TIMEOUT_S = 10.0
+
+
+def _poll_until(condition, timeout: float = _POLL_TIMEOUT_S) -> bool:
+    """Poll ``condition`` (a zero-arg callable) every 10ms until true or ``timeout`` elapses.
+
+    Returns whatever the last call to ``condition`` returned (truthy on
+    success, falsy on timeout) so callers can ``assert _poll_until(...)`` with
+    a useful failure. Used in place of a fixed ``time.sleep`` window
+    everywhere a test waits on the Sampler background thread to have taken a
+    certain number of ticks -- a fixed sleep is either flaky under load (too
+    short) or slow (padded long), where polling is both robust and fast.
+    """
+    deadline = time.monotonic() + timeout
+    result = condition()
+    while not result and time.monotonic() < deadline:
+        time.sleep(0.01)
+        result = condition()
+    return result
 
 
 class _FakeProbe:
@@ -85,8 +107,13 @@ def test_process_tree_sees_a_real_grandchild_and_root_gone_is_empty() -> None:
     The grandchild backgrounds itself into a fresh process group
     (``os.setpgid(0, 0)``) to reproduce the exact shape that broke a
     process-group-based walk (a ``uv run`` child does the same). It then
-    allocates and touches ~200 MB after a short delay, so a sample taken
-    before that delay and one taken after it bracket the rise.
+    allocates and touches ~200 MB after a short delay, so a ``before``
+    snapshot and a later ``after`` snapshot bracket the rise.
+
+    Both snapshots are polled for, not waited-for on a fixed clock: a fixed
+    2.2s window was measured to catch the allocation only ~45 MiB into its
+    200 MiB (reproduced on a back-to-back full-suite run under load) --
+    exactly the kind of flakiness a tick-count/condition poll avoids.
     """
     child_code = textwrap.dedent(
         """
@@ -102,12 +129,23 @@ def test_process_tree_sees_a_real_grandchild_and_root_gone_is_empty() -> None:
     shell_cmd = f"{shlex.quote(sys.executable)} -c {shlex.quote(child_code)} & wait"
     proc = subprocess.Popen(["/bin/sh", "-c", shell_cmd])
     try:
-        time.sleep(0.2)
+        assert _poll_until(lambda: proc.pid in process_tree(proc.pid)), "root pid never appeared in ps"
         before = process_tree(proc.pid)
         assert proc.pid in before
 
-        time.sleep(2.0)
-        after = process_tree(proc.pid)
+        snapshots: dict[str, dict[int, int]] = {}
+
+        def risen_enough() -> bool:
+            after = process_tree(proc.pid)
+            snapshots["after"] = after
+            grandchild_pids = set(after) - {proc.pid}
+            risen = sum(after.values()) - sum(before.values())
+            return bool(grandchild_pids) and risen >= 150 * 2**20
+
+        assert _poll_until(risen_enough, timeout=20.0), (
+            f"tree RSS never rose by 150 MiB; last snapshot: {snapshots.get('after')}"
+        )
+        after = snapshots["after"]
 
         assert len(after) >= 2, "expected the shell plus its python grandchild"
         grandchild_pids = set(after) - {proc.pid}
@@ -153,12 +191,13 @@ def test_sampler_on_a_real_child_records_rss_with_no_device_available() -> None:
         probe = open_device_probe()
         assert probe.device_available is False
         with Sampler(child.pid, probe, interval_s=0.1) as sampler:
-            time.sleep(0.5)
+            assert _poll_until(lambda: len(sampler.rss) >= 2)
         assert len(sampler.rss) >= 2
         assert child.pid in sampler.pids_seen
         assert sampler.device_process == []
         assert sampler.device_stats == []
         assert sampler.device_error is None
+        assert sampler.stop_timed_out is False
     finally:
         child.kill()
         child.wait(timeout=5)
@@ -172,7 +211,7 @@ def test_sampler_device_process_is_the_sum_over_tree_pids() -> None:
     try:
         probe = _FakeProbe(per_pid={child.pid: 999_999})
         with Sampler(child.pid, probe, interval_s=0.05) as sampler:
-            time.sleep(0.3)
+            assert _poll_until(lambda: len(sampler.device_process) >= 2)
         assert len(sampler.device_process) >= 2
         assert all(value == 999_999 for _, value in sampler.device_process)
         assert len(sampler.device_stats) == len(sampler.device_process)
@@ -188,9 +227,12 @@ def test_sampler_probe_failure_mid_run_sets_device_error_once_and_rss_continues(
     try:
         probe = _FakeProbe(per_pid={child.pid: 42}, fail_after=2)
         with Sampler(child.pid, probe, interval_s=0.05) as sampler:
-            time.sleep(0.6)
+            assert _poll_until(lambda: sampler.device_error is not None)
+            device_samples_at_failure = len(sampler.device_process)
+            # Let RSS sampling take a few more ticks past where device sampling stopped.
+            target_rss_samples = device_samples_at_failure + 3
+            assert _poll_until(lambda: len(sampler.rss) >= target_rss_samples)
         assert sampler.device_error == "device probe went away mid-run"
-        device_samples_at_failure = len(sampler.device_process)
         assert device_samples_at_failure > 0
         # RSS kept accumulating well past where device sampling stopped.
         assert len(sampler.rss) > device_samples_at_failure
@@ -209,7 +251,7 @@ def test_sampler_stats_failure_after_process_bytes_keeps_lists_equal_length() ->
     try:
         probe = _FakeProbeStatsFails(fail_after=2)
         with Sampler(child.pid, probe, interval_s=0.05) as sampler:
-            time.sleep(0.4)
+            assert _poll_until(lambda: sampler.device_error is not None)
         assert sampler.device_error == "stats went away mid-run"
         assert len(sampler.device_process) == len(sampler.device_stats) == 2
     finally:
@@ -235,7 +277,7 @@ def test_sampler_ps_failure_on_one_tick_is_skipped_and_rss_continues(
     probe = open_device_probe()
     try:
         with Sampler(child.pid, probe, interval_s=0.05) as sampler:
-            time.sleep(0.5)
+            assert _poll_until(lambda: calls["n"] >= 3 and len(sampler.rss) >= 2)
         assert calls["n"] >= 3, "expected the flaky process_tree to be called past its one failure"
         # The failed tick (call #2) contributed no RSS sample, but ticks before and after it did.
         assert len(sampler.rss) >= 2
@@ -318,6 +360,95 @@ def test_foreign_gpu_processes_raises_when_gpu_present_but_no_tool(monkeypatch: 
     monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: {"nv"})
     with pytest.raises(GpuProcessListUnavailable):
         foreign_gpu_processes(set())
+
+
+def test_foreign_gpu_processes_raises_when_vendors_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_reported_gpu_vendors`` returning ``None`` (vendor presence unknown) must raise immediately.
+
+    Unknown presence is never satisfied by whatever tool happens to be on
+    ``PATH`` -- not even one that runs cleanly and returns no processes -- so
+    this must raise both with no tools present at all, and with
+    ``nvidia-smi`` present and returning a clean empty list.
+    """
+    monkeypatch.setattr(profile_sampling, "_reported_gpu_vendors", lambda: None)
+
+    monkeypatch.setattr(profile_sampling.shutil, "which", lambda name: None)
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes(set())
+
+    monkeypatch.setattr(
+        profile_sampling.shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes(set())
+
+
+def test_reported_gpu_vendors_get_stats_failure_after_successful_enter_is_unknown_not_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(round-2 reproducer) ``GPUDiagContext`` constructs/enters fine but ``get_stats()`` raises.
+
+    Exercises the REAL ``_reported_gpu_vendors`` body (not a monkeypatch of
+    the function itself): a fake ``GPUDiagContext`` is installed at the
+    import site the function actually uses, so ``get_stats()`` raising must
+    make ``_reported_gpu_vendors`` return ``None`` -- and ``foreign_gpu_processes``
+    must then raise, whether or not a vendor tool happens to be on ``PATH``.
+    """
+    import max.profiler.gpu as gpu_module
+
+    class _FakeGPUDiagContext:
+        def __enter__(self) -> "_FakeGPUDiagContext":
+            return self
+
+        def __exit__(self, *exc_info: object) -> bool:
+            return False
+
+        def get_stats(self) -> dict[str, Any]:
+            raise RuntimeError("nvml went away")
+
+    monkeypatch.setattr(gpu_module, "GPUDiagContext", _FakeGPUDiagContext)
+
+    assert profile_sampling._reported_gpu_vendors() is None
+
+    # No tools on PATH at all.
+    monkeypatch.setattr(profile_sampling.shutil, "which", lambda name: None)
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes(set())
+
+    # nvidia-smi present and returns a clean empty list -- still must raise:
+    # unknown vendor presence is never satisfied by a tool being on PATH.
+    monkeypatch.setattr(
+        profile_sampling.shutil, "which", lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None
+    )
+    monkeypatch.setattr(
+        profile_sampling.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+    )
+    with pytest.raises(GpuProcessListUnavailable):
+        foreign_gpu_processes(set())
+
+
+def test_reported_gpu_vendors_import_failure_is_empty_not_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``max.profiler.gpu`` genuinely failing to import means "none", not "unknown" -- ``set()``, not ``None``.
+
+    Setting a module to ``None`` in ``sys.modules`` is what makes Python's
+    import system raise ``ImportError`` (a ``ModuleNotFoundError``, its
+    subclass) for it, without needing to uninstall anything real.
+    """
+    monkeypatch.setitem(sys.modules, "max.profiler.gpu", None)
+
+    assert profile_sampling._reported_gpu_vendors() == set()
+
+    monkeypatch.setattr(profile_sampling.shutil, "which", lambda name: None)
+    assert foreign_gpu_processes(set()) == []
 
 
 def test_foreign_gpu_processes_raises_nvidia_reported_only_rocm_smi_present(
@@ -528,3 +659,73 @@ def test_device_probe_process_bytes_sums_across_both_vendor_contexts() -> None:
 
     probe_no_context = DeviceProbe(diag=None, nvml=None, rsmi=None)
     assert probe_no_context.process_bytes([1]) is None
+
+
+# --- _try_open --------------------------------------------------------------
+
+
+def test_try_open_enter_failure_is_cleaned_up_and_returns_none() -> None:
+    """Construct succeeds but ``__enter__`` raises: ``_try_open`` returns ``None`` and still calls ``__exit__``.
+
+    Without the cleanup call, a context that acquired a resource in
+    ``__init__`` (or partially, before ``__enter__`` blew up) would leak it --
+    ``_try_open`` must not let a failed ``__enter__`` skip ``__exit__``.
+    """
+    exit_calls: list[tuple[object, object, object]] = []
+
+    class _EntersBadly:
+        def __enter__(self) -> "_EntersBadly":
+            raise RuntimeError("enter blew up")
+
+        def __exit__(self, *exc_info: object) -> None:
+            exit_calls.append(exc_info)
+
+    result = profile_sampling._try_open(_EntersBadly)
+
+    assert result is None
+    assert len(exit_calls) == 1
+
+
+# --- Sampler.stop() bound ----------------------------------------------------
+
+
+def test_sampler_stop_is_bounded_and_flags_timeout_when_a_tick_blocks() -> None:
+    """A probe whose ``stats()`` blocks forever: ``stop()`` still returns within its bound.
+
+    ``entered`` (not a fixed sleep) is the synchronization: the test waits
+    for confirmation that the sampler thread is actually stuck inside
+    ``stats()`` before timing ``stop()``, so the test cannot be flaky about
+    whether the block was reached in time.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingProbe:
+        device_available = True
+
+        def process_bytes(self, pids: object) -> int:
+            return 0
+
+        def stats(self) -> dict[str, dict[str, int]]:
+            entered.set()
+            release.wait()
+            return {}
+
+    child = subprocess.Popen(["sleep", "5"])
+    sampler = Sampler(child.pid, _BlockingProbe(), interval_s=0.01)
+    try:
+        sampler.__enter__()
+        assert entered.wait(timeout=_POLL_TIMEOUT_S), "tick never reached the blocking stats() call"
+
+        bound = max(5.0, 10 * sampler.interval_s)
+        started = time.monotonic()
+        sampler.stop()
+        elapsed = time.monotonic() - started
+
+        assert sampler.stop_timed_out is True
+        assert elapsed < bound + 2.0, f"stop() took {elapsed}s, expected to return near the {bound}s bound"
+    finally:
+        release.set()  # let the blocked (daemon) thread finish so it doesn't linger.
+        sampler._thread.join(timeout=5)
+        child.kill()
+        child.wait(timeout=5)

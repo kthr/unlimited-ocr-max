@@ -231,7 +231,7 @@ class GpuProcessListUnavailable(RuntimeError):
     """
 
 
-def _reported_gpu_vendors() -> set[str]:
+def _reported_gpu_vendors() -> set[str] | None:
     """Which vendors (a subset of ``{"nv", "amd"}``) MAX's own GPU diagnostics report a GPU for.
 
     ``GPUDiagContext().get_stats()`` keys are vendor-prefixed GPU ids
@@ -240,16 +240,30 @@ def _reported_gpu_vendors() -> set[str]:
     vendor, whether that vendor's own tool is *required* to be on ``PATH`` --
     a single combined bool would let one vendor's present-but-unrelated tool
     (or its own GPU-less ``[]``) mask the other vendor's missing tool.
+
+    Three distinct outcomes, not two -- "no GPU diagnostics installed" and
+    "installed but broken" must not collapse into the same answer, because
+    the caller (:func:`foreign_gpu_processes`) treats them differently:
+
+    * ``max.profiler.gpu`` cannot be **imported** at all (``ImportError``) --
+      no MAX GPU diagnostics on this host -- returns ``set()``: vendor
+      presence is legitimately "none".
+    * ``GPUDiagContext`` imports fine but constructing it, entering it, or
+      calling ``get_stats()`` raises **anything** -- returns ``None``:
+      vendor presence is *unknown*, not "none". The caller must never treat
+      this the same as a genuinely GPU-less host.
+    * Otherwise, the vendor-prefix set of whatever ``get_stats()`` returned
+      (``{}`` -> ``set()``).
     """
     try:
         from max.profiler.gpu import GPUDiagContext
-    except Exception:
+    except ImportError:
         return set()
     try:
         with GPUDiagContext() as ctx:
             gpu_ids = list(ctx.get_stats())
     except Exception:
-        return set()
+        return None
     return {gpu_id.rstrip("0123456789") for gpu_id in gpu_ids}
 
 
@@ -408,11 +422,22 @@ def foreign_gpu_processes(own_pids: set[int]) -> list[dict[str, Any]]:
     reported is still consulted (its results are concatenated in), but its
     ``[]`` never satisfies the other vendor's requirement.
 
+    If :func:`_reported_gpu_vendors` cannot even determine which vendors are
+    present (``None`` -- MAX's own GPU diagnostics are installed but raised),
+    this raises immediately, before looking at ``PATH`` at all: an unknown
+    vendor set must never be satisfied by whatever tool happens to be lying
+    around, however cleanly that tool runs.
+
     Returns ``[]`` only when no vendor tool is on ``PATH`` *and* no vendor is
     reported at all (a Metal or CPU-only host). A present tool that exits
     non-zero, or returns output in an unrecognised shape, also raises.
     """
     reported_vendors = _reported_gpu_vendors()
+    if reported_vendors is None:
+        raise GpuProcessListUnavailable(
+            "cannot determine which GPUs are present: "
+            "max.profiler.gpu's GPUDiagContext failed to report device stats"
+        )
     processes: list[dict[str, Any]] = []
 
     if shutil.which("nvidia-smi"):
@@ -451,6 +476,13 @@ class Sampler:
     in :attr:`device_error`, and device sampling stops for the rest of the run
     -- RSS sampling is unaffected. The background thread never raises into the
     caller.
+
+    :meth:`stop` is bounded: it never waits longer than
+    ``max(5.0, 10 * interval_s)`` for the thread to finish, even if a tick is
+    stuck inside a blocking probe call. If the thread is still alive once
+    that bound elapses, :attr:`stop_timed_out` is set to ``True`` and
+    :meth:`stop` returns anyway -- a slow or hung probe must not hang whatever
+    called ``stop()`` (or exited the ``with`` block).
     """
 
     def __init__(self, root_pid: int, probe: DeviceProbe, interval_s: float = 0.5) -> None:
@@ -463,6 +495,7 @@ class Sampler:
         self.device_process: list[tuple[float, int | None]] = []
         self.device_stats: list[tuple[float, dict[str, dict[str, int]]]] = []
         self.device_error: str | None = None
+        self.stop_timed_out = False
 
         self._device_ok = True
         self._stop_event = threading.Event()
@@ -476,10 +509,20 @@ class Sampler:
         self.stop()
 
     def stop(self) -> None:
-        """Stop and join the sampling thread. Safe to call more than once."""
+        """Stop and join the sampling thread, bounded. Safe to call more than once.
+
+        Signals the stop event, then joins with a timeout of
+        ``max(5.0, 10 * interval_s)`` so a tick stuck inside a blocking probe
+        call cannot hang the caller forever. If the thread is still alive
+        once that bound elapses, sets :attr:`stop_timed_out` and returns --
+        the (daemon) thread is left to finish on its own whenever the probe
+        call it is stuck in eventually returns.
+        """
         self._stop_event.set()
         if self._thread.is_alive():
-            self._thread.join()
+            self._thread.join(timeout=max(5.0, 10 * self.interval_s))
+            if self._thread.is_alive():
+                self.stop_timed_out = True
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
