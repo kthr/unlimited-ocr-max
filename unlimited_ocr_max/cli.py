@@ -1,4 +1,5 @@
 """``unlimited-ocr-max serve``: build the ``max serve`` command for this port and hand off to it.
+``unlimited-ocr-max profile``: the same server, started and measured by :mod:`.profile`.
 
 Imports only the standard library, so ``--help`` never loads MAX.
 """
@@ -82,17 +83,45 @@ def check_devices_support_variant(weights: str, devices: str) -> None:
         raise SystemExit("--weights int8 is GPU-only; serve on cpu with --weights bf16")
 
 
+def serve_env(ngram_size: int) -> dict[str, str]:
+    """The environment ``max serve`` runs under: ours, plus the n-gram size for the architecture."""
+    env = dict(os.environ)
+    env[NGRAM_ENV] = str(ngram_size)
+    return env
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     check_devices_support_variant(args.weights, args.devices)
     model, weight_path, revision = resolve_model(args.model, args.weights, args.revision)
     cmd = serve_command(
         max_exe=max_executable(), model=model, weight_path=weight_path, devices=args.devices, port=args.port, revision=revision
     )
-    env = dict(os.environ)
-    env[NGRAM_ENV] = str(args.ngram_size)
+    env = serve_env(args.ngram_size)
     print("[unlimited-ocr-max] " + " ".join(cmd), file=sys.stderr, flush=True)
     os.execvpe(cmd[0], cmd, env)
     return 1  # unreachable: execvpe only returns on failure, which raises
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    from . import profile  # here, not at the top: `profile --help` loads neither it nor, through it, MAX
+
+    return profile.run(args)
+
+
+def add_server_arguments(parser: argparse.ArgumentParser) -> None:
+    """The flags that decide what ``max serve`` runs; shared by ``serve`` and ``profile``."""
+    parser.add_argument("--devices", choices=("cpu", "gpu"), required=True,
+                        help="gpu (Metal, CUDA or ROCm; see the README prerequisites) or cpu (supported, slow)")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="Hub repository or a local directory with its layout (default: %(default)s)")
+    parser.add_argument("--revision", default=DEFAULT_REVISION,
+                        help="Hub revision for config, tokenizer and weights; ignored for a local directory (default: %(default)s)")
+    parser.add_argument("--weights", default="bf16", choices=WEIGHT_VARIANTS,
+                        help="weight variant: bf16 is the unquantised model.safetensors (cpu or gpu), int8 is model-int8.safetensors (gpu only) (default: %(default)s)")
+    parser.add_argument("--port", type=int, default=8010, help="(default: %(default)s)")
+    # 35 is `ngram.DEFAULT_NGRAM_SIZE`, repeated here so this module imports no MAX.
+    parser.add_argument("--ngram-size", type=int, default=35,
+                        help="no-repeat n-gram guard; 0 disables, which reproduces the PyTorch reference (default: %(default)s)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,19 +130,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = ap.add_subparsers(dest="command", required=True)
     srv = sub.add_parser("serve", help="run `max serve` with this port's flags")
-    srv.add_argument("--devices", choices=("cpu", "gpu"), required=True,
-                     help="gpu (Metal, CUDA or ROCm; see the README prerequisites) or cpu (supported, slow)")
-    srv.add_argument("--model", default=DEFAULT_MODEL,
-                     help="Hub repository or a local directory with its layout (default: %(default)s)")
-    srv.add_argument("--revision", default=DEFAULT_REVISION,
-                     help="Hub revision for config, tokenizer and weights; ignored for a local directory (default: %(default)s)")
-    srv.add_argument("--weights", default="bf16", choices=WEIGHT_VARIANTS,
-                     help="weight variant: bf16 is the unquantised model.safetensors (cpu or gpu), int8 is model-int8.safetensors (gpu only) (default: %(default)s)")
-    srv.add_argument("--port", type=int, default=8010, help="(default: %(default)s)")
-    # 35 is `ngram.DEFAULT_NGRAM_SIZE`, repeated here so this module imports no MAX.
-    srv.add_argument("--ngram-size", type=int, default=35,
-                     help="no-repeat n-gram guard; 0 disables, which reproduces the PyTorch reference (default: %(default)s)")
+    add_server_arguments(srv)
     srv.set_defaults(func=cmd_serve)
+    prof = sub.add_parser(
+        "profile",
+        help="start `max serve`, send the bundled 12-page corpus, print a row of the README's 'Where it has run' table",
+    )
+    add_server_arguments(prof)
+    prof.add_argument("--out", type=Path, default=None, metavar="DIR",
+                      help="new or empty directory for profile.json, serve.log and pages/ (default: ./unlimited-ocr-max-profile-<UTC time>)")
+    prof.add_argument("--ready-timeout-s", type=float, default=1800, metavar="SECONDS",
+                      help="how long the server may take to come up; a cold kernel compile takes minutes (default: %(default)s)")
+    prof.set_defaults(func=cmd_profile)
     return ap
 
 
