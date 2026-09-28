@@ -75,17 +75,21 @@ compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, mod
 | `--revision` | tag | `v0.3.3` | the model-repo tag this package version was validated against |
 | `--port` | integer | `8010` | |
 | `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
+| `--max-batch-size` | `1`–`8` | `1` | concurrent requests decoded together each step; bf16 on a GPU only above 1 (int8 and CPU are refused); a lone request runs slower; output is independent of what else is in flight |
 
 ### Measure it on your machine
 
 ```bash
 unlimited-ocr-max profile --devices gpu            # add --weights int8, or --devices cpu
+unlimited-ocr-max profile --devices gpu --max-batch-size 8   # concurrency defaults to 8
 ```
 
 Starts its own server, sends the 12 bundled pages, prints one row of the table
 below and writes `profile.json`. On a GPU it refuses to run unless no other
 process is using the GPU. `--out DIR` sets the output directory (default
-`./unlimited-ocr-max-profile-<UTC time>`).
+`./unlimited-ocr-max-profile-<UTC time>`). `--concurrency N` (profile-only)
+keeps N requests in flight over the corpus instead of one; it defaults to
+`--max-batch-size` and must not exceed it.
 
 One page to Markdown:
 
@@ -113,8 +117,8 @@ characters over all pages.
 
 | hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
 |---|---|---|---|---|---|---|
-| Apple M4 24 GB | bf16 | 12 pages | **21.2 tok/s** | 2.45 s | 15.6 / 11.6–13.6 GiB | **12/12 byte-identical** |
-| Apple M4 24 GB | int8 | 12 pages | **36.4 tok/s** | 6.79 s | 13.5 / 11.1 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| Apple M4 24 GB | bf16 | 12 pages | **21.3 tok/s** | 2.44 s | 17.8 / 10.4–10.5 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages | **35.4 tok/s** | 6.86 s | 13.4 / 11.0–11.1 GiB | 6/12; CER 0.0011, all edits bbox digits |
 | NVIDIA A100 80 GB | bf16 | re-run pending | — | — | — | — |
 | NVIDIA A100 80 GB | int8 | re-run pending | — | — | — | — |
 | NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
@@ -136,9 +140,26 @@ exact. ³ On CUDA two of the twelve pages differ from the fp32 reference. The
 bf16 output is byte-identical to v0.3.1's on the same A100, so this is CUDA's
 arithmetic rather than a change in this release.
 
+### Continuous batching (`--max-batch-size 8`, Apple M4, bf16)
+
+`unlimited-ocr-max profile --devices gpu --max-batch-size 8 --concurrency N`,
+12 pages, one draw each:
+
+| concurrency | aggregate tok/s | per-page latency (median) | decode step (full batch) | text vs reference |
+|---|---|---|---|---|
+| 1 | 14.1 | 35.9 s | 65.8 ms (a lone request, padded to 2 rows) | 12/12 byte-identical |
+| 2 | 22.9 | 41.4 s | 68.9 ms | 12/12 byte-identical |
+| 4 | 29.8 | 60.5 s | 98.2 ms | 12/12 byte-identical |
+| 8 | 34.8 | 89.7 s | 148.1 ms | 12/12 byte-identical |
+
+Concurrency 8 is 1.81× the default server's aggregate over the same corpus
+(19.2 tok/s, 26.2 s per-page latency median).
+
 ## Not supported
 
-`gundam` (tiled) mode; batch size > 1; multi-GPU.
+`gundam` (tiled) mode; batch size > 1 with `--weights int8` or `--devices cpu`;
+multi-GPU. A new request's prefill pauses every running decode -- there is no
+in-flight batching.
 
 ## References
 

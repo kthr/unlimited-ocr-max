@@ -2,6 +2,36 @@
 
 ## [0.3.3] — unreleased
 
+### Added
+- **`--max-batch-size N`** (`serve` and `profile`; default `1`, capped at `8`): with `N > 1`, one
+  decode step serves up to `N` concurrent requests, on bf16 running on an accelerator only --
+  `--weights int8` and `--devices cpu` are refused above `1`. `--max-batch-size 1` runs exactly the
+  previous single-request path.
+- **Load-independent decode.** With `N > 1` every decode step runs a multi-row graph; a lone
+  request is padded to 2 rows, so its output is identical whatever else is in flight. Prefill still
+  runs one request at a time: a new request's prefill pauses the running decodes (no in-flight
+  batching).
+- **Startup now eagerly compiles every batch size.** The multi-row graphs for `B = 2..N` compile at
+  server startup. Apple M4: first boot 142.5 s, with 4 of the 7 graphs compiling cold (a fully cold
+  boot is estimated at 7 × 24–33 s); 24.6–28.5 s once cached, against 14.3–22.4 s at `N = 1`.
+- **`profile --concurrency N`** (profile-only): keeps `N` requests in flight over the 12 bundled
+  pages; defaults to `--max-batch-size` and must not exceed it. With `N > 1` the decode-step cell
+  reports aggregate tok/s and "concurrency N".
+
+  Apple M4, `profile --max-batch-size 8`, 12 pages, bf16:
+
+  | concurrency | aggregate tok/s | per-page latency (median) | decode step (full batch) |
+  |---|---|---|---|
+  | 1 | 14.1 | 35.9 s | 65.8 ms (a lone request, padded to 2 rows) |
+  | 2 | 22.9 | 41.4 s | 68.9 ms |
+  | 4 | 29.8 | 60.5 s | 98.2 ms |
+  | 8 | **34.8** | 89.7 s | 148.1 ms |
+
+  Concurrency 8's aggregate is **1.81×** the default server's over the same corpus (19.2 tok/s).
+  The lone-request decode step is 65.8 ms, against 47.0 ms for the default server's step. Text is
+  byte-identical to concurrency 1 at every row, and 12/12 to the reference throughout; the
+  scheduler reported 0 preemptions; peak/steady footprint at concurrency 8 is 13.9 / 11.4–11.5 GiB.
+
 ### Performance
 - **bf16 on a GPU: both language graphs stay resident.** Since 0.3.2 they hold
   no weights of their own (prefill 0.002 GiB, decode 0.000 GiB beyond the
