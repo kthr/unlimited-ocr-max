@@ -6,12 +6,15 @@ deliberately empty paged cache (1 layer, 1 head, ``head_dim`` 1: 16 KiB at
 ``--max-length 2048``) that nothing reads. The real cache is
 :class:`~unlimited_ocr_max.kv_cache.KvCache`, one per in-flight request, keyed
 by request id. ``base`` mode only; batch size 1 unless ``--max-batch-size`` raises it, bf16 on an
-accelerator only, capped at ``MAX_BATCH_CAP``.
+accelerator only, capped at ``MAX_BATCH_CAP``. A scheduler step is all-prefill or all-decode
+(in-flight batching is off): a prefill batch runs as one batch-1 prefill per request, a decode
+batch as one :meth:`~unlimited_ocr_max.pipeline.UnlimitedOcrPipeline.decode_rows` execute.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -69,8 +72,8 @@ def serve_ngram_size() -> int:
 #: so a direct ``max serve --custom-architectures`` user gets it too.
 MAX_BATCH_SIZE_ENV = "_UNLIMITED_OCR_MAX_MAX_BATCH_SIZE"
 
-#: Above this, ``--max-batch-size`` is refused: batched decoding (a later task, bf16 on an
-#: accelerator only) is unvalidated past it.
+#: Above this, ``--max-batch-size`` is refused: batched decoding (bf16 on an accelerator only) is
+#: unvalidated past it.
 MAX_BATCH_CAP = 8
 
 
@@ -90,8 +93,8 @@ def serve_max_batch_size() -> int:
 def check_max_batch_size(max_batch_size: int, *, device: DeviceRef, int8: bool) -> None:
     """Refuse a ``--max-batch-size`` neither this device nor this checkpoint can serve.
 
-    Batched decoding is a later task, for bf16 on an accelerator only. Called once both facts are
-    known -- cheaply, and before any expensive pipeline construction."""
+    Batched decoding is bf16 on an accelerator only. Called once both facts are known -- cheaply,
+    and before any expensive pipeline construction."""
     if max_batch_size <= 1:
         return
     if device.is_cpu():
@@ -104,8 +107,13 @@ def check_max_batch_size(max_batch_size: int, *, device: DeviceRef, int8: bool) 
 
 @dataclass(kw_only=True)
 class UnlimitedOcrInputs(ModelInputs):
+    #: Every context's active tokens, concatenated in batch order.
     tokens: Buffer
+    #: How many of ``tokens`` each context owns, in batch order.
+    token_counts: tuple[int, ...] = ()
+    #: On a prefill step, one buffer per context, in batch order; ``None`` on a decode step.
     pixel_values: list[Buffer] | None = None
+    #: On a prefill step, each context's own placeholder rows, one buffer per context (or ``None``).
     image_token_indices: list[Buffer] | None = None
     #: One request id per context, in batch order; the KV cache is addressed by it.
     request_ids: tuple[str, ...] = ()
@@ -210,6 +218,18 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         return placeholder_kv_params(cache_dtype, devices)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Refuse what cannot be served, adapt the weights and build the pipeline.
+
+        With ``--max-batch-size N > 1`` (bf16 on an accelerator; everything
+        else was refused by :func:`check_max_batch_size`) every decode step
+        runs a graph of at least two rows -- a lone request is padded to two
+        (``min_decode_rows = 2``) -- so a request's output does not depend on
+        how many others are in flight, and the ``B = 2 .. N`` decode graphs
+        are loaded here, before the first request. Those graphs bind the
+        shared language weight registry, so in this mode its one-time build
+        moves from the first prefill to startup. ``N == 1`` changes nothing:
+        the batch-1 decode graph, compiled lazily, and no padding.
+        """
         super().__init__(*args, **kwargs)
         self._session: InferenceSession = kwargs["session"]
         # `max_seq_len` is the memory plan's resolved length; the graphs must agree with it.
@@ -219,7 +239,8 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
             raise ValueError("UnlimitedOCRModel needs the safetensors weight adapter registered in arch.py")
         weights = dict(self.weights.items())
         is_int8 = self._weights_are_int8(weights)
-        check_max_batch_size(serve_max_batch_size(), device=self.device_refs[0], int8=is_int8)
+        max_batch_size = serve_max_batch_size()
+        check_max_batch_size(max_batch_size, device=self.device_refs[0], int8=is_int8)
         if is_int8:
             # The decoder the adapter checks the file against must declare the int8 stacks and their scales.
             self._arch_config.model = self._arch_config.model.with_int8_experts()
@@ -240,6 +261,9 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
             ngram_size=serve_ngram_size(),
             ngram_window=self._arch_config.decoder.sliding_window_size,
         )
+        if max_batch_size > 1:
+            self._pipeline.min_decode_rows = 2
+            self._pipeline.warm_decode_graphs(max_batch_size)
         self._served: dict[str, ServedRequest] = {}
 
     @staticmethod
@@ -269,29 +293,66 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         """Drop a finished request's KV cache (device bytes on an accelerator)."""
         self._served.pop(request_key(request_id), None)
 
-    def _logits_buffer(self, logits: np.ndarray) -> Buffer:
-        flat = np.ascontiguousarray(np.asarray(logits, dtype=np.float32).reshape(1, -1))
+    def _logits_buffer(self, rows: Sequence[np.ndarray]) -> Buffer:
+        """``[B, vocab]`` fp32 on the model's device, row ``b`` for context ``b``."""
+        flat = np.ascontiguousarray(np.stack([np.asarray(row, dtype=np.float32).reshape(-1) for row in rows]))
         return Buffer.from_numpy(flat).to(self.devices[0])
 
     def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
-        """One scheduler step: prefill when pixels are present, else one decode token. Guard applied to the logits."""
+        """One scheduler step over the batch's ``B`` contexts; ``[B, vocab]`` logits, row ``b`` for context ``b``.
+
+        In-flight batching is off, so a step is all-prefill or all-decode. With
+        pixels present it is a prefill batch: one batch-1 :meth:`_prefill` per
+        context, in batch order, context ``b`` taking ``pixel_values[b]`` and
+        ``image_token_indices[b]``. Otherwise every context decodes one token,
+        all in one :meth:`_decode`. The n-gram guard is applied row by row,
+        each row against its own request's sequence.
+        """
         assert isinstance(model_inputs, UnlimitedOcrInputs)
         if not model_inputs.request_ids:
             raise ValueError("UnlimitedOcrInputs carries no request ids; build inputs through the batch processor")
-        request_id = request_key(model_inputs.request_ids[0])
+        request_ids = [request_key(request_id) for request_id in model_inputs.request_ids]
         tokens = np.asarray(model_inputs.tokens.to(CPU()).to_numpy(), dtype=np.int64).reshape(-1)
+        rows = self._split_tokens(tokens, model_inputs.token_counts, len(request_ids))
+        logits: list[np.ndarray]
         if model_inputs.has_vision_inputs:
-            logits = self._prefill(request_id, model_inputs, tokens)
+            pixels = model_inputs.pixel_values
+            indices = model_inputs.image_token_indices
+            assert pixels is not None
+            if len(pixels) != len(request_ids) or (indices is not None and len(indices) != len(request_ids)):
+                raise ValueError(
+                    f"{len(request_ids)} requests need one pixel buffer (and one placeholder buffer) each; "
+                    f"got {len(pixels)} and {'none' if indices is None else len(indices)}"
+                )
+            logits = [
+                self._prefill(request_id, row, pixels[b], None if indices is None else indices[b])
+                for b, (request_id, row) in enumerate(zip(request_ids, rows, strict=True))
+            ]
         else:
-            logits = self._decode(request_id, tokens)
+            logits = list(self._decode(request_ids, rows))
         blocker = self._pipeline.ngram_blocker
         if blocker is not None:
-            logits = blocker.apply(logits, self._served[request_id].sequence)
+            logits = [
+                blocker.apply(row, self._served[request_id].sequence)
+                for request_id, row in zip(request_ids, logits, strict=True)
+            ]
         buffer = self._logits_buffer(logits)
         return ModelOutputs(next_token_logits=buffer, logits=buffer)
 
-    def _prefill(self, request_id: str, model_inputs: UnlimitedOcrInputs, tokens: np.ndarray) -> np.ndarray:
-        """Vision tower, then the static-length prefill graph.
+    @staticmethod
+    def _split_tokens(tokens: np.ndarray, token_counts: Sequence[int], n_requests: int) -> list[np.ndarray]:
+        """``tokens`` cut into each context's own, in batch order, by ``token_counts``."""
+        if len(token_counts) != n_requests or sum(token_counts) != int(tokens.shape[0]):
+            raise ValueError(
+                f"token_counts {tuple(token_counts)} do not split {tokens.shape[0]} tokens over {n_requests} "
+                "requests; build inputs through the batch processor"
+            )
+        return np.split(tokens, np.cumsum(token_counts)[:-1])
+
+    def _prefill(
+        self, request_id: str, tokens: np.ndarray, pixel_values: Buffer, image_token_indices: Buffer | None
+    ) -> np.ndarray:
+        """One request's vision tower, then the static-length prefill graph, over its own ``tokens``.
 
         The policy is the pipeline's named ``releases_language_graphs``
         predicate. Where it holds (an accelerator without the shared registry)
@@ -300,18 +361,17 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         resident. Where both graphs stay resident on an accelerator, the prefill
         cache is bounded to this prompt's length instead.
         """
-        assert model_inputs.pixel_values is not None
         transient = self._pipeline.releases_language_graphs
         if transient:
             self._pipeline.release_decode()
         elif self._pipeline.on_accelerator:
             self._pipeline.retain_only_prefill(int(tokens.shape[0]))
-        pixels = model_inputs.pixel_values[0].to(CPU()).to_numpy()
+        pixels = pixel_values.to(CPU()).to_numpy()
         stages = self._pipeline.run_vision(np.ascontiguousarray(pixels))
         self._pipeline.drop_vision_weights()
         image_embeds = stages["image_embeds"]
-        if model_inputs.image_token_indices is not None:
-            expected = int(model_inputs.image_token_indices[0].shape[0])
+        if image_token_indices is not None:
+            expected = int(image_token_indices.shape[0])
             if expected != int(image_embeds.shape[0]):
                 raise ValueError(f"vision produced {image_embeds.shape[0]} rows but the prompt has {expected} placeholders")
         result = self._pipeline.run_prefill(tokens, image_embeds)
@@ -320,12 +380,20 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
             self._pipeline.release_prefill()
         return result.logits
 
-    def _decode(self, request_id: str, tokens: np.ndarray) -> np.ndarray:
-        state = self._served.get(request_id)
-        if state is None:
-            raise ValueError(f"request {request_id} asked for a decode step with no prefill on record")
-        if tokens.shape[0] != 1:
-            raise ValueError(f"this decoder steps one token at a time; the scheduler asked for {tokens.shape[0]}")
-        token = int(tokens[0])
-        state.sequence.append(token)
-        return self._pipeline.decode_step(state.cache, token)
+    def _decode(self, request_ids: Sequence[str], rows: Sequence[np.ndarray]) -> np.ndarray:
+        """One token per request, all in ONE ``decode_rows`` call; ``[B, vocab]``, row ``b`` for request ``b``.
+
+        Every request is checked before any sequence moves.
+        """
+        states: list[ServedRequest] = []
+        for request_id, row in zip(request_ids, rows, strict=True):
+            state = self._served.get(request_id)
+            if state is None:
+                raise ValueError(f"request {request_id} asked for a decode step with no prefill on record")
+            if row.shape[0] != 1:
+                raise ValueError(f"this decoder steps one token at a time; the scheduler asked for {row.shape[0]}")
+            states.append(state)
+        tokens = [int(row[0]) for row in rows]
+        for state, token in zip(states, tokens, strict=True):
+            state.sequence.append(token)
+        return self._pipeline.decode_rows([state.cache for state in states], tokens)

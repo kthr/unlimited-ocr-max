@@ -202,10 +202,6 @@ def test_the_served_prefill_drops_the_decode_graph_first() -> None:
         cache = "cache-sentinel"
         logits = np.zeros((1, 4), dtype=np.float32)
 
-    class _Inputs:
-        pixel_values = [_Buffer()]
-        image_token_indices = None
-
     class _Pipeline:
         def __init__(self, transient: bool, on_accelerator: bool) -> None:
             self.releases_language_graphs = transient
@@ -243,7 +239,7 @@ def test_the_served_prefill_drops_the_decode_graph_first() -> None:
         model = object.__new__(UnlimitedOCRModel)
         model._pipeline = _Pipeline(transient, on_accelerator)
         model._served = {}
-        logits = UnlimitedOCRModel._prefill(model, "r1", _Inputs(), np.array([1, 2, 3], dtype=np.int64))
+        logits = UnlimitedOCRModel._prefill(model, "r1", np.array([1, 2, 3], dtype=np.int64), _Buffer(), None)
         assert model._pipeline.calls == expected, (transient, on_accelerator)
         # The request's state is recorded either way -- a release that also
         # dropped the host KV cache would break decoding entirely.
