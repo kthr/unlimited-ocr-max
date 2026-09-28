@@ -1,14 +1,16 @@
-"""The in-process pipeline: vision graph(s) + prefill graph + decode graph, and greedy decoding.
+"""The in-process pipeline: vision graph(s) + prefill graph + decode graph(s), and greedy decoding.
 
-Graphs are compiled lazily. On an accelerator the pipeline binds both language
-graphs to ONE shared device copy of the language weights
+Graphs are compiled lazily. On an accelerator the pipeline binds every language
+graph to ONE shared device copy of the language weights
 (:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT` -- **bf16 only**; the int8 variant
 serves unshared, KON-162) and keeps the KV cache device-resident. With that
-registry both language graphs stay resident; without it (int8) the pipeline
+registry the language graphs stay resident; without it (int8) the pipeline
 holds one at a time -- prefill is released once its host outputs are back, the
-decode graph before the next prefill
+decode graphs before the next prefill
 (:attr:`UnlimitedOcrPipeline.releases_language_graphs`). On CPU every graph
-stays resident and the cache is host numpy.
+stays resident and the cache is host numpy. The decode graphs are the batch-1
+step and, for :meth:`UnlimitedOcrPipeline.decode_rows`, one batched step per
+row count ``B >= 2``; :meth:`UnlimitedOcrPipeline.release_decode` drops them all.
 ``base`` mode is one 1024px view; a tiled
 :class:`~unlimited_ocr_max.batch_processor.CropLayout`
 selects ``gundam`` (a 640px tile tower plus a layout graph), which is usable
@@ -38,6 +40,7 @@ from .graphs import (
     LayoutGraph,
     UnlimitedOcrVisionModel,
     VisionGraph,
+    build_batched_decode_graph,
     build_decode_graph,
     build_language_graph,
     build_layout_graph,
@@ -127,7 +130,7 @@ class UnlimitedOcrPipeline:
         self._vision_state_dict = vision_state_dict
         self._language_state_dict = language_state_dict
         #: Bind the language weights as one shared device registry and declare
-        #: them device-side in both language graphs (KON-113's spelling:
+        #: them device-side in every language graph (KON-113's spelling:
         #: ``add_weight(force_initial_weight_on_host=False)``, deliberately not
         #: ``Weight._has_alias``, which does not compile on Metal in tractable
         #: time). An attribute rather than a property so a probe can set it
@@ -146,6 +149,8 @@ class UnlimitedOcrPipeline:
         self._layout: tuple[LayoutGraph, Model] | None = None
         self._prefill: dict[int, tuple[LanguageGraph, Model]] = {}
         self._decode: tuple[DecodeGraph, Model] | None = None
+        #: The batched decode graphs, keyed by row count ``B >= 2``.
+        self._batched_decode: dict[int, tuple[DecodeGraph, Model]] = {}
         # Compile the Mojo guard now, so a missing Metal Toolchain fails at load
         # rather than on the first request. Its own graph; the model graphs are unaffected.
         if self.ngram_blocker is not None:
@@ -157,7 +162,7 @@ class UnlimitedOcrPipeline:
 
     @property
     def shares_language_weights(self) -> bool:
-        """Whether both language graphs bind ONE device registry of the language weights.
+        """Whether every language graph binds ONE device registry of the language weights.
 
         :attr:`_share_language_weights` (:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT`,
         **on**) gated by :attr:`on_accelerator` and by the weight variant -- the
@@ -204,6 +209,12 @@ class UnlimitedOcrPipeline:
         graph stays resident and a reload would be pure loss. Named so the
         served path (``UnlimitedOCRModel._prefill``) carries the reason along
         instead of reading the device raw.
+
+        A batched decode graph (:meth:`batched_decode_graph`) is one more
+        language graph under the same rule: without the registry it places its
+        own weight copy, so it counts against the one-at-a-time budget
+        alongside the batch-1 decode graph. Its footprint beyond the registry
+        is not measured yet.
         """
         return self.on_accelerator and not self.shares_language_weights
 
@@ -428,6 +439,28 @@ class UnlimitedOcrPipeline:
             self._decode = (staged, self.session.load(staged.graph, weights_registry=decoder.state_dict()))
         return self._decode
 
+    def batched_decode_graph(self, batch: int) -> tuple[DecodeGraph, Model]:
+        """The decode step for ``batch >= 2`` independent requests, compiled lazily and cached per ``batch``.
+
+        Built and loaded exactly like :attr:`decode_graph` -- a fresh decoder,
+        the same ``max_seq_len``, the same weight declaration and registry --
+        but it is a separate graph: :attr:`decode_graph` is untouched by it.
+        """
+        cached = self._batched_decode.get(batch)
+        if cached is None:
+            decoder = self._decoder()
+            staged = build_batched_decode_graph(
+                self.config,
+                decoder,
+                batch=batch,
+                max_seq_len=self.max_total_len,
+                device=self.device,
+                device_resident_weights=self.shares_language_weights,
+            )
+            cached = (staged, self.session.load(staged.graph, weights_registry=decoder.state_dict()))
+            self._batched_decode[batch] = cached
+        return cached
+
     # -- lifetime ----------------------------------------------------------- #
     def drop_vision_weights(self) -> None:
         """Drop the Python-side fp32 vision arrays once the compiled tower holds them (serving path)."""
@@ -446,19 +479,20 @@ class UnlimitedOcrPipeline:
         gc.collect()
 
     def release_decode(self) -> None:
-        """Drop the decode graph. Idempotent, and safe before anything was built.
+        """Drop every decode graph, batch-1 and batched. Idempotent, and safe before anything was built.
 
-        The graph (the ``Model``) is what goes; the shared language weight
+        The graphs (each a ``Model``) are what go; the shared language weight
         registry (:attr:`_language_device_weights`) deliberately does **not**.
-        It is one device copy bound by *both* language graphs across every
+        It is one device copy bound by *every* language graph across every
         release/reload cycle -- keeping it is the whole per-request saving
         (decode reload 8.4 -> ~1.5 s in the research port) -- and it could not
         be rebuilt anyway: :meth:`_resolved_language_weights` took the host
-        arrays. Were a registry ever dropped here, the graph would still have
-        to go **first**: the ``Model`` reads those buffers, and dropping them
+        arrays. Were a registry ever dropped here, the graphs would still have
+        to go **first**: a ``Model`` reads those buffers, and dropping them
         under it would be a use-after-free of the weights the graph binds.
         """
         self._decode = None
+        self._batched_decode.clear()
         gc.collect()
 
     def release_prefill(self) -> None:
@@ -570,6 +604,45 @@ class UnlimitedOcrPipeline:
             [outputs[f"value_{i}"] for i in range(staged.num_layers)],
         )
         return outputs["logits"].reshape(-1)
+
+    def decode_rows(self, caches: Sequence[KvCache], token_ids: Sequence[int]) -> np.ndarray:
+        """Feed ``token_ids[b]`` to request ``b`` at ``caches[b].position``; ``[B, vocab]`` fp32 logits, row ``b`` for it.
+
+        ``B == 1`` is :meth:`decode_step` -- the unchanged batch-1 graph --
+        reshaped to ``[1, vocab]``. ``B >= 2`` is one execute of
+        :meth:`batched_decode_graph`, then each cache appends its own row
+        ``b`` of every ``key_i`` / ``value_i``. On a
+        :class:`~unlimited_ocr_max.kv_cache.DeviceKvCache` those rows are
+        ``[b : b + 1, :, :]`` views of the graph's own device outputs, ordered
+        behind the submission that produced them, so the async copy needs no
+        drain (the rule ``DeviceKvCache._write_row`` states).
+
+        Every cache must be of one class: the single execute brings back one
+        set of host outputs, ``caches[0].HOST_OUTPUTS``.
+        """
+        if len(caches) != len(token_ids):
+            raise ValueError(f"{len(caches)} caches for {len(token_ids)} tokens")
+        if not caches:
+            raise ValueError("decode_rows needs at least one row")
+        kinds = {type(cache) for cache in caches}
+        if len(kinds) != 1:
+            raise TypeError(f"every cache must be of one class, got {sorted(kind.__name__ for kind in kinds)}")
+        if len(caches) == 1:
+            return self.decode_step(caches[0], token_ids[0]).reshape(1, -1)
+        staged, model = self.batched_decode_graph(len(caches))
+        inputs: list[Any] = [
+            np.asarray(token_ids, dtype=np.int64),
+            np.asarray([cache.position for cache in caches], dtype=np.int32),
+        ]
+        for cache in caches:
+            inputs += [cache.selector(), *cache.views()]
+        outputs = self._execute(model, staged.output_names, *inputs, host_outputs=caches[0].HOST_OUTPUTS)
+        for b, cache in enumerate(caches):
+            cache.append(
+                [outputs[f"key_{i}"][b : b + 1, :, :] for i in range(staged.num_layers)],
+                [outputs[f"value_{i}"][b : b + 1, :, :] for i in range(staged.num_layers)],
+            )
+        return outputs["logits"]
 
     def generate(self, *, pixels: np.ndarray, token_ids: np.ndarray, local_pixels: np.ndarray | None = None) -> list[int]:
         """Greedy decode to EOS (included) or ``max_new_tokens``; the n-gram guard, if on, is applied to every step."""

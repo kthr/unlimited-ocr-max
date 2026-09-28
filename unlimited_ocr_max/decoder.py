@@ -42,7 +42,9 @@ Invariants the emitted graph depends on:
   runtime-derived expert index (:meth:`MoE._runtime_zero`). The graph that
   stages these ops needs ``custom_extensions=[MOJO_KERNELS]``.
 * Hidden states are rank-2 ``[seq_len, hidden]``; ``seq_len`` is a static graph
-  dimension so the causal mask and the RoPE tables are graph constants.
+  dimension so the causal mask and the RoPE tables are graph constants. The
+  batched decode step (:meth:`UnlimitedOcrDecoder.decode_rows`) reuses the
+  layout for ``B`` independent one-token requests: there a row is a request.
 """
 
 from __future__ import annotations
@@ -354,6 +356,38 @@ class Attention(Module):
         merged = attended.permute([1, 0, 2]).reshape((1, self.hidden_size))
         return self.o_proj(merged), k_new.permute([1, 0, 2]), v_new.permute([1, 0, 2])
 
+    def decode_rows(
+        self,
+        x: TensorValue,
+        *,
+        cos: TensorValue,
+        sin: TensorValue,
+        past: Sequence[tuple[TensorValue, TensorValue]],
+        write_sels: Sequence[TensorValue],
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
+        """One token for each of ``B`` independent requests, each over its own cached prefix.
+
+        ``x`` is ``[B, hidden]``, one row per request; ``cos`` / ``sin`` are
+        ``[1, B, head_dim]``. The q/k/v projections, RoPE and ``o_proj`` run
+        once over all ``B`` rows. Attention is unrolled per row: row ``b``
+        runs exactly :meth:`decode`'s math -- the ``write_sels[b]``
+        substitution after the permute, scores times scale, softmax, ``@ v`` --
+        against its own ``past[b]`` cache, whose ``past_len`` is its own. The
+        ``B`` merged rows are concatenated before the one ``o_proj``. Returns
+        the new rows as ``[B, n_kv_heads, head_dim]``, row ``b`` for request ``b``.
+        """
+        q = self._rope(self._heads(self.q_proj(x)), cos, sin)
+        k_new = self._rope(self._heads(self.k_proj(x)), cos, sin)
+        v_new = self._heads(self.v_proj(x))
+        merged: list[TensorValue] = []
+        for b, ((past_k, past_v), write_sel) in enumerate(zip(past, write_sels, strict=True)):
+            k = ops.where(write_sel, k_new[:, b : b + 1, :], past_k.permute([1, 0, 2]))
+            v = ops.where(write_sel, v_new[:, b : b + 1, :], past_v.permute([1, 0, 2]))
+            scores = (q[:, b : b + 1, :] @ k.transpose(-1, -2)) * self.scale
+            attended = ops.softmax(scores) @ v
+            merged.append(attended.permute([1, 0, 2]).reshape((1, self.hidden_size)))
+        return self.o_proj(ops.concat(merged, axis=0)), k_new.permute([1, 0, 2]), v_new.permute([1, 0, 2])
+
 
 class MoEGate(Module):
     """Softmax over all experts in fp32, then top-k. Weight name ``gate.gate_score.weight``."""
@@ -576,6 +610,22 @@ class DecoderLayer(Module):
         x = x + attended
         return x + self.mlp(self.post_attention_layernorm(x)), key, value
 
+    def decode_rows(
+        self,
+        x: TensorValue,
+        *,
+        cos: TensorValue,
+        sin: TensorValue,
+        past: Sequence[tuple[TensorValue, TensorValue]],
+        write_sels: Sequence[TensorValue],
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
+        """:meth:`decode` for ``B`` independent rows; the norms and the FFN/MoE see all ``B`` at once."""
+        attended, key, value = self.self_attn.decode_rows(
+            self.input_layernorm(x), cos=cos, sin=sin, past=past, write_sels=write_sels
+        )
+        x = x + attended
+        return x + self.mlp(self.post_attention_layernorm(x)), key, value
+
 
 class UnlimitedOcrDecoder(Module):
     """``embed_tokens`` / ``layers`` / ``norm`` / ``lm_head``; FQNs are the checkpoint keys minus ``model.``.
@@ -661,3 +711,56 @@ class UnlimitedOcrDecoder(Module):
     def logits(self, normed: TensorValue) -> TensorValue:
         """``lm_head`` over the final row only, in fp32."""
         return ops.cast(self.lm_head(normed[-1:, :]), DType.float32)
+
+    def rope_rows(self, positions: TensorValue, *, max_seq_len: int) -> tuple[TensorValue, TensorValue]:
+        """``(cos, sin)`` at each of ``positions [B]`` as ``[1, B, head_dim]``, from the same table as :meth:`rope_row`."""
+        head_dim = self.config.head_dim
+        rows = int(positions.shape[0])
+        cos_np, sin_np = rope_tables(head_dim=head_dim, seq_len=max_seq_len, theta=self.config.rope_theta)
+        gathered = []
+        for table in (cos_np, sin_np):
+            constant = ops.constant(table, COMPUTE_DTYPE, device=self.device)
+            gathered.append(ops.gather(constant, positions, axis=0).reshape((1, rows, head_dim)))
+        return gathered[0], gathered[1]
+
+    def decode_rows(
+        self,
+        hidden: TensorValue,
+        *,
+        positions: TensorValue,
+        max_seq_len: int,
+        past_kv_rows: Sequence[Sequence[tuple[TensorValue, TensorValue]]],
+        write_sels: Sequence[TensorValue],
+    ) -> tuple[TensorValue, list[tuple[TensorValue, TensorValue]]]:
+        """One token for each of ``B`` independent requests; ``(normed [B, hidden], new (k, v) rows per layer)``.
+
+        Row ``b`` of ``hidden`` is request ``b``, not a sequence position: it
+        sits at ``positions[b]``, attends over ``past_kv_rows[b]`` (its own
+        ``(k, v)`` per layer) and writes where ``write_sels[b]`` points. Each
+        layer's new rows come back as ``[B, n_kv_heads, head_dim]``.
+
+        The MoE is called unchanged on the ``[B, hidden]`` rows, so its dispatch
+        is keyed on the row count: bf16 on an accelerator takes
+        :meth:`MoE._routed_native` at any ``B``, but on CPU and in int8 mode a
+        ``B >= 2`` step takes the prefill chain (:meth:`MoE._routed_dense`), not
+        the one-row decode path.
+        """
+        rows = int(hidden.shape[0])
+        if len(past_kv_rows) != rows or len(write_sels) != rows:
+            raise ValueError(
+                f"{rows} rows need {rows} caches and selectors, got {len(past_kv_rows)} and {len(write_sels)}"
+            )
+        for b, past_kv in enumerate(past_kv_rows):
+            if len(past_kv) != len(self.layers):
+                raise ValueError(f"row {b}: expected {len(self.layers)} cache pairs, got {len(past_kv)}")
+        cos, sin = self.rope_rows(positions, max_seq_len=max_seq_len)
+        new_kv: list[tuple[TensorValue, TensorValue]] = []
+        for i, layer in enumerate(self.layers):
+            past = [past_kv[i] for past_kv in past_kv_rows]
+            hidden, key, value = layer.decode_rows(hidden, cos=cos, sin=sin, past=past, write_sels=write_sels)
+            new_kv.append((key, value))
+        return self.norm(hidden), new_kv
+
+    def logits_rows(self, normed: TensorValue) -> TensorValue:
+        """``lm_head`` over every row, in fp32: ``[B, vocab]`` for :meth:`decode_rows`' ``[B, hidden]``."""
+        return ops.cast(self.lm_head(normed), DType.float32)
