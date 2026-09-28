@@ -392,6 +392,8 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
                 raise ValueError(f"request {request_id} asked for a decode step with no prefill on record")
             if row.shape[0] != 1:
                 raise ValueError(f"this decoder steps one token at a time; the scheduler asked for {row.shape[0]}")
+            if any(state is seen for seen in states):
+                raise ValueError(f"request {request_id} appears twice in one decode batch")
             states.append(state)
         tokens = [int(row[0]) for row in rows]
         for state, token in zip(states, tokens, strict=True):

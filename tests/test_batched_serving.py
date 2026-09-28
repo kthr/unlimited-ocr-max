@@ -291,6 +291,8 @@ def test_a_decode_batch_checks_every_request_before_any_sequence_moves() -> None
     two_tokens = [_context("r0", [5]), _context("r1", [6, 7])]
     with pytest.raises(ValueError, match="this decoder steps one token at a time; the scheduler asked for 2"):
         model.execute(_inputs(two_tokens))
+    with pytest.raises(ValueError, match="request r0 appears twice in one decode batch"):
+        model.execute(_inputs([_context("r0", [5]), _context("r0", [6])]))
     assert pipeline.calls == []
     assert {request_id: state.sequence for request_id, state in model._served.items()} == before
 

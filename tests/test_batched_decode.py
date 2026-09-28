@@ -17,6 +17,8 @@ rows.
 from __future__ import annotations
 
 import hashlib
+import platform
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -70,6 +72,10 @@ _BATCH1_DECODE_GOLDEN = {
     ("variant", "device", "resident"),
     [("cpu", "cpu", False), ("gpu-resident", "gpu", True), ("gpu-plain", "gpu", False)],
 )
+@pytest.mark.skipif(
+    (sys.platform, platform.machine()) != ("darwin", "arm64"),
+    reason="goldens recorded on darwin/arm64: the text prints numpy float32 RoPE tables, whose cos/sin digits are platform-dependent",
+)
 def test_the_batch1_decode_graph_is_byte_identical(variant: str, device: str, resident: bool) -> None:
     """The batch-1 ``build_decode_graph`` text hashes to its pre-KON-212 value, in all three variants the port stages.
 
@@ -78,8 +84,11 @@ def test_the_batch1_decode_graph_is_byte_identical(variant: str, device: str, re
     without the graph meaning anything different. Re-record them on a bump
     only after proving the bump itself did not move the graph (KON-122's
     bar), never by pasting what the new build prints. The text also carries
-    the RoPE tables as printed float32 constants, so the goldens assume
-    numpy's float32 ``cos``/``sin`` produce the same bits too.
+    the RoPE tables as printed float32 constants, and numpy's float32
+    ``cos``/``sin`` are not correctly rounded on every platform (628 of 8192
+    cos entries differ from the correctly rounded value on darwin/arm64), so
+    the goldens are only asserted on the platform they were recorded on; the
+    macOS CI leg and every local run on Apple silicon carry the guard.
     """
     config = _config(int8=False, num_hidden_layers=3)
     text = _graph_text(config, DEVICES[device], decode=True, resident=resident)
@@ -503,3 +512,6 @@ def test_batched_decode_rows_against_two_batch1_steps(_accelerator_session) -> N
     for name in got:
         delta = float(np.max(np.abs(got[name].astype(np.float64) - want[name].astype(np.float64))))
         print(f"[uocr]   {name}: bitwise {bitwise[name]}, max |delta| {delta:.3e}")
+        # Not the numeric bar (the rows are not bitwise to batch 1 on Metal, ~1e-6 here), but a row
+        # swapped, a RoPE row misaligned or a cache mixed up moves these by O(1); fail on that.
+        assert delta <= 1e-3, (name, delta)

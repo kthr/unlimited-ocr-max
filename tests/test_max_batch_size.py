@@ -172,3 +172,10 @@ def test_max_batch_size_reaches_the_env_but_never_the_serve_argv(
         cli.main(["serve", "--devices", "gpu", "--model", str(tmp_path)])
     assert captured["argv"] == baseline_argv
     assert captured["env"][cli.MAX_BATCH_SIZE_ENV] == "1"
+
+
+def test_the_architecture_forces_in_flight_batching_off() -> None:
+    """``execute`` serves all-prefill or all-decode steps only, so the scheduler must never mix them."""
+    from unlimited_ocr_max import arch
+
+    assert arch.unlimited_ocr_arch.required_arguments["enable_in_flight_batching"] is False

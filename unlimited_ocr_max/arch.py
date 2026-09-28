@@ -78,6 +78,9 @@ unlimited_ocr_arch = SupportedArchitecture(
     required_arguments={
         "enable_prefix_caching": False,
         "enable_chunked_prefill": False,
+        # Batching is prefill-only or decode-only per step (``UnlimitedOCRModel.execute``); a
+        # mixed CE+TG batch is refused, so the scheduler must never form one.
+        "enable_in_flight_batching": False,
         "max_batch_size": serve_max_batch_size(),
     },
     config=UnlimitedOcrArchConfig,
