@@ -6,11 +6,11 @@ graph open raises), and a ``Weight`` binds to the first graph it is added to,
 so each graph needs a fresh module instance.
 
 An int8 decoder (``config.decoder.int8_experts``) stages ``ops.custom`` calls
-into ``kernels/moe_int8.mojo``, so both language graphs are then opened with
-``custom_extensions=[MOJO_KERNELS]``; a bf16 decoder's graphs are opened exactly
-as before. int8 is accelerator-only in this port and both builders refuse a CPU
-``DeviceRef`` (the CLI refuses ``--weights int8`` on cpu first; this is the
-second line).
+into ``kernels/moe_int8.mojo``, so every language graph (prefill, decode and
+batched decode) is then opened with ``custom_extensions=[MOJO_KERNELS]``; a
+bf16 decoder's graphs are opened exactly as before. int8 is accelerator-only in
+this port and every language builder refuses a CPU ``DeviceRef`` (the CLI
+refuses ``--weights int8`` on cpu first; this is the second line).
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ __all__ = [
     "LayoutGraph",
     "UnlimitedOcrVisionModel",
     "VisionGraph",
+    "build_batched_decode_graph",
     "build_decode_graph",
     "build_language_graph",
     "build_layout_graph",
@@ -89,7 +90,7 @@ def declare_device_resident_weights(graph: Graph, decoder: UnlimitedOcrDecoder) 
     weights disappear. The declaration set itself is unchanged. The registry
     values ``session.load`` binds must then be device-resident
     (:meth:`~unlimited_ocr_max.pipeline.UnlimitedOcrPipeline._resolved_language_weights`
-    builds them), which is what lets both language graphs share **one** device
+    builds them), which is what lets every language graph share **one** device
     copy of the weights instead of materialising one each (KON-113/KON-158).
     On CPU the weight's device *is* the host, so this is never called there.
     """
@@ -307,6 +308,8 @@ class DecodeGraph:
     graph: Graph
     output_names: tuple[str, ...]
     num_layers: int
+    #: Requests stepped per execute: 1 for :func:`build_decode_graph`, ``B >= 2`` for :func:`build_batched_decode_graph`.
+    batch: int = 1
 
 
 def build_decode_graph(
@@ -356,3 +359,78 @@ def build_decode_graph(
             names.append(f"value_{i}")
         graph.output(*outputs)
     return DecodeGraph(graph=graph, output_names=tuple(names), num_layers=num_layers)
+
+
+def build_batched_decode_graph(
+    config: UnlimitedOCRConfig,
+    decoder: UnlimitedOcrDecoder,
+    *,
+    batch: int,
+    max_seq_len: int,
+    device: DeviceRef,
+    device_resident_weights: bool = False,
+) -> DecodeGraph:
+    """One decode step for ``batch >= 2`` independent requests in one execute.
+
+    Inputs: ``tokens [B]`` int64, ``positions [B]`` int32, then for each row
+    ``b`` its ``write_sel_b`` ``[1, past_len_b, 1]``, its L key caches and its L
+    value caches, each ``[past_len_b, n_kv_heads, head_dim]`` -- so row ``b``'s
+    slice is exactly ``cache.selector(), *cache.views()``, and the rows'
+    slices concatenate. Every row has its own symbolic ``past_len_b``.
+
+    Outputs: ``logits [B, vocab]``, then ``key_0..key_{L-1}`` and
+    ``value_0..value_{L-1}``, each ``[B, n_kv_heads, head_dim]`` with row ``b``
+    for request ``b``.
+
+    A separate graph from :func:`build_decode_graph`, which it leaves exactly
+    as it was: bitwise identity is a property of the whole emitted graph, and
+    whether this one is bitwise the batch-1 step is measured, not assumed.
+    ``device_resident_weights`` is :func:`build_language_graph`'s parameter of
+    the same name, same contract.
+    """
+    if batch < 2:
+        raise ValueError(f"batch must be >= 2, got {batch}; batch 1 is build_decode_graph")
+    dec = config.decoder
+    num_layers = dec.num_hidden_layers
+    input_types: list[TensorType] = [
+        TensorType(DType.int64, [batch], device=device),
+        TensorType(DType.int32, [batch], device=device),
+    ]
+    for b in range(batch):
+        past_len = f"past_len_{b}"
+        cache_type = TensorType(COMPUTE_DTYPE, [past_len, dec.num_key_value_heads, dec.head_dim], device=device)
+        input_types += [TensorType(DType.bool, [1, past_len, 1], device=device), *([cache_type] * (2 * num_layers))]
+    with Graph(
+        f"unlimited_ocr_decode_{max_seq_len}_ring_b{batch}",
+        input_types=input_types,
+        **_language_graph_kwargs(decoder, device),
+    ) as graph:
+        if device_resident_weights:
+            declare_device_resident_weights(graph, decoder)
+        tokens = graph.inputs[0].tensor
+        positions = graph.inputs[1].tensor
+        per_row = 1 + 2 * num_layers
+        write_sels: list[TensorValue] = []
+        past_kv_rows: list[list[tuple[TensorValue, TensorValue]]] = []
+        for b in range(batch):
+            start = 2 + b * per_row
+            write_sels.append(graph.inputs[start].tensor)
+            caches = [value.tensor for value in graph.inputs[start + 1 : start + per_row]]
+            past_kv_rows.append([(caches[i], caches[num_layers + i]) for i in range(num_layers)])
+        normed, new_kv = decoder.decode_rows(
+            decoder.embed(tokens),
+            positions=positions,
+            max_seq_len=max_seq_len,
+            past_kv_rows=past_kv_rows,
+            write_sels=write_sels,
+        )
+        outputs: list[TensorValue] = [decoder.logits_rows(normed)]
+        names: list[str] = ["logits"]
+        for i, (key, _) in enumerate(new_kv):
+            outputs.append(key)
+            names.append(f"key_{i}")
+        for i, (_, value) in enumerate(new_kv):
+            outputs.append(value)
+            names.append(f"value_{i}")
+        graph.output(*outputs)
+    return DecodeGraph(graph=graph, output_names=tuple(names), num_layers=num_layers, batch=batch)
