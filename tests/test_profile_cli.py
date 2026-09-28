@@ -1504,6 +1504,74 @@ def test_concurrent_sending_keeps_at_most_n_in_flight_all_12_pages_sent_warmup_f
     assert concurrency_figure["by_batch_size"] == {}
 
 
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_interrupt_with_a_page_genuinely_in_flight_propagates_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, concurrency: int
+) -> None:
+    """Review round 1 (KON-216), blocker: a SIGINT arriving while a page request is genuinely in
+    flight must raise ``KeyboardInterrupt`` out of ``_send_pages`` at once, at concurrency 1 (the
+    sequential sender, no executor) and above 1 (the concurrent sender must not drain in-flight
+    futures on the way out). Before the fix this blocked for as long as the in-flight request took
+    to finish on its own -- up to ``REQUEST_TIMEOUT_S`` (3600 s) -- because a worker thread's
+    ``_stream_chat`` is never interrupted by a signal delivered to the main thread.
+    """
+    if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
+        pytest.skip("SIGINT does not raise KeyboardInterrupt in this test process")
+    release = threading.Event()
+
+    def blocked_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        release.wait(timeout=30.0)
+        raise profile.ExchangeFailed("test stub: never meant to complete")
+
+    monkeypatch.setattr(profile, "_stream_chat", blocked_stream_chat)
+    out = tmp_path / "run"
+    (out / "pages").mkdir(parents=True)
+    timer = threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            profile._send_pages(0, tmp_path / "serve.log", out, PAGES, concurrency)
+        assert time.monotonic() - started < 2.0
+    finally:
+        timer.cancel()
+        release.set()  # let whatever worker thread is still blocked finish, so none lingers
+
+
+def test_exchange_failed_mid_run_at_concurrency_above_one_still_records_in_flight_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 1 (KON-216), minor: one page failing while others are already in flight must
+    stop further submissions but still wait for, record and write the siblings already sent --
+    not abandon them."""
+    concurrency = 3
+    png_to_page = {profile_corpus.page_png(page): page for page in PAGES}
+    requested: list[str] = []
+    lock = threading.Lock()
+
+    def fake_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        page = png_to_page[png]
+        with lock:
+            requested.append(page)
+        if page == PAGES[0]:
+            raise profile.ExchangeFailed("stub failure: server dropped the connection")
+        time.sleep(0.05)  # long enough that the failure above is always processed first
+        t = time.monotonic()
+        return profile.Exchange(max_tokens=max_tokens, t_start=t, t_end=t + 0.01, t_first=t,
+                                completion_tokens=1, finish_reason="stop", text="x")
+
+    monkeypatch.setattr(profile, "_stream_chat", fake_stream_chat)
+    out = tmp_path / "run"
+    (out / "pages").mkdir(parents=True)
+    exchanges, busy, void = profile._send_pages(0, out / "serve.log", out, PAGES, concurrency)
+
+    assert void == [f"request {PAGES[0]} failed: stub failure: server dropped the connection"]
+    # the two siblings already in flight alongside the failing page are still recorded ...
+    assert set(exchanges) == {PAGES[1], PAGES[2]}
+    # ... and nothing beyond the first `concurrency` pages was ever submitted
+    assert set(requested) == set(PAGES[:concurrency])
+
+
 def test_the_stop_message_is_said_while_signals_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, Any]] = []
     monkeypatch.setattr(profile, "_say", lambda message: events.append((message, signal.getsignal(signal.SIGINT))))

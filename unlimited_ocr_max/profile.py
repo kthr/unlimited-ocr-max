@@ -558,20 +558,65 @@ def _stream_chat(port: int, png: bytes, max_tokens: int) -> Exchange:
 
 def _send_pages(port: int, log_path: Path, out: Path, pages: list[str],
                 concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """Send ``pages``, keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight.
+
+    At ``concurrency`` 1 this is :func:`_send_pages_sequential`: one request after another, on
+    this thread, with no executor at all -- byte-identical to how ``profile`` sent pages before
+    concurrency existed, Ctrl-C included. Above 1 it is :func:`_send_pages_concurrent`.
+    """
+    if concurrency == 1:
+        return _send_pages_sequential(port, log_path, out, pages)
+    return _send_pages_concurrent(port, log_path, out, pages, concurrency)
+
+
+def _send_pages_sequential(port: int, log_path: Path, out: Path,
+                           pages: list[str]) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """One request after another, on this thread -- no executor, no worker thread. A failure voids
+    the run and stops further sending; an interrupt (Ctrl-C/SIGTERM/SIGHUP) is not caught here at
+    all, so it propagates the instant it is raised, exactly as it did before concurrency existed.
+    """
+    exchanges: dict[str, Exchange] = {}
+    busy: list[tuple[float, float]] = []
+    void: list[str] = []
+    for page in pages:
+        t_start = time.monotonic()
+        try:
+            exchange = _stream_chat(port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
+        except ExchangeFailed as e:
+            busy.append((t_start, time.monotonic()))
+            void.append(f"request {page} failed: {e}")
+            _say(void[-1])
+            _print_log_tail(log_path)
+            break
+        busy.append((exchange.t_start, exchange.t_end))
+        exchanges[page] = exchange
+        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
+        _say(f"{page}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+    return exchanges, busy, void
+
+
+def _send_pages_concurrent(port: int, log_path: Path, out: Path, pages: list[str],
+                           concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
     """Send ``pages`` keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight at
     once (a thread per in-flight exchange). Every result is read back and every write happens on
     this thread, never on a worker thread, so none of the state below needs a lock.
 
     Returns ``(exchanges keyed by page, busy intervals, void reasons)`` -- the same shapes the
-    fully sequential sender used, so its overlapping ``busy`` intervals still feed
-    :func:`memory_stats` correctly (a sample is excluded if it falls in *any* busy window,
-    overlapping or not).
+    sequential sender uses, so its overlapping ``busy`` intervals still feed :func:`memory_stats`
+    correctly (a sample is excluded if it falls in *any* busy window, overlapping or not).
 
     The first :class:`ExchangeFailed` stops further submissions -- voiding the run, as a failure
-    always has -- but whatever was already in flight is still waited for, recorded and written, so
-    a failure in one thread never leaves another unreported. Any other exception (a bug, not a
-    request failure) is drained the same way -- so nothing here is left running -- and then
-    re-raised, exactly as an exception from the sequential sender used to propagate.
+    always has -- but whatever was already in flight is still waited for (in the loop below, not
+    the ``except``) and recorded, so a failure in one thread never leaves a sibling unreported;
+    this never raises out of the loop.
+
+    An actual interrupt (``KeyboardInterrupt``, ``SystemExit`` from SIGTERM/SIGHUP) or a genuine
+    bug is different: a worker's :func:`_stream_chat` is not interrupted by the signal that raised
+    it here -- only this thread sees it -- so waiting for one to finish on its own could block for
+    up to ``REQUEST_TIMEOUT_S``. Instead the pool is shut down without waiting and with pending
+    futures cancelled, and the exception is re-raised at once: the outer teardown kills the
+    server's process group right after, which breaks every in-flight request's socket and ends
+    the worker threads, without this function waiting on them.
     """
     exchanges: dict[str, Exchange] = {}
     busy: list[tuple[float, float]] = []
@@ -603,29 +648,24 @@ def _send_pages(port: int, log_path: Path, out: Path, pages: list[str],
             future = pool.submit(_stream_chat, port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
             in_flight[future] = (page, t_start)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        try:
-            _fill(pool)
-            while in_flight:
-                done, _ = concurrent.futures.wait(list(in_flight), return_when=concurrent.futures.FIRST_COMPLETED)
-                for future in done:
-                    page, t_start = in_flight.pop(future)
-                    try:
-                        _finish(future, page)
-                    except ExchangeFailed as e:
-                        _voided(page, t_start, e)
-                _fill(pool)
-        except BaseException:
-            # Drain whatever else was in flight so a bug that fails one request never leaves
-            # another running unreported; the exception that got us here is re-raised either way.
-            for future, (page, t_start) in list(in_flight.items()):
+    # Not a `with` block: `ThreadPoolExecutor.__exit__` calls `shutdown(wait=True)` unconditionally,
+    # which would wait for in-flight workers on the way out of the `except` below too.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        _fill(pool)
+        while in_flight:
+            done, _ = concurrent.futures.wait(list(in_flight), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                page, t_start = in_flight.pop(future)
                 try:
                     _finish(future, page)
                 except ExchangeFailed as e:
                     _voided(page, t_start, e)
-                except Exception as drain_error:
-                    _say(f"request {page} failed while draining after an earlier failure: {drain_error}")
-            raise
+            _fill(pool)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)  # nothing is left in flight here, so this returns at once
     return exchanges, busy, void
 
 
