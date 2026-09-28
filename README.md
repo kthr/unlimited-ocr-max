@@ -72,7 +72,7 @@ compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, mod
 | `--devices` | `gpu` \| `cpu` | **required** | `gpu` is Metal, CUDA or ROCm; `cpu` is slow |
 | `--weights` | `bf16` \| `int8` | `bf16` | `int8`: quantised routed experts, faster decode, **gpu only** |
 | `--model` | Hub repo or local dir | `kthierbach/unlimited-ocr-max` | a local dir needs this repository's layout |
-| `--revision` | tag | `v0.3.2` | the model-repo tag this package version was validated against |
+| `--revision` | tag | `v0.3.3` | the model-repo tag this package version was validated against |
 | `--port` | integer | `8010` | |
 | `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
 
@@ -101,7 +101,7 @@ EOF
 Offline:
 
 ```bash
-uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.2 --local-dir ocr-model
+uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.3 --local-dir ocr-model
 unlimited-ocr-max serve --devices gpu --model ocr-model
 ```
 
@@ -113,16 +113,17 @@ characters over all pages.
 
 | hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
 |---|---|---|---|---|---|---|
-| Apple M4 24 GB | bf16 | 12 pages | **21.3 tok/s** | 3.20 s | 17.8 / 11.1–11.2 GiB | **12/12 byte-identical** |
-| Apple M4 24 GB | int8 | 12 pages ² | **36.6 tok/s** | 6.86 s | 20.7 / 10.9 GiB | 6/12; CER 0.0011, all edits bbox digits |
-| NVIDIA A100 80 GB | bf16 | 12 pages | **93.6 tok/s** | 3.56 s | device 10.6 / 10.6 GiB | 10/12; CER 0.022 ³ |
-| NVIDIA A100 80 GB | int8 | 12 pages | **82.7 tok/s** | 6.23 s | device 17.4 / 17.4 GiB | 6/12; CER 0.025 ³ |
+| Apple M4 24 GB | bf16 | 12 pages | **21.2 tok/s** | 2.45 s | 15.6 / 11.6–13.6 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages | **36.4 tok/s** | 6.79 s | 13.5 / 11.1 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| NVIDIA A100 80 GB | bf16 | re-run pending | — | — | — | — |
+| NVIDIA A100 80 GB | int8 | re-run pending | — | — | — | — |
 | NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
 | AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
 | CPU (Apple M4) | bf16 | 12 pages ² | 5.1 tok/s | 47.9 s | 21.1 / 21.0 GiB | **12/12 byte-identical** |
 
-Every measured row is one draw with `unlimited-ocr-max profile` on v0.3.2
-(Apple M4: macOS 26.5.2; A100: Linux; `max` 26.6.0 on both). Memory is the server's **physical
+Every measured row is one draw with `unlimited-ocr-max profile` on v0.3.3
+(Apple M4: macOS 26.5.2; A100: Linux; `max` 26.6.0 on both), except the CPU
+row, which is v0.3.2's: the CPU path is unchanged in v0.3.3. Memory is the server's **physical
 footprint** on Apple silicon -- what `footprint` and `vmmap` report, which on
 unified memory includes the Metal allocations and excludes clean page cache --
 and its device memory on NVIDIA/AMD. Peak is reached in the first request

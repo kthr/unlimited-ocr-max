@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.3.3] — unreleased
+
+### Performance
+- **bf16 on a GPU: both language graphs stay resident.** Since 0.3.2 they hold
+  no weights of their own (prefill 0.002 GiB, decode 0.000 GiB beyond the
+  shared registry). Releasing them after every prefill therefore only re-paid a
+  graph reload per request. Now they are released only on an accelerator
+  without the registry (int8). The prefill-graph cache is bounded to the
+  current prompt length.
+
+  Apple M4, `profile`, 12 pages, same sitting:
+
+  | | v0.3.2 | v0.3.3 |
+  |---|---|---|
+  | prefill median | 3.19 s | **2.44 s** |
+  | TTFT median | 3.23 s | **2.49 s** |
+  | total time, 12 pages | 334.6 s | **318.1 s** |
+
+  Decode is unchanged, and the between-request footprint stays flat across the
+  run.
+- **int8: prefill no longer materialises an fp32 copy of the dequantised
+  experts.** At prefill, the per-expert dequantisation received only constants,
+  so MAX pre-computed it at load and kept an fp32 copy of every expert on the
+  device. The expert index is now derived from the router's runtime output, so
+  the dequantisation runs at prefill on the int8 weights and computes the same
+  values.
+
+  Apple M4, `profile`, 12 pages, same sitting:
+
+  | | v0.3.2 | v0.3.3 |
+  |---|---|---|
+  | prefill graph, device memory | 10.6 GiB | **3.9 GiB** |
+  | server peak physical footprint | 20.7 GiB | **13.6 GiB** |
+  | swap growth during the run | 2.2 GiB | **0** |
+
+  Decode is unchanged.
+
+### Behavior
+- **Output unchanged.** bf16 is 12/12 byte-identical to the reference, and
+  int8 is 12/12 byte-identical to its pinned transcripts. The int8 prefill
+  logits are bitwise identical to v0.3.2's, and a slow test pins it.
+- **int8's first request compiles for longer** on an empty compile cache, i.e.
+  the first run after an install or a MAX upgrade: about 5 minutes against
+  about 1.5 before. The per-expert dequantisation is now compiled into the
+  graph instead of pre-computed at load.
+- CPU serving is unchanged.
+
 ## [0.3.2] — 2026-09-28
 
 ### Performance
