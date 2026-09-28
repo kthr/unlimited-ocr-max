@@ -245,7 +245,8 @@ def test_profile_help_does_not_import_max() -> None:
     modules, help_text = _modules_and_stdout("from unlimited_ocr_max import cli\ncli.main(['profile', '--help'])")
     assert not _imports_max(modules)
     assert "unlimited_ocr_max.profile" not in modules
-    for flag in ("--devices", "--model", "--revision", "--weights", "--port", "--ngram-size", "--out", "--ready-timeout-s"):
+    for flag in ("--devices", "--model", "--revision", "--weights", "--port", "--ngram-size", "--max-batch-size",
+                 "--out", "--ready-timeout-s"):
         assert flag in help_text
 
 
@@ -291,7 +292,7 @@ def test_serve_and_profile_share_one_definition_of_the_server_flags() -> None:
         }
 
     serve, prof = spec(subparsers.choices["serve"]), spec(subparsers.choices["profile"])
-    assert list(serve) == ["devices", "model", "revision", "weights", "port", "ngram_size"]
+    assert list(serve) == ["devices", "model", "revision", "weights", "port", "ngram_size", "max_batch_size"]
     assert {dest: prof[dest] for dest in serve} == serve
     assert list(prof)[len(serve):] == ["out", "ready_timeout_s"]
     assert prof["ready_timeout_s"][1] == 1800

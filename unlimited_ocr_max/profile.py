@@ -949,7 +949,7 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
     if shutil.which("ps") is None:
         _say("refusing: `ps` is required (install procps)")
         return EXIT_NO_PS
-    cli.check_devices_support_variant(args.weights, args.devices)
+    cli.check_devices_support_variant(args.weights, args.devices, args.max_batch_size)
     model, weight_path, revision = cli.resolve_model(args.model, args.weights, args.revision)
     out = _out_dir(args.out)
     cmd = cli.serve_command(
@@ -982,7 +982,7 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
                     _say(f"  {reason}")
                 return EXIT_GPU_BUSY
         baseline = probe.stats()
-        server = _Server(cmd, cli.serve_env(args.ngram_size), out / "serve.log", probe)
+        server = _Server(cmd, cli.serve_env(args.ngram_size, args.max_batch_size), out / "serve.log", probe)
         return _profile(args, server, out, baseline=baseline, guarded=guarded, started_utc=started_utc)
     except KeyboardInterrupt:
         if server is None or server.proc is None:

@@ -2,8 +2,18 @@
 
 ``name`` must equal ``config.json``'s ``architectures[0]`` exactly. Prefix
 caching and chunked prefill are forced off: the language graph splices the
-image embeddings at 273 placeholder rows of the whole prompt, and batch size is
-forced to 1 because the prefill graph's ``seq_len`` is static.
+image embeddings at 273 placeholder rows of the whole prompt.
+
+Batch size is ``model.serve_max_batch_size()`` (default 1): MAX applies
+``required_arguments`` over user flags, so a ``--max-batch-size`` passed
+straight to ``max serve`` would simply be overridden here, which is why the
+``unlimited-ocr-max serve``/``profile`` CLI instead carries the flag in
+through ``model.MAX_BATCH_SIZE_ENV`` -- read by both this API process and the
+model worker it spawns, which inherits the environment. A value this port
+cannot honour (CPU, an int8 checkpoint, or above ``model.MAX_BATCH_CAP``) is
+refused by ``model.check_max_batch_size`` in ``UnlimitedOCRModel.__init__``,
+not here: this dict is built at import time, before a device or a checkpoint
+is known.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ from max.pipelines.modeling.config_enums import SupportedEncoding
 from max.pipelines.modeling.types import PipelineTask
 
 from .batch_processor import BASE_SIZE, UnlimitedOcrBatchProcessor
-from .model import UnlimitedOcrArchConfig, UnlimitedOCRModel
+from .model import UnlimitedOcrArchConfig, UnlimitedOCRModel, serve_max_batch_size
 from .model_config import UnlimitedOCRConfig
 from .tokenizer import UnlimitedOcrTokenizer
 from .weight_adapters import LANGUAGE_MODEL, VISION, language_state_dict, vision_state_dict
@@ -68,7 +78,7 @@ unlimited_ocr_arch = SupportedArchitecture(
     required_arguments={
         "enable_prefix_caching": False,
         "enable_chunked_prefill": False,
-        "max_batch_size": 1,
+        "max_batch_size": serve_max_batch_size(),
     },
     config=UnlimitedOcrArchConfig,
     batching=UnlimitedOcrBatchProcessor,

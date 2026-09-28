@@ -5,7 +5,8 @@ memory planner requires an ``ArchConfigWithKVCache``, so both declare a
 deliberately empty paged cache (1 layer, 1 head, ``head_dim`` 1: 16 KiB at
 ``--max-length 2048``) that nothing reads. The real cache is
 :class:`~unlimited_ocr_max.kv_cache.KvCache`, one per in-flight request, keyed
-by request id. ``base`` mode and batch size 1 only.
+by request id. ``base`` mode only; batch size 1 unless ``--max-batch-size`` raises it, bf16 on an
+accelerator only, capped at ``MAX_BATCH_CAP``.
 """
 
 from __future__ import annotations
@@ -32,12 +33,16 @@ from .pipeline import UnlimitedOcrPipeline
 from .weight_adapters import is_int8_checkpoint
 
 __all__ = [
+    "MAX_BATCH_CAP",
+    "MAX_BATCH_SIZE_ENV",
     "NGRAM_SIZE_ENV",
     "UnlimitedOCRModel",
     "UnlimitedOcrArchConfig",
     "UnlimitedOcrInputs",
+    "check_max_batch_size",
     "hf_config_as_dict",
     "placeholder_kv_params",
+    "serve_max_batch_size",
     "serve_ngram_size",
 ]
 
@@ -55,6 +60,46 @@ def serve_ngram_size() -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{NGRAM_SIZE_ENV}={raw!r} is not an integer") from exc
+
+
+#: Internal transport, set by the ``unlimited-ocr-max serve`` CLI for the ``max serve`` child it
+#: launches: ``arch.py``'s ``required_arguments`` forces ``max_batch_size`` (MAX applies it over user
+#: flags, so a ``--max-batch-size`` passed straight to ``max serve`` would just be overridden), so
+#: this is how the CLI's flag actually reaches the architecture. Unset or blank means batch size 1,
+#: so a direct ``max serve --custom-architectures`` user gets it too.
+MAX_BATCH_SIZE_ENV = "_UNLIMITED_OCR_MAX_MAX_BATCH_SIZE"
+
+#: Above this, ``--max-batch-size`` is refused: batched decoding (a later task, bf16 on an
+#: accelerator only) is unvalidated past it.
+MAX_BATCH_CAP = 8
+
+
+def serve_max_batch_size() -> int:
+    raw = os.environ.get(MAX_BATCH_SIZE_ENV, "").strip()
+    if not raw:
+        return 1
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{MAX_BATCH_SIZE_ENV}={raw!r} is not an integer") from exc
+    if value < 1:
+        raise ValueError(f"{MAX_BATCH_SIZE_ENV}={raw!r} must be >= 1")
+    return value
+
+
+def check_max_batch_size(max_batch_size: int, *, device: DeviceRef, int8: bool) -> None:
+    """Refuse a ``--max-batch-size`` neither this device nor this checkpoint can serve.
+
+    Batched decoding is a later task, for bf16 on an accelerator only. Called once both facts are
+    known -- cheaply, and before any expensive pipeline construction."""
+    if max_batch_size <= 1:
+        return
+    if device.is_cpu():
+        raise ValueError(f"--max-batch-size {max_batch_size} needs an accelerator; the pipeline is on cpu")
+    if int8:
+        raise ValueError(f"--max-batch-size {max_batch_size} is bf16-only; this checkpoint is int8")
+    if max_batch_size > MAX_BATCH_CAP:
+        raise ValueError(f"--max-batch-size {max_batch_size} exceeds the cap of {MAX_BATCH_CAP}")
 
 
 @dataclass(kw_only=True)
@@ -173,7 +218,9 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         if self.adapter is None:
             raise ValueError("UnlimitedOCRModel needs the safetensors weight adapter registered in arch.py")
         weights = dict(self.weights.items())
-        if self._weights_are_int8(weights):
+        is_int8 = self._weights_are_int8(weights)
+        check_max_batch_size(serve_max_batch_size(), device=self.device_refs[0], int8=is_int8)
+        if is_int8:
             # The decoder the adapter checks the file against must declare the int8 stacks and their scales.
             self._arch_config.model = self._arch_config.model.with_int8_experts()
             check_int8_device(self._arch_config.decoder, self.device_refs[0])
