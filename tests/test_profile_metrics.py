@@ -16,9 +16,11 @@ import pytest
 
 from unlimited_ocr_max.profile_metrics import (
     decode_stats,
+    decode_stats_by_batch,
     levenshtein,
     memory_stats,
     parse_scheduler_log,
+    parse_tg_batch_sizes,
     prefill_stats,
     text_stats,
 )
@@ -142,6 +144,68 @@ def test_oracle_kon180_tg_values_are_all_steady() -> None:
     assert stats["n"] == 1
     assert stats["n_whole_second_excluded"] == 2
     assert stats["floor_ms"] == stats["median_ms"] == 398.94
+
+
+# --------------------------------------------------------------------------- #
+# decode stats grouped by TG batch size (KON-216)
+# --------------------------------------------------------------------------- #
+def _tg_line(batch_size: int, execution: str, creation: str = "109.25us") -> str:
+    """A synthetic (not verbatim) ``Executed TG batch`` line, only ``batch_size`` and
+    ``Execution:`` varied -- same shape as the real ``_TG_LINE_*`` fixtures above."""
+    return (
+        f"11:07:15.555 INFO: Executed TG batch with {batch_size} reqs | Terminated: 0 reqs, "
+        f"Pending: 0 reqs | Input Tokens: {batch_size}/8192 toks | Prompt Tput: 2.5 tok/s, "
+        f"Generation Tput: 2.5 tok/s | Batch creation: {creation}, Execution: {execution} | "
+        "KVCache usage: 18.8% of 16 blocks | All Preemptions: 0 reqs"
+    )
+
+
+def test_parse_tg_batch_sizes_groups_by_batch_size_across_all_three_units() -> None:
+    text = "\n".join([
+        _tg_line(1, "50.00ms"),
+        _tg_line(4, "80.00ms"),
+        _tg_line(1, "45.00ms"),
+        _tg_line(4, "0.85ms"),  # exercises ms alongside batch 4's other entry
+        _tg_line(4, "900.00us"),
+        _tg_line(1, "20.00s"),  # a per-request reload, still grouped under its own batch size
+    ])
+    parsed = parse_tg_batch_sizes(text)
+    assert parsed == {
+        1: [("ms", 50.0), ("ms", 45.0), ("s", 20000.0)],
+        4: [("ms", 80.0), ("ms", 0.85), ("us", 0.9)],
+    }
+
+
+def test_parse_tg_batch_sizes_ignores_ce_lines_and_lines_missing_the_field() -> None:
+    """A CE line never carries ``Executed TG batch``; a line with no ``N reqs`` after the marker,
+    or no ``Execution:`` field, contributes nothing -- same as ``parse_scheduler_log``."""
+    no_batch_field = "11:07:15.555 INFO: Executed TG batch | Execution: 50.00ms"
+    no_execution_field = "11:07:15.555 INFO: Executed TG batch with 1 reqs | no execution field here"
+    text = "\n".join([_CE_LINE, no_batch_field, no_execution_field, _tg_line(2, "10.00ms")])
+    assert parse_tg_batch_sizes(text) == {2: [("ms", 10.0)]}
+
+
+def test_decode_stats_by_batch_excludes_whole_second_entries_per_batch_size() -> None:
+    """Each batch size gets its own steady population and its own excluded count, exactly as
+    ``decode_stats`` computes for the un-grouped population."""
+    text = "\n".join([
+        _tg_line(1, "50.00ms"), _tg_line(1, "40.00ms"), _tg_line(1, "20.00s"),
+        _tg_line(4, "80.00ms"), _tg_line(4, "90.00ms"),
+    ])
+    stats = decode_stats_by_batch(text)
+    assert stats[1] == {"median_ms": 45.0, "floor_ms": 40.0, "n": 2, "tok_s": pytest.approx(1000.0 / 45.0),
+                        "n_whole_second_excluded": 1}
+    assert stats[4] == {"median_ms": 85.0, "floor_ms": 80.0, "n": 2, "tok_s": pytest.approx(1000.0 / 85.0),
+                        "n_whole_second_excluded": 0}
+
+
+def test_decode_stats_by_batch_drops_a_batch_size_with_no_steady_entries() -> None:
+    """A batch size logged only as whole-second reload/stall entries has no steady population to
+    summarize -- ``decode_stats`` would raise for it alone; grouped, it is just left out."""
+    text = "\n".join([_tg_line(1, "50.00ms"), _tg_line(8, "20.00s"), _tg_line(8, "21.00s")])
+    stats = decode_stats_by_batch(text)
+    assert set(stats) == {1}
+    assert stats[1]["n"] == 1
 
 
 def test_prefill_stats_skips_the_warmup_request_by_default() -> None:

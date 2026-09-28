@@ -28,9 +28,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "decode_stats",
+    "decode_stats_by_batch",
     "levenshtein",
     "memory_stats",
     "parse_scheduler_log",
+    "parse_tg_batch_sizes",
     "prefill_stats",
     "text_stats",
 ]
@@ -42,6 +44,13 @@ __all__ = [
 #: names it, so it is never a candidate.
 _LINE = re.compile(
     r"Executed (?P<stage>CE|TG) batch\b.*?Execution:\s*(?P<value>[0-9.]+)(?P<unit>us|ms|s)\b"
+)
+
+#: Like ``_LINE``, but only ``TG`` lines, and it also captures the batch size MAX logs right on
+#: the marker (``Executed TG batch with <N> reqs``) -- a real scheduler log always logs it, but a
+#: line missing the field (or the ``Execution:`` field) contributes nothing, same as ``_LINE``.
+_TG_BATCH_LINE = re.compile(
+    r"Executed TG batch with (?P<batch_size>\d+) reqs\b.*?Execution:\s*(?P<value>[0-9.]+)(?P<unit>us|ms|s)\b"
 )
 
 _TO_MS = {"us": 1e-3, "ms": 1.0, "s": 1e3}
@@ -92,6 +101,43 @@ def decode_stats(tg: Sequence[tuple[str, float]]) -> dict:
         "n": len(steady),
         "tok_s": 1000.0 / median_ms,
         "n_whole_second_excluded": n_excluded,
+    }
+
+
+def parse_tg_batch_sizes(text: str) -> dict[int, list[tuple[str, float]]]:
+    """Every ``Executed TG batch with N reqs ... Execution:`` line, grouped by ``N`` (the batch
+    size the scheduler served that step with), each entry as ``(unit, ms)`` in log order -- the
+    batch-size-aware sibling of :func:`parse_scheduler_log`, whose own return shape is unchanged
+    for its existing callers. A ``TG`` line missing the ``N reqs`` field or the ``Execution:``
+    field contributes nothing, the same as :func:`parse_scheduler_log` does for a line missing
+    ``Execution:``.
+    """
+    out: dict[int, list[tuple[str, float]]] = {}
+    for line in text.splitlines():
+        match = _TG_BATCH_LINE.search(line)
+        if match is None:
+            continue
+        unit = match.group("unit")
+        ms = float(match.group("value")) * _TO_MS[unit]
+        out.setdefault(int(match.group("batch_size")), []).append((unit, ms))
+    return out
+
+
+def decode_stats_by_batch(text: str) -> dict[int, dict]:
+    """:func:`decode_stats` computed separately for every ``TG`` batch size found in ``text`` (a
+    scheduler log), keyed by that size -- so a batching server's decode step time can be compared
+    batch size by batch size, not just averaged across all of them.
+
+    Whole-second entries are excluded from each batch size's statistics and counted, exactly as
+    :func:`decode_stats` does for the un-grouped population. A batch size whose every entry is a
+    whole-second reload/stall contributes no key -- its steady population is empty, same as
+    :func:`decode_stats` raising ``ValueError`` for that case, just swallowed here per key instead
+    of raised for the whole result.
+    """
+    return {
+        batch_size: decode_stats(entries)
+        for batch_size, entries in parse_tg_batch_sizes(text).items()
+        if any(unit != "s" for unit, _ in entries)
     }
 
 

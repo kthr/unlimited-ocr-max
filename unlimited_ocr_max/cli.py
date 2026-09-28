@@ -164,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="new or empty directory for profile.json, serve.log and pages/ (default: ./unlimited-ocr-max-profile-<UTC time>)")
     prof.add_argument("--ready-timeout-s", type=float, default=1800, metavar="SECONDS",
                       help="how long the server may take to come up; a cold kernel compile takes minutes (default: %(default)s)")
+    prof.add_argument("--concurrency", type=int, default=None, metavar="N",
+                      help="requests kept in flight while sending the 12-page corpus, 1..--max-batch-size "
+                           "(default: --max-batch-size)")
     prof.set_defaults(func=cmd_profile)
     return ap
 

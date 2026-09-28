@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import concurrent.futures
 import datetime as dt
 import http.client
 import importlib.metadata
@@ -555,6 +556,119 @@ def _stream_chat(port: int, png: bytes, max_tokens: int) -> Exchange:
     return exchange
 
 
+def _send_pages(port: int, log_path: Path, out: Path, pages: list[str],
+                concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """Send ``pages``, keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight.
+
+    At ``concurrency`` 1 this is :func:`_send_pages_sequential`: one request after another, on
+    this thread, with no executor at all -- byte-identical to how ``profile`` sent pages before
+    concurrency existed, Ctrl-C included. Above 1 it is :func:`_send_pages_concurrent`.
+    """
+    if concurrency == 1:
+        return _send_pages_sequential(port, log_path, out, pages)
+    return _send_pages_concurrent(port, log_path, out, pages, concurrency)
+
+
+def _send_pages_sequential(port: int, log_path: Path, out: Path,
+                           pages: list[str]) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """One request after another, on this thread -- no executor, no worker thread. A failure voids
+    the run and stops further sending; an interrupt (Ctrl-C/SIGTERM/SIGHUP) is not caught here at
+    all, so it propagates the instant it is raised, exactly as it did before concurrency existed.
+    """
+    exchanges: dict[str, Exchange] = {}
+    busy: list[tuple[float, float]] = []
+    void: list[str] = []
+    for page in pages:
+        t_start = time.monotonic()
+        try:
+            exchange = _stream_chat(port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
+        except ExchangeFailed as e:
+            busy.append((t_start, time.monotonic()))
+            void.append(f"request {page} failed: {e}")
+            _say(void[-1])
+            _print_log_tail(log_path)
+            break
+        busy.append((exchange.t_start, exchange.t_end))
+        exchanges[page] = exchange
+        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
+        _say(f"{page}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+    return exchanges, busy, void
+
+
+def _send_pages_concurrent(port: int, log_path: Path, out: Path, pages: list[str],
+                           concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """Send ``pages`` keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight at
+    once (a thread per in-flight exchange). Every result is read back and every write happens on
+    this thread, never on a worker thread, so none of the state below needs a lock.
+
+    Returns ``(exchanges keyed by page, busy intervals, void reasons)`` -- the same shapes the
+    sequential sender uses, so its overlapping ``busy`` intervals still feed :func:`memory_stats`
+    correctly (a sample is excluded if it falls in *any* busy window, overlapping or not).
+
+    The first :class:`ExchangeFailed` stops further submissions -- voiding the run, as a failure
+    always has -- but whatever was already in flight is still waited for (in the loop below, not
+    the ``except``) and recorded, so a failure in one thread never leaves a sibling unreported;
+    this never raises out of the loop.
+
+    An actual interrupt (``KeyboardInterrupt``, ``SystemExit`` from SIGTERM/SIGHUP) or a genuine
+    bug is different: a worker's :func:`_stream_chat` is not interrupted by the signal that raised
+    it here -- only this thread sees it -- so waiting for one to finish on its own could block for
+    up to ``REQUEST_TIMEOUT_S``. Instead the pool is shut down without waiting and with pending
+    futures cancelled, and the exception is re-raised at once: the outer teardown kills the
+    server's process group right after, which breaks every in-flight request's socket and ends
+    the worker threads, without this function waiting on them.
+    """
+    exchanges: dict[str, Exchange] = {}
+    busy: list[tuple[float, float]] = []
+    void: list[str] = []
+    pending = list(pages)
+    in_flight: dict[concurrent.futures.Future[Exchange], tuple[str, float]] = {}
+    tail_printed = False
+
+    def _finish(future: concurrent.futures.Future[Exchange], page: str) -> None:
+        exchange = future.result()
+        busy.append((exchange.t_start, exchange.t_end))
+        exchanges[page] = exchange
+        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
+        _say(f"{page}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+
+    def _voided(page: str, t_start: float, error: ExchangeFailed) -> None:
+        nonlocal tail_printed
+        busy.append((t_start, time.monotonic()))
+        void.append(f"request {page} failed: {error}")
+        _say(void[-1])
+        if not tail_printed:
+            _print_log_tail(log_path)
+            tail_printed = True
+
+    def _fill(pool: concurrent.futures.ThreadPoolExecutor) -> None:
+        while not void and pending and len(in_flight) < concurrency:
+            page = pending.pop(0)
+            t_start = time.monotonic()
+            future = pool.submit(_stream_chat, port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
+            in_flight[future] = (page, t_start)
+
+    # Not a `with` block: `ThreadPoolExecutor.__exit__` calls `shutdown(wait=True)` unconditionally,
+    # which would wait for in-flight workers on the way out of the `except` below too.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        _fill(pool)
+        while in_flight:
+            done, _ = concurrent.futures.wait(list(in_flight), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                page, t_start = in_flight.pop(future)
+                try:
+                    _finish(future, page)
+                except ExchangeFailed as e:
+                    _voided(page, t_start, e)
+            _fill(pool)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)  # nothing is left in flight here, so this returns at once
+    return exchanges, busy, void
+
+
 def _wait_ready(server: _Server, port: int, timeout_s: float) -> str | None:
     """``None`` once ``/v1/models`` lists the served model, else why it never did."""
     deadline = time.monotonic() + timeout_s
@@ -822,6 +936,32 @@ def _text(text_by_variant: dict[str, dict[str, Any]], variant: str, n_done: int,
     return {key: value for key, value in text_by_variant[variant].items() if key != "pages"}
 
 
+def _concurrency_figure(exchanges: dict[str, Exchange], concurrency: int, max_batch_size: int, log: str) -> dict[str, Any]:
+    """Aggregate throughput, per-request latency and per-batch-size decode step time over the page
+    exchanges -- what both :func:`row` (when ``concurrency`` is above 1) and ``profile.json``'s
+    ``concurrency`` figure report.
+
+    ``tok_s`` is every completed page's completion tokens summed, divided by the span from the
+    first page's start to the last page's end -- the aggregate this run actually achieved, not a
+    single request's rate. ``latency_median_s`` is the median of each page's own wall time.
+    ``by_batch_size`` is :func:`profile_metrics.decode_stats_by_batch` over the same scheduler log
+    :func:`_scheduler_figures` already parsed.
+    """
+    if not exchanges:
+        raise ValueError("no page completed")
+    total_tokens = sum(e.completion_tokens or 0 for e in exchanges.values())
+    span = max(e.t_end for e in exchanges.values()) - min(e.t_start for e in exchanges.values())
+    if span <= 0:
+        raise ValueError("the first page's start and the last page's end are not far enough apart to rate")
+    return {
+        "n": concurrency,
+        "max_batch_size": max_batch_size,
+        "tok_s": total_tokens / span,
+        "latency_median_s": statistics.median(e.wall_s for e in exchanges.values()),
+        "by_batch_size": profile_metrics.decode_stats_by_batch(log),
+    }
+
+
 def _gib(n: int) -> str:
     return f"{n / _GIB:.1f}"
 
@@ -866,17 +1006,31 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
     The memory cell is the server's device memory where it was measured (a discrete GPU); else its
     physical footprint where that was sampled (macOS: host and Metal allocations, clean page cache
     excluded -- see :func:`host_memory_figure`); else its host RSS. Device memory from a device
-    sampler that stopped mid-run is marked ``(partial)``."""
+    sampler that stopped mid-run is marked ``(partial)``.
+
+    The decode cell is unchanged at ``concurrency`` 1 (or when the figure never got computed): the
+    single-request decode rate and step time. Above 1, it instead leads with the run's aggregate
+    tok/s -- what concurrent clients actually achieved -- and names the concurrency, keeping the
+    decode step time and count from the same steady population as before.
+    """
     decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
+    concurrency = figures.get("concurrency")
     if device_memory:
         memory = f"device {_memory_cell(device_memory)}" + (" (partial)" if device_memory.get("partial") else "")
     else:
         memory = _memory_cell(host_memory_figure(figures)[1])
+    if decode and concurrency and concurrency["n"] > 1:
+        decode_cell = (f"**{concurrency['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, "
+                       f"n={decode['n']}, concurrency {concurrency['n']})")
+    elif decode:
+        decode_cell = f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})"
+    else:
+        decode_cell = "—"
     cells = [
         hardware,
         weights,
         status,
-        f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})" if decode else "—",
+        decode_cell,
         f"{prefill['median_s']:.2f} s" if prefill else "—",
         memory,
         _text_cell(figures.get("text")),
@@ -916,6 +1070,18 @@ def _page_rows(pages: list[str], exchanges: dict[str, Exchange],
 # --------------------------------------------------------------------------- #
 # the command
 # --------------------------------------------------------------------------- #
+def _resolve_concurrency(max_batch_size: int, concurrency: int | None) -> int:
+    """``--concurrency``, defaulting to ``--max-batch-size`` when ``None``; refused up front, the
+    same ``SystemExit`` style ``cli.check_devices_support_variant`` uses for a bad
+    ``--max-batch-size``, before the server starts."""
+    resolved = max_batch_size if concurrency is None else concurrency
+    if resolved < 1:
+        raise SystemExit(f"--concurrency {resolved} must be >= 1")
+    if resolved > max_batch_size:
+        raise SystemExit(f"--concurrency {resolved} exceeds --max-batch-size {max_batch_size}")
+    return resolved
+
+
 def _out_dir(out: Path | None) -> Path:
     if out is None:
         out = Path(f"unlimited-ocr-max-profile-{dt.datetime.now(dt.UTC).strftime('%Y%m%dT%H%M%SZ')}")
@@ -950,6 +1116,7 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
         _say("refusing: `ps` is required (install procps)")
         return EXIT_NO_PS
     cli.check_devices_support_variant(args.weights, args.devices, args.max_batch_size)
+    concurrency = _resolve_concurrency(args.max_batch_size, args.concurrency)
     model, weight_path, revision = cli.resolve_model(args.model, args.weights, args.revision)
     out = _out_dir(args.out)
     cmd = cli.serve_command(
@@ -983,7 +1150,8 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
                 return EXIT_GPU_BUSY
         baseline = probe.stats()
         server = _Server(cmd, cli.serve_env(args.ngram_size, args.max_batch_size), out / "serve.log", probe)
-        return _profile(args, server, out, baseline=baseline, guarded=guarded, started_utc=started_utc)
+        return _profile(args, server, out, baseline=baseline, guarded=guarded, started_utc=started_utc,
+                        concurrency=concurrency)
     except KeyboardInterrupt:
         if server is None or server.proc is None:
             _say("interrupted")
@@ -1000,7 +1168,7 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
 
 
 def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: dict[str, dict[str, int]],
-             guarded: bool, started_utc: str) -> int:
+             guarded: bool, started_utc: str, concurrency: int) -> int:
     pages = profile_corpus.page_names()
     (out / "pages").mkdir(parents=True)
     exchanges: dict[str, Exchange] = {}
@@ -1028,27 +1196,23 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
                 ready_s = time.monotonic() - t_spawn
                 _say(f"ready after {ready_s:.1f} s")
 
-                for label, page, max_tokens in [("warmup", pages[0], WARMUP_MAX_TOKENS)] + [
-                    (page, page, PAGE_MAX_TOKENS) for page in pages
-                ]:
-                    t_start = time.monotonic()
-                    try:
-                        exchange = _stream_chat(args.port, profile_corpus.page_png(page), max_tokens)
-                    except ExchangeFailed as e:
-                        busy.append((t_start, time.monotonic()))
-                        void.append(f"request {label} failed: {e}")
-                        _say(void[-1])
-                        _print_log_tail(server.log_path)
-                        break
-                    busy.append((exchange.t_start, exchange.t_end))
-                    if label == "warmup":
-                        warmup = exchange
-                        # The pages' swap baseline: loading and compiling have paged by now, if at all.
-                        swap_warm, swap_warm_error = _swap_now("at the warmup's end")
-                    else:
-                        exchanges[page] = exchange
-                        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
-                    _say(f"{label}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+                # The warmup is always sequential and alone -- concurrency is only for the 12 pages.
+                t_start = time.monotonic()
+                try:
+                    warmup = _stream_chat(args.port, profile_corpus.page_png(pages[0]), WARMUP_MAX_TOKENS)
+                except ExchangeFailed as e:
+                    busy.append((t_start, time.monotonic()))
+                    void.append(f"request warmup failed: {e}")
+                    _say(void[-1])
+                    _print_log_tail(server.log_path)
+                else:
+                    busy.append((warmup.t_start, warmup.t_end))
+                    # The pages' swap baseline: loading and compiling have paged by now, if at all.
+                    swap_warm, swap_warm_error = _swap_now("at the warmup's end")
+                    _say(f"warmup: {warmup.completion_tokens} tokens in {warmup.wall_s:.1f} s")
+                    exchanges, page_busy, page_void = _send_pages(args.port, server.log_path, out, pages, concurrency)
+                    busy += page_busy
+                    void += page_void
 
                 if not void:
                     time.sleep(STEADY_DWELL_S)
@@ -1071,7 +1235,7 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
     void += server.void
     return _report(args, server, out, pages, exchanges, warmup, busy, void, baseline=baseline, guarded=guarded,
                    ready_s=ready_s, started_utc=started_utc, swap_start=swap_start, swap_start_error=swap_start_error,
-                   swap_warm=swap_warm, swap_warm_error=swap_warm_error)
+                   swap_warm=swap_warm, swap_warm_error=swap_warm_error, concurrency=concurrency)
 
 
 def _swap_now(when: str) -> tuple[int | None, str | None]:
@@ -1153,7 +1317,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
             warmup: Exchange | None, busy: list[tuple[float, float]], void: list[str], *,
             baseline: dict[str, dict[str, int]], guarded: bool, ready_s: float | None, started_utc: str,
             swap_start: int | None, swap_start_error: str | None,
-            swap_warm: int | None, swap_warm_error: str | None) -> int:
+            swap_warm: int | None, swap_warm_error: str | None, concurrency: int) -> int:
     sampler = server.sampler
     assert sampler is not None
     rss = list(sampler.rss)
@@ -1168,7 +1332,9 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     text_by_variant = _text_stats_by_variant(refs, responses, done)
 
     figures = _Figures()
-    _scheduler_figures(figures, server.log_path.read_bytes().decode("utf-8", "replace"))
+    log_text = server.log_path.read_bytes().decode("utf-8", "replace")
+    _scheduler_figures(figures, log_text)
+    figures.compute("concurrency", lambda: _concurrency_figure(exchanges, concurrency, args.max_batch_size, log_text))
     figures.compute("host_memory", lambda: _memory(
         rss, busy, steady_after, empty="no host RSS samples", figures=figures, name="host_memory"))
     if profile_sampling.FOOTPRINT_SUPPORTED:
