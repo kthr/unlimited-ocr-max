@@ -222,6 +222,76 @@ def test_sampler_on_a_real_child_records_rss_with_no_device_available() -> None:
             probe.close()
 
 
+macos_only = pytest.mark.skipif(not profile_sampling.FOOTPRINT_SUPPORTED, reason="physical footprint is macOS-only")
+
+
+@macos_only
+def test_phys_footprint_counts_dirty_memory_a_child_touches() -> None:
+    """A real child that dirties 256 MiB shows it in its footprint; a gone pid reads ``None``."""
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import time; b = bytearray(256 << 20); [b.__setitem__(i, 1) for i in range(0, len(b), 16384)]; "
+         "print('ready', flush=True); time.sleep(30)"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert child.stdout is not None and child.stdout.readline().strip() == "ready"
+        footprint = profile_sampling.phys_footprint_bytes(child.pid)
+        assert footprint is not None and footprint >= 256 << 20
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+    assert profile_sampling.phys_footprint_bytes(child.pid) is None  # reaped: ESRCH
+
+
+def test_phys_footprint_refuses_off_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off macOS there is no such counter: the call raises instead of reporting 0."""
+    monkeypatch.setattr(profile_sampling, "FOOTPRINT_SUPPORTED", False)
+    with pytest.raises(OSError, match="not readable"):
+        profile_sampling.phys_footprint_bytes(os.getpid())
+
+
+@macos_only
+def test_sampler_footprint_is_the_sum_over_tree_pids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each footprint sample is the sum over the tick's tree pids; a pid gone mid-tick (``None``) counts 0."""
+    child = subprocess.Popen(["sleep", "5"])
+    monkeypatch.setattr(profile_sampling, "phys_footprint_bytes", lambda pid: 7_000 if pid == child.pid else None)
+    try:
+        with Sampler(child.pid, _FakeProbe(per_pid={}), interval_s=0.05) as sampler:
+            assert _poll_until(lambda: len(sampler.footprint) >= 2)
+        assert all(value == 7_000 for _, value in sampler.footprint)
+        assert sampler.footprint_error is None
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
+@macos_only
+def test_sampler_footprint_failure_stops_footprint_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A footprint read that fails is recorded once and stops footprint sampling; RSS keeps going."""
+    child = subprocess.Popen(["sleep", "5"])
+    calls = {"n": 0}
+
+    def flaky(pid: int) -> int:
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise OSError(1, "proc_pid_rusage: Operation not permitted")
+        return 1
+
+    monkeypatch.setattr(profile_sampling, "phys_footprint_bytes", flaky)
+    try:
+        with Sampler(child.pid, _FakeProbe(per_pid={}), interval_s=0.05) as sampler:
+            assert _poll_until(lambda: sampler.footprint_error is not None)
+            at_failure = len(sampler.footprint)
+            assert _poll_until(lambda: len(sampler.rss) >= at_failure + 3)
+        assert "Operation not permitted" in sampler.footprint_error
+        assert len(sampler.footprint) == at_failure == 2
+        assert len(sampler.rss) > at_failure
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+
+
 def test_sampler_device_process_is_the_sum_over_tree_pids() -> None:
     """.device_process values equal Σ over the sampled tree's pids, from the fake probe's own map."""
     child = subprocess.Popen(["sleep", "5"])

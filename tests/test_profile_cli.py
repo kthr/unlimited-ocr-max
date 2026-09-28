@@ -625,8 +625,15 @@ def test_a_cpu_run_never_consults_the_gpu_process_list_and_reports_no_device_fig
     assert doc["sampling"]["device_samples"] > 0  # sampled, and deliberately not reported
     for name in ("device_memory", "gpu_utilisation"):
         assert doc["figures"][name] is None and doc["unavailable"][name] == "--devices cpu"
+    # The memory figure is the physical footprint on macOS, sampled for real over the stub's tree.
+    if profile_sampling.FOOTPRINT_SUPPORTED:
+        assert doc["sampling"]["footprint_samples"] > 0 and doc["sampling"]["footprint_error"] is None
+        assert doc["figures"]["host_footprint"]["peak_bytes"] > 0
+    else:
+        assert doc["figures"]["host_footprint"] is None
+        assert "macOS only" in doc["unavailable"]["host_footprint"]
     lines = captured.out.splitlines()
-    assert _cells(lines[0])[5] == profile._memory_cell(doc["figures"]["host_memory"])  # host RSS, not "device ..."
+    assert _cells(lines[0])[5] == profile._memory_cell(profile.host_memory_figure(doc["figures"])[1])  # host RSS, not "device ..."
     assert lines[1:] == [f"profile.json: {out / 'profile.json'}"]
 
 
@@ -663,7 +670,8 @@ def test_a_foreign_gpu_process_found_after_the_run_voids_it(
     cells = _cells(lines[0])
     assert cells[2] == "void, 12 pages"
     assert cells[5] == "device 3.0 / 3.0 GiB"
-    assert lines[1] == (f"host RSS peak / steady {profile._memory_cell(doc['figures']['host_memory'])}, "
+    assert lines[1] == (f"host {profile.host_memory_figure(doc['figures'])[0]} peak / steady "
+                        f"{profile._memory_cell(profile.host_memory_figure(doc['figures'])[1])}, "
                         "median GPU utilisation 40 %")
     assert lines[2] == f"void: {doc['void'][0]}"
     assert probe.closed
@@ -1097,7 +1105,8 @@ def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row
     assert doc["figures"]["host_memory"] is not None  # JSON keeps both memories
     lines = captured.out.splitlines()
     assert _cells(lines[0])[5] == "device 3.0 / 3.0 GiB"
-    assert lines[1] == (f"host RSS peak / steady {profile._memory_cell(doc['figures']['host_memory'])}, "
+    assert lines[1] == (f"host {profile.host_memory_figure(doc['figures'])[0]} peak / steady "
+                        f"{profile._memory_cell(profile.host_memory_figure(doc['figures'])[1])}, "
                         "median GPU utilisation 90 %")
 
 
@@ -1154,7 +1163,7 @@ def test_device_sampling_that_fails_before_its_first_sample_is_said_not_silent(
     assert doc["unavailable"]["device_memory"] == "no per-process device memory sampled on this host" + stopped
     assert doc["unavailable"]["gpu_utilisation"] == "no device statistics sampled on this host" + stopped
     lines = captured.out.splitlines()
-    assert _cells(lines[0])[5] == profile._memory_cell(doc["figures"]["host_memory"])
+    assert _cells(lines[0])[5] == profile._memory_cell(profile.host_memory_figure(doc["figures"])[1])
     assert lines[1:] == ["note: device sampling stopped: the device went away; no device figures",
                          f"profile.json: {out / 'profile.json'}"]
 
@@ -1184,11 +1193,11 @@ def test_gpu_utilisation_without_device_memory_is_still_printed(
     assert doc["figures"]["device_memory"] is None
     assert doc["unavailable"]["device_memory"] == "no per-process device memory sampled on this host"
     lines = captured.out.splitlines()
-    assert _cells(lines[0])[5] == profile._memory_cell(doc["figures"]["host_memory"])  # host RSS, not "device ..."
+    assert _cells(lines[0])[5] == profile._memory_cell(profile.host_memory_figure(doc["figures"])[1])  # host RSS, not "device ..."
     assert lines[1:] == ["median GPU utilisation 40 %", f"profile.json: {out / 'profile.json'}"]
 
 
-def test_the_row_memory_cell_is_device_memory_where_it_was_measured_else_host_rss() -> None:
+def test_the_row_memory_cell_is_device_memory_else_physical_footprint_else_host_rss() -> None:
     host = {"peak_bytes": 2 * GIB, "steady_min_bytes": GIB, "steady_max_bytes": GIB}
     device = {"peak_bytes": 3 * GIB, "steady_min_bytes": GIB * 5 // 2, "steady_max_bytes": GIB * 5 // 2,
               "partial": False}
@@ -1196,9 +1205,21 @@ def test_the_row_memory_cell_is_device_memory_where_it_was_measured_else_host_rs
     partial = profile.row("hw", "bf16", "profiled, 12 pages",
                           {"host_memory": host, "device_memory": {**device, "partial": True}})
     metal_or_cpu = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": None})
+    footprint = {"peak_bytes": 4 * GIB, "steady_min_bytes": 3 * GIB, "steady_max_bytes": 3 * GIB}
+    macos = profile.row("hw", "bf16", "profiled, 12 pages",
+                        {"host_memory": host, "host_footprint": footprint, "device_memory": None})
+    macos_discrete = profile.row("hw", "bf16", "profiled, 12 pages",
+                                 {"host_memory": host, "host_footprint": footprint, "device_memory": device})
     assert _cells(discrete)[5] == "device 3.0 / 2.5 GiB"
     assert _cells(partial)[5] == "device 3.0 / 2.5 GiB (partial)"
     assert _cells(metal_or_cpu)[5] == "2.0 / 1.0 GiB"
+    # macOS: the physical footprint (Metal allocations in, clean page cache out) wins over RSS...
+    assert _cells(macos)[5] == "4.0 / 3.0 GiB"
+    assert profile.host_memory_figure({"host_memory": host, "host_footprint": footprint}) == (
+        "physical footprint", footprint)
+    # ...but never over device memory measured on a discrete GPU.
+    assert _cells(macos_discrete)[5] == "device 3.0 / 2.5 GiB"
+    assert profile.host_memory_figure({"host_memory": host, "host_footprint": None}) == ("RSS", host)
 
 
 def _requests_seen(stub: Stub) -> int:

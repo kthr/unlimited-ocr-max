@@ -847,18 +847,31 @@ def _text_cell(text: dict[str, Any] | None) -> str:
     return f"{text['identical']}/{text['n']} byte-identical, CER {_cer(text['cer'])}"
 
 
+def host_memory_figure(figures: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """``(label, figure)`` for the server's host memory: its physical footprint where sampled, else RSS.
+
+    On Apple silicon RSS is the wrong number in both directions -- it leaves out every Metal
+    allocation (on unified memory, the weights and graphs) and counts clean file-backed pages
+    such as the mmap'd checkpoint -- so the footprint wins wherever it exists.
+    """
+    if figures.get("host_footprint"):
+        return "physical footprint", figures["host_footprint"]
+    return "RSS", figures.get("host_memory")
+
+
 def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> str:
     """One row in the README's column order:
     ``| hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |``.
 
-    The memory cell is the server's device memory where it was measured (a discrete GPU), else
-    its host RSS (Metal, where device memory is host memory, and CPU); device memory from a
-    device sampler that stopped mid-run is marked ``(partial)``."""
+    The memory cell is the server's device memory where it was measured (a discrete GPU); else its
+    physical footprint where that was sampled (macOS: host and Metal allocations, clean page cache
+    excluded -- see :func:`host_memory_figure`); else its host RSS. Device memory from a device
+    sampler that stopped mid-run is marked ``(partial)``."""
     decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
     if device_memory:
         memory = f"device {_memory_cell(device_memory)}" + (" (partial)" if device_memory.get("partial") else "")
     else:
-        memory = _memory_cell(figures.get("host_memory"))
+        memory = _memory_cell(host_memory_figure(figures)[1])
     cells = [
         hardware,
         weights,
@@ -1158,6 +1171,15 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     _scheduler_figures(figures, server.log_path.read_bytes().decode("utf-8", "replace"))
     figures.compute("host_memory", lambda: _memory(
         rss, busy, steady_after, empty="no host RSS samples", figures=figures, name="host_memory"))
+    if profile_sampling.FOOTPRINT_SUPPORTED:
+        footprint = list(sampler.footprint)
+        stopped = f" (footprint sampling stopped: {sampler.footprint_error})" if sampler.footprint_error else ""
+        figures.compute("host_footprint", lambda: _memory(
+            footprint, busy, steady_after, empty="no physical-footprint samples" + stopped, figures=figures,
+            name="host_footprint"))
+    else:
+        figures.values["host_footprint"] = None
+        figures.unavailable["host_footprint"] = f"physical footprint is sampled on macOS only, not {sys.platform}"
     _device_figures(figures, args, sampler, baseline=baseline, busy=busy, steady_after=steady_after,
                     page_windows=page_windows)
     for variant, name in (("bf16", "text"), ("int8", "text_vs_int8")):
@@ -1191,6 +1213,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         "sampling": {
             "interval_s": sampler.interval_s, "host_samples": len(rss), "device_samples": len(sampler.device_stats),
             "device_error": sampler.device_error, "swap_samples": len(sampler.swap),
+            "footprint_samples": len(sampler.footprint), "footprint_error": sampler.footprint_error,
         },
         "swap": swap,
         "warmup": warmup.summary() if warmup is not None else None,
@@ -1205,8 +1228,9 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     device_memory, utilisation = figures.values.get("device_memory"), figures.values.get("gpu_utilisation")
     if device_memory is not None or utilisation is not None:
         device_line = "median GPU utilisation " + (f"{utilisation['median_percent']:.0f} %" if utilisation else "—")
-        if device_memory is not None:  # the row's memory cell is the device's: host RSS goes here
-            device_line = f"host RSS peak / steady {_memory_cell(figures.values.get('host_memory'))}, {device_line}"
+        if device_memory is not None:  # the row's memory cell is the device's: host memory goes here
+            label, host = host_memory_figure(figures.values)
+            device_line = f"host {label} peak / steady {_memory_cell(host)}, {device_line}"
         if sampler.device_error is not None:
             device_line += f" (partial: device sampling stopped: {sampler.device_error})"
         print(device_line)

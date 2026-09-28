@@ -12,6 +12,14 @@ samples are unstamped. Hence :func:`process_tree` (parent/child links, one
 tick also records the system's swap in use (:func:`swap_used_bytes`), so a
 run whose timings were taken while the host was paging can say so.
 
+On macOS the tick also sums the tree's **physical footprint**
+(:func:`phys_footprint_bytes`). That, not RSS, is the memory figure on Apple
+silicon: ``ps`` RSS leaves out every Metal allocation -- on unified memory the
+model's weights and graphs -- and counts clean file-backed pages such as the
+mmap'd checkpoint, so it moves with the host's free RAM rather than with the
+server. The footprint is the kernel's own per-process accounting, the number
+``footprint`` and ``vmmap`` print as "Physical footprint".
+
 The owner's rule for device sampling: *"the measurement is only doable if
 there are no other processes running on the GPU."* :func:`foreign_gpu_processes`
 is the guard that rule needs -- it lists every compute process on any GPU
@@ -30,6 +38,9 @@ and monkeypatching rather than real hardware.
 
 from __future__ import annotations
 
+import ctypes
+import errno
+import functools
 import json
 import os
 import re
@@ -46,11 +57,64 @@ __all__ = [
     "GpuProcessListUnavailable",
     "Sampler",
     "descendants",
+    "FOOTPRINT_SUPPORTED",
     "foreign_gpu_processes",
     "open_device_probe",
+    "phys_footprint_bytes",
     "process_tree",
     "swap_used_bytes",
 ]
+
+#: Whether :func:`phys_footprint_bytes` can answer on this platform.
+FOOTPRINT_SUPPORTED = sys.platform == "darwin"
+
+
+class _RusageInfoV2(ctypes.Structure):
+    """``struct rusage_info_v2`` from ``<sys/resource.h>``: a 16-byte uuid, then 18 ``uint64_t``."""
+
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups", "ri_interrupt_wkups", "ri_pageins",
+            "ri_wired_size", "ri_resident_size", "ri_phys_footprint", "ri_proc_start_abstime",
+            "ri_proc_exit_abstime", "ri_child_user_time", "ri_child_system_time", "ri_child_pkg_idle_wkups",
+            "ri_child_interrupt_wkups", "ri_child_pageins", "ri_child_elapsed_abstime", "ri_diskio_bytesread",
+            "ri_diskio_byteswritten",
+        )
+    ]
+
+
+_RUSAGE_INFO_V2 = 2
+
+
+@functools.cache
+def _proc_pid_rusage() -> Any:
+    """libproc's ``proc_pid_rusage``, bound on first use (libSystem is always loaded on macOS)."""
+    fn = ctypes.CDLL(None, use_errno=True).proc_pid_rusage
+    fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(_RusageInfoV2)]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def phys_footprint_bytes(pid: int) -> int | None:
+    """``pid``'s physical footprint in bytes (macOS only), or ``None`` if the process is gone.
+
+    ``proc_pid_rusage(pid, RUSAGE_INFO_V2).ri_phys_footprint`` -- what ``footprint``
+    and ``vmmap`` report as "Physical footprint": the process's dirty and
+    compressed memory, Metal allocations included, and none of its clean
+    file-backed pages. Readable for the caller's own processes without
+    privileges. Raises :class:`OSError` for any failure other than ESRCH, and on
+    a platform without it (:data:`FOOTPRINT_SUPPORTED`).
+    """
+    if not FOOTPRINT_SUPPORTED:
+        raise OSError(f"physical footprint is not readable on {sys.platform}")
+    info = _RusageInfoV2()
+    if _proc_pid_rusage()(pid, _RUSAGE_INFO_V2, ctypes.byref(info)) != 0:
+        err = ctypes.get_errno()
+        if err == errno.ESRCH:
+            return None
+        raise OSError(err, f"proc_pid_rusage({pid}): {os.strerror(err)}")
+    return int(info.ri_phys_footprint)
 
 
 def descendants(children: dict[int, list[int]], root: int) -> set[int]:
@@ -537,14 +601,17 @@ class Sampler:
     RSS bytes) and every pid seen to :attr:`pids_seen`. When ``probe.device_available``,
     it also appends to :attr:`device_process` (``probe.process_bytes`` over the
     tree's pids) and :attr:`device_stats` (``probe.stats()``). Every tick also
-    appends the system's swap in use (:func:`swap_used_bytes`) to :attr:`swap`.
+    appends the system's swap in use (:func:`swap_used_bytes`) to :attr:`swap`,
+    and, on macOS, the tree's summed physical footprint to :attr:`footprint`
+    (a pid that exits between the ``ps`` call and its read counts 0).
 
     A ``ps`` failure on a single tick is skipped (RSS sampling just continues
     on the next tick). A device-probe exception is recorded once, as a string,
     in :attr:`device_error`, and device sampling stops for the rest of the run
     -- RSS sampling is unaffected. A swap read that fails is recorded the same
-    way, in :attr:`swap_error`, and stops swap sampling only. The background
-    thread never raises into the caller.
+    way, in :attr:`swap_error`, and stops swap sampling only; so does a failed
+    footprint read, in :attr:`footprint_error`. The background thread never
+    raises into the caller.
 
     :meth:`stop` is bounded: it never waits longer than
     ``max(5.0, 10 * interval_s)`` for the thread to finish, even if a tick is
@@ -566,6 +633,8 @@ class Sampler:
         self.device_error: str | None = None
         self.swap: list[tuple[float, int]] = []
         self.swap_error: str | None = None
+        self.footprint: list[tuple[float, int]] = []
+        self.footprint_error: str | None = None
         self.stop_timed_out = False
 
         self._device_ok = True
@@ -617,6 +686,7 @@ class Sampler:
         pids = list(tree.keys())
         self.pids_seen.update(pids)
         self.rss.append((now, sum(tree.values())))
+        self._sample_footprint(now, pids)
 
         if self._device_ok and self.probe.device_available:
             try:
@@ -632,6 +702,16 @@ class Sampler:
                 # leave a process_bytes sample with no matching stats sample).
                 self.device_process.append((now, process_bytes))
                 self.device_stats.append((now, stats))
+
+    def _sample_footprint(self, now: float, pids: list[int]) -> None:
+        if not FOOTPRINT_SUPPORTED or self.footprint_error is not None:
+            return
+        try:
+            total = sum(phys_footprint_bytes(pid) or 0 for pid in pids)
+        except Exception as e:
+            self.footprint_error = str(e) or type(e).__name__
+            return
+        self.footprint.append((now, total))
 
     def _sample_swap(self) -> None:
         if self.swap_error is not None:
