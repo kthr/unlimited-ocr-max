@@ -453,3 +453,138 @@ def test_device_resident_registry_is_bitwise_equal_to_plain_load(
         f"registry-bound graph moved the bits: max abs diff "
         f"{float(np.max(np.abs(plain.astype(np.float64) - resident.astype(np.float64)))):.3e}"
     )
+
+
+# --------------------------------------------------------------------------
+# the non-expert weights held as fp32 in the registry (OQ-113-A, TODO D26 step 3)
+# --------------------------------------------------------------------------
+
+
+def _is_fp32_resident(name: str) -> bool:
+    """Every weight but the routed expert stacks (and their scales) and the embedding table."""
+    return ".mlp.experts." not in name and name != "embed_tokens.weight"
+
+
+@pytest.mark.parametrize("int8", [False, True], ids=["bf16", "int8"])
+def test_non_expert_dtype_widens_exactly_the_non_expert_weights(int8: bool) -> None:
+    """``non_expert_dtype`` re-types every weight except the expert stacks and the table; the default changes nothing.
+
+    The stacks are read by kernels that take their storage dtype (bf16 by
+    ``grouped_matmul_ragged``, int8 by the Mojo ops) and the table is gathered
+    before its cast, so neither is ever compile-folded -- widening them would
+    only cost memory. Everything else is consumed by an fp32 matmul or norm,
+    which is where the fold happens.
+    """
+    from max.dtype import DType
+
+    config = _config(int8=int8, num_hidden_layers=3)
+    plain = UnlimitedOcrDecoder(config.decoder, dtype=config.dtype).raw_state_dict()
+    widened = UnlimitedOcrDecoder(config.decoder, dtype=config.dtype, non_expert_dtype=DType.float32).raw_state_dict()
+    assert set(plain) == set(widened)
+    for name, weight in widened.items():
+        if _is_fp32_resident(name):
+            assert plain[name].dtype == DType.bfloat16, name
+            assert weight.dtype == DType.float32, name
+        else:
+            assert weight.dtype == plain[name].dtype, name
+            assert list(weight.shape) == list(plain[name].shape), name
+    assert any(_is_fp32_resident(name) for name in widened)
+    assert "embed_tokens.weight" in widened and any(".mlp.experts." in name for name in widened)
+
+
+def test_non_expert_dtype_follows_the_registry() -> None:
+    """fp32 exactly where the shared registry is: bf16 on an accelerator; ``None`` on CPU and for int8."""
+    from max.dtype import DType
+
+    assert _pipeline(DeviceRef.GPU(0)).non_expert_dtype == DType.float32
+    assert _pipeline(DeviceRef.CPU()).non_expert_dtype is None
+    assert _pipeline(DeviceRef.GPU(0), config=_config(int8=True)).non_expert_dtype is None
+    unshared = _pipeline(DeviceRef.GPU(0))
+    unshared._share_language_weights = False
+    assert unshared.non_expert_dtype is None
+    assert unshared._fp32_resident_names() == frozenset()
+
+
+@gpu_only
+def test_the_registry_widens_the_non_expert_weights_exactly() -> None:
+    """Declared-fp32 names become their exact fp32 upcast on the device; the stacks and the table stay bf16, bit for bit."""
+    from max.driver import CPU, Accelerator, Buffer
+
+    config = _config(int8=False, num_hidden_layers=3)
+    pipeline = _pipeline(DeviceRef.GPU(0), driver=Accelerator(), config=config)
+    names = sorted(pipeline._fp32_resident_names())
+    assert names and all(_is_fp32_resident(name) for name in names)
+    picked = [names[0], "embed_tokens.weight", "layers.1.mlp.experts.gate_proj"]
+    rng = np.random.default_rng(5)
+    originals = {name: _bf16_tensor(rng.standard_normal((3, 4))) for name in picked}
+    pipeline._language_state_dict = {name: Buffer.from_dlpack(tensor) for name, tensor in originals.items()}
+
+    registry = pipeline._resolved_language_weights()
+    for name, tensor in originals.items():
+        back = torch.from_dlpack(registry[name].to(CPU()))
+        if name in pipeline._fp32_resident_names():
+            assert back.dtype == torch.float32, name
+            assert torch.equal(back, tensor.to(torch.float32)), name
+        else:
+            assert back.dtype == torch.bfloat16, name
+            assert torch.equal(back, tensor), name
+
+
+def _bf16_tensor(array: np.ndarray) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32)).to(torch.bfloat16)
+
+
+@pytest.mark.slow
+@gpu_only
+@pytest.mark.parametrize("seq", [1, 4], ids=["decode", "prefill"])
+def test_fp32_resident_non_expert_weights_compute_the_same_bits(seq: int, _accelerator_session) -> None:
+    """A bf16 MoE with its router and shared experts held as the exact fp32 upcast computes the folded path's BITS.
+
+    The folded path is what ships without step 3: bf16 declared, and MAX
+    upcasts the weight for the fp32 matmul. Holding that upcast in the registry
+    instead must not move a single bit (KON-122's bar), at decode and at
+    prefill -- both of which now take the native expert kernels.
+    """
+    from max.driver import CPU, Buffer
+    from max.dtype import DType
+    from max.graph import Graph, TensorType
+
+    from unlimited_ocr_max.decoder import MoE
+
+    from test_decoder_int8 import _moe_weights, _small_decoder_config
+
+    driver, session = _accelerator_session
+    config = _small_decoder_config(int8=False)
+    weights, _, _ = _moe_weights(config, seed=29)
+    dref = DeviceRef.GPU(0)
+
+    def load(widen: bool):
+        moe = MoE(config, dtype=DType.bfloat16, device=dref, non_expert_dtype=DType.float32 if widen else None)
+        declared = moe.raw_state_dict()
+        values = {
+            name: tensor.to(torch.float32) if declared[name].dtype == DType.float32 else tensor
+            for name, tensor in weights.items()
+        }
+        moe.load_state_dict(values)
+        with Graph(
+            f"fp32_resident_ab_{seq}_{widen}",
+            input_types=[TensorType(DType.float32, [seq, config.hidden_size], device=dref)],
+        ) as graph:
+            for weight in moe.raw_state_dict().values():
+                graph.add_weight(weight, force_initial_weight_on_host=False)
+            graph.output(moe(graph.inputs[0].tensor))
+        registry = {name: Buffer.from_dlpack(tensor.contiguous()).to(driver) for name, tensor in values.items()}
+        driver.synchronize()
+        return session.load(graph, weights_registry=registry)
+
+    x = np.random.default_rng(31).standard_normal((seq, config.hidden_size)).astype(np.float32)
+
+    def run(model) -> np.ndarray:
+        return model.execute(Buffer.from_numpy(np.ascontiguousarray(x)).to(driver))[0].to(CPU()).to_numpy()
+
+    folded = run(load(widen=False))
+    resident = run(load(widen=True))
+    assert np.array_equal(folded, resident), (
+        f"fp32-resident weights moved the bits: max abs diff "
+        f"{float(np.max(np.abs(folded.astype(np.float64) - resident.astype(np.float64)))):.3e}"
+    )

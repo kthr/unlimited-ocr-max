@@ -8,7 +8,13 @@ Invariants the emitted graph depends on:
 
 * Weights stay in the checkpoint's bfloat16; every activation is fp32
   (:data:`COMPUTE_DTYPE`). A bf16-weight x fp32-activation matmul is bitwise
-  the fp32 matmul against the upcast weight on this MAX build.
+  the fp32 matmul against the upcast weight on this MAX build -- and it *is*
+  that matmul: MAX compile-folds the weight-only upcast into an fp32 copy of
+  the weight on the device. ``non_expert_dtype=COMPUTE_DTYPE`` (the shared
+  registry's setting) therefore stores every weight except the routed expert
+  stacks and the embedding table as that exact fp32 upcast, so no graph folds
+  its own copy; the stacks go to kernels that read bf16, and the table is
+  gathered before its cast, so neither is ever folded.
 * ``ops.rms_norm`` requires ``gamma.dtype == input.dtype``, so the bf16 norm
   weight is cast to fp32 inside :class:`RmsNorm`.
 * The MoE gate is softmax over all 64 experts, then top-6, no renormalisation,
@@ -104,7 +110,7 @@ def _projection_split(out_dim: int) -> int | None:
 
 
 class Projection(Module):
-    """A bias-free ``[out_dim, in_dim]`` bf16 weight applied as ``x @ w.T`` to an fp32 activation."""
+    """A bias-free ``[out_dim, in_dim]`` weight (bf16, or its fp32 upcast) applied as ``x @ w.T`` to an fp32 activation."""
 
     def __init__(self, in_dim: int, out_dim: int, *, dtype: DType, device: DeviceRef) -> None:
         super().__init__()
@@ -367,15 +373,18 @@ class MoE(Module):
     graphs are built (:mod:`~unlimited_ocr_max.graphs`), not here.
     """
 
-    def __init__(self, config: DecoderConfig, *, dtype: DType, device: DeviceRef) -> None:
+    def __init__(
+        self, config: DecoderConfig, *, dtype: DType, device: DeviceRef, non_expert_dtype: DType | None = None
+    ) -> None:
         super().__init__()
+        non_expert = dtype if non_expert_dtype is None else non_expert_dtype
         self.num_experts = config.n_routed_experts
         self.num_experts_per_token = config.num_experts_per_tok
         self.hidden_dim = config.hidden_size
         self.native_routing = not device.is_cpu()
         self.int8 = config.int8_experts
         self.gate = MoEGate(
-            config.hidden_size, config.n_routed_experts, config.num_experts_per_tok, dtype=dtype, device=device
+            config.hidden_size, config.n_routed_experts, config.num_experts_per_tok, dtype=non_expert, device=device
         )
         self.experts = StackedExperts(
             config.n_routed_experts,
@@ -385,7 +394,7 @@ class MoE(Module):
             device=device,
             int8=config.int8_experts,
         )
-        self.shared_experts = GatedMlp(config.hidden_size, config.shared_experts_dim, dtype=dtype, device=device)
+        self.shared_experts = GatedMlp(config.hidden_size, config.shared_experts_dim, dtype=non_expert, device=device)
 
     def router_matrix(self, indices: TensorValue, weights: TensorValue) -> TensorValue:
         """Scatter ``[seq, k]`` top-k pairs into a dense ``[seq, num_experts]`` matrix."""
@@ -491,15 +500,24 @@ class MoE(Module):
 class DecoderLayer(Module):
     """Pre-norm attention and FFN/MoE with two residual branches."""
 
-    def __init__(self, config: DecoderConfig, layer_idx: int, *, dtype: DType, device: DeviceRef) -> None:
+    def __init__(
+        self,
+        config: DecoderConfig,
+        layer_idx: int,
+        *,
+        dtype: DType,
+        device: DeviceRef,
+        non_expert_dtype: DType | None = None,
+    ) -> None:
         super().__init__()
-        self.self_attn = Attention(config, dtype=dtype, device=device)
+        non_expert = dtype if non_expert_dtype is None else non_expert_dtype
+        self.self_attn = Attention(config, dtype=non_expert, device=device)
         self.mlp: Module = (
-            MoE(config, dtype=dtype, device=device)
+            MoE(config, dtype=dtype, device=device, non_expert_dtype=non_expert)
             if config.is_moe_layer(layer_idx)
-            else GatedMlp(config.hidden_size, config.intermediate_size, dtype=dtype, device=device)
+            else GatedMlp(config.hidden_size, config.intermediate_size, dtype=non_expert, device=device)
         )
-        norm_kwargs = {"eps": config.rms_norm_eps, "dtype": dtype, "device": device}
+        norm_kwargs = {"eps": config.rms_norm_eps, "dtype": non_expert, "device": device}
         self.input_layernorm = RmsNorm(config.hidden_size, **norm_kwargs)
         self.post_attention_layernorm = RmsNorm(config.hidden_size, **norm_kwargs)
 
@@ -533,19 +551,34 @@ class UnlimitedOcrDecoder(Module):
 
     ``dtype`` is the storage dtype of every weight except, with
     ``config.int8_experts``, the routed expert stacks (int8 plus fp32 scales).
+    ``non_expert_dtype`` (default: ``dtype``) overrides it for every weight
+    that is neither a routed expert stack nor the embedding table -- the
+    projections, norms, router and ``lm_head``; see the module docstring for
+    why the shared registry stores those in fp32.
     """
 
-    def __init__(self, config: DecoderConfig, *, dtype: DType = DType.bfloat16, device: DeviceRef | None = None) -> None:
+    def __init__(
+        self,
+        config: DecoderConfig,
+        *,
+        dtype: DType = DType.bfloat16,
+        device: DeviceRef | None = None,
+        non_expert_dtype: DType | None = None,
+    ) -> None:
         super().__init__()
         device = device if device is not None else DeviceRef.CPU()
+        non_expert = dtype if non_expert_dtype is None else non_expert_dtype
         self.config = config
         self.device = device
         self.embed_tokens = EmbeddingTable(config.vocab_size, config.hidden_size, dtype=dtype, device=device)
         self.layers = LayerList(
-            [DecoderLayer(config, i, dtype=dtype, device=device) for i in range(config.num_hidden_layers)]
+            [
+                DecoderLayer(config, i, dtype=dtype, device=device, non_expert_dtype=non_expert)
+                for i in range(config.num_hidden_layers)
+            ]
         )
-        self.norm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype, device=device)
-        self.lm_head = Projection(config.hidden_size, config.vocab_size, dtype=dtype, device=device)
+        self.norm = RmsNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=non_expert, device=device)
+        self.lm_head = Projection(config.hidden_size, config.vocab_size, dtype=non_expert, device=device)
 
     def embed(self, token_ids: TensorValue) -> TensorValue:
         """The bf16 table lookup, upcast to fp32."""

@@ -22,10 +22,12 @@ from typing import Any
 
 import numpy as np
 from max.driver import CPU, Buffer, Device
+from max.dtype import DType
 from max.engine import InferenceSession, Model
 from max.graph import DeviceKind, DeviceRef
 
 from .batch_processor import BASE_SIZE, LOCAL_SIZE, CropLayout, ViewGeometry
+from .buffers import as_float32, numpy_to_buffer
 from .decoder import COMPUTE_DTYPE, UnlimitedOcrDecoder
 from .graphs import (
     DecodeGraph,
@@ -172,6 +174,20 @@ class UnlimitedOcrPipeline:
         return self._share_language_weights and self.on_accelerator and not self.config.decoder.int8_experts
 
     @property
+    def non_expert_dtype(self) -> DType | None:
+        """Storage dtype of the non-expert language weights: fp32 under :attr:`shares_language_weights`, else the checkpoint's.
+
+        A bf16 weight read by an fp32 matmul is compile-folded into an fp32
+        copy on the device at every ``session.load`` -- ~1.29 GiB per language
+        graph for the projections, norms, router and ``lm_head``
+        (EXPERIMENTS.md, OQ-113-A). Holding the exact fp32 upcast ONCE in the
+        shared registry removes both graphs' copies for +0.65 GiB of registry.
+        Off the registry (CPU, int8) nothing changes: ``None`` keeps the
+        decoder's declarations, and so every emitted graph, as they were.
+        """
+        return COMPUTE_DTYPE if self.shares_language_weights else None
+
+    @property
     def releases_language_graphs(self) -> bool:
         """Whether a caller must hold **one** language graph at a time.
 
@@ -242,7 +258,10 @@ class UnlimitedOcrPipeline:
         The host entries are already ``Buffer``s -- MAX's mmap of the checkpoint
         for the dense weights, one host allocation per expert stack -- so every
         dtype needs the same single step, ``.to(device)``: bf16 dense weights,
-        int8 expert stacks and fp32 scales alike.
+        int8 expert stacks and fp32 scales alike. The one exception is the set
+        :attr:`non_expert_dtype` declares fp32 (:meth:`_fp32_resident_names`):
+        those bf16 entries are widened to their exact fp32 upcast first, so the
+        graphs bind fp32 and fold no copy of their own.
 
         **The conversion is incremental, and that is not cosmetic**: building
         the whole device dict beside the host one holds both ~5.5 GiB copies at
@@ -281,18 +300,36 @@ class UnlimitedOcrPipeline:
             return self._resolved_language_state_dict()
         if self._language_device_weights is None:
             host = self._resolved_language_state_dict()
+            widen = self._fp32_resident_names()
             built: dict[str, Buffer] = {}
             # `list(...)` because the loop mutates `host`.
             for name in list(host):
-                built[name] = host[name].to(self._driver_device)
+                value = host[name]
+                if name in widen and value.dtype == DType.bfloat16:
+                    # The exact upcast (lossless: bf16 is the top half of the
+                    # fp32 word). Its numpy source is a temporary, so drain the
+                    # async copy before the next iteration can free it (KON-125).
+                    built[name] = numpy_to_buffer(as_float32(value), DType.float32).to(self._driver_device)
+                    self._driver_device.synchronize()
+                else:
+                    built[name] = value.to(self._driver_device)
                 # Drop the host bytes now, one weight at a time, so the two
                 # copies never both exist in full.
-                del host[name]
+                del host[name], value
             self._driver_device.synchronize()
             self._language_device_weights = built
             self._language_state_dict = None
             gc.collect()
         return self._language_device_weights
+
+    def _fp32_resident_names(self) -> frozenset[str]:
+        """The weights :attr:`non_expert_dtype` declares fp32, read off a weightless decoder (declarations only)."""
+        if self.non_expert_dtype is None:
+            return frozenset()
+        declared = UnlimitedOcrDecoder(
+            self.config.decoder, dtype=self.config.dtype, device=self.device, non_expert_dtype=self.non_expert_dtype
+        ).raw_state_dict()
+        return frozenset(name for name, weight in declared.items() if weight.dtype == DType.float32)
 
     def _decoder(self) -> UnlimitedOcrDecoder:
         """A fresh, weight-loaded decoder: a ``Weight`` binds to one graph, the arrays behind it are shared.
@@ -302,7 +339,9 @@ class UnlimitedOcrPipeline:
         -- *is* that registry: host tensors on CPU, the shared device buffers
         under :attr:`shares_language_weights`.
         """
-        decoder = UnlimitedOcrDecoder(self.config.decoder, dtype=self.config.dtype, device=self.device)
+        decoder = UnlimitedOcrDecoder(
+            self.config.decoder, dtype=self.config.dtype, device=self.device, non_expert_dtype=self.non_expert_dtype
+        )
         decoder.load_state_dict(self._resolved_language_weights())
         return decoder
 
