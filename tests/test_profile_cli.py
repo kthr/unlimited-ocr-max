@@ -246,7 +246,7 @@ def test_profile_help_does_not_import_max() -> None:
     assert not _imports_max(modules)
     assert "unlimited_ocr_max.profile" not in modules
     for flag in ("--devices", "--model", "--revision", "--weights", "--port", "--ngram-size", "--max-batch-size",
-                 "--out", "--ready-timeout-s"):
+                 "--out", "--ready-timeout-s", "--concurrency"):
         assert flag in help_text
 
 
@@ -294,9 +294,10 @@ def test_serve_and_profile_share_one_definition_of_the_server_flags() -> None:
     serve, prof = spec(subparsers.choices["serve"]), spec(subparsers.choices["profile"])
     assert list(serve) == ["devices", "model", "revision", "weights", "port", "ngram_size", "max_batch_size"]
     assert {dest: prof[dest] for dest in serve} == serve
-    assert list(prof)[len(serve):] == ["out", "ready_timeout_s"]
+    assert list(prof)[len(serve):] == ["out", "ready_timeout_s", "concurrency"]
     assert prof["ready_timeout_s"][1] == 1800
     assert prof["out"][1] is None  # resolved at run time, to the run's own UTC timestamp
+    assert prof["concurrency"][1] is None  # resolved at run time, to --max-batch-size
 
 
 def test_int8_on_cpu_is_refused_as_serve_refuses_it() -> None:
@@ -1370,6 +1371,137 @@ def test_prefill_all_ce_is_the_median_over_every_ce_line_the_warmups_included() 
     assert figures.values["prefill"] == {"median_s": 2.0, "floor_s": 1.0, "n": 3}  # the warmup's line skipped
     assert figures.values["prefill_all_ce"] == {"median_s": 2.5, "floor_s": 1.0, "n": 4}  # median(30, 1, 2, 3)
     assert _cells(profile.row("hw", "bf16", "s", figures.values))[4] == "2.00 s"  # the row keeps the primary
+
+
+# --------------------------------------------------------------------------- #
+# --concurrency (KON-216)
+# --------------------------------------------------------------------------- #
+def test_concurrency_defaults_to_max_batch_size() -> None:
+    assert profile._resolve_concurrency(max_batch_size=4, concurrency=None) == 4
+    assert profile._resolve_concurrency(max_batch_size=4, concurrency=2) == 2
+
+
+def test_concurrency_below_one_is_refused() -> None:
+    with pytest.raises(SystemExit) as refused:
+        profile._resolve_concurrency(max_batch_size=4, concurrency=0)
+    assert str(refused.value) == "--concurrency 0 must be >= 1"
+
+
+def test_concurrency_above_max_batch_size_is_refused() -> None:
+    with pytest.raises(SystemExit) as refused:
+        profile._resolve_concurrency(max_batch_size=2, concurrency=3)
+    assert str(refused.value) == "--concurrency 3 exceeds --max-batch-size 2"
+
+
+def test_concurrency_out_of_range_is_refused_before_the_server_would_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(profile._Server, "start", _no_spawn)
+    out = tmp_path / "run"
+    with pytest.raises(SystemExit, match=r"--concurrency 0 must be >= 1"):
+        profile.run(_args(out, _free_port(), "--concurrency", "0"), max_exe="/nonexistent/max")
+    assert not out.exists()
+    with pytest.raises(SystemExit, match=r"--concurrency 2 exceeds --max-batch-size 1"):
+        profile.run(_args(out, _free_port(), "--concurrency", "2", "--max-batch-size", "1"), max_exe="/nonexistent/max")
+    assert not out.exists()
+
+
+def test_row_decode_cell_at_concurrency_one_is_byte_identical_to_before_concurrency_existed() -> None:
+    """The concurrency figure being present (at ``n`` 1) must not change the decode cell at all."""
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}}
+    before = profile.row("hw", "bf16", "profiled, 12 pages", figures)
+    assert before == "| hw | bf16 | profiled, 12 pages | **20.0 tok/s** (50.0 ms/step, n=39) | — | — | — |"
+    figures_with_concurrency = {**figures, "concurrency": {
+        "n": 1, "max_batch_size": 4, "tok_s": 999.0, "latency_median_s": 0.1, "by_batch_size": {},
+    }}
+    assert profile.row("hw", "bf16", "profiled, 12 pages", figures_with_concurrency) == before
+
+
+def test_row_decode_cell_above_concurrency_one_leads_with_the_aggregate_tok_s() -> None:
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}, "concurrency": {
+        "n": 3, "max_batch_size": 4, "tok_s": 55.5, "latency_median_s": 0.2, "by_batch_size": {},
+    }}
+    cell = _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3]
+    assert cell == "**55.5 tok/s** (50.0 ms/step, n=39, concurrency 3)"
+
+
+def test_concurrency_figure_raises_when_no_page_completed() -> None:
+    with pytest.raises(ValueError):
+        profile._concurrency_figure({}, concurrency=2, max_batch_size=4, log="")
+
+
+def test_concurrency_figure_aggregate_tok_s_and_latency_median_over_synthetic_exchanges() -> None:
+    exchanges = {
+        "a": profile.Exchange(max_tokens=8192, t_start=0.0, t_end=1.0, completion_tokens=100),
+        "b": profile.Exchange(max_tokens=8192, t_start=0.5, t_end=2.0, completion_tokens=50),
+        "c": profile.Exchange(max_tokens=8192, t_start=1.0, t_end=1.5, completion_tokens=25),
+    }
+    figure = profile._concurrency_figure(exchanges, concurrency=3, max_batch_size=4, log="")
+    assert figure["n"] == 3
+    assert figure["max_batch_size"] == 4
+    # tokens 100+50+25=175 over the span from the first start (0.0) to the last end (2.0): 87.5 tok/s.
+    assert figure["tok_s"] == pytest.approx(87.5)
+    # wall_s per exchange: a=1.0, b=1.5, c=0.5 -> median 1.0.
+    assert figure["latency_median_s"] == pytest.approx(1.0)
+    assert figure["by_batch_size"] == {}
+
+
+def test_concurrent_sending_keeps_at_most_n_in_flight_all_12_pages_sent_warmup_first_and_alone(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``profile._stream_chat`` itself is stubbed here (a lock-guarded counter, a short sleep to
+    force overlap): the real HTTP path is exercised by every other test in this module, this one
+    only pins the concurrency mechanism and the warmup's ordering."""
+    concurrency = 3
+    _idle_gpu(monkeypatch, _FakeProbe)
+    png_to_page = {profile_corpus.page_png(page): page for page in PAGES}
+    lock = threading.Lock()
+    current = 0
+    max_concurrent = 0
+    calls: list[tuple[str, float, float]] = []  # (page, or "warmup", t_start, t_end)
+
+    def fake_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        nonlocal current, max_concurrent
+        label = "warmup" if max_tokens == profile.WARMUP_MAX_TOKENS else png_to_page[png]
+        t_start = time.monotonic()
+        with lock:
+            current += 1
+            max_concurrent = max(max_concurrent, current)
+        time.sleep(0.05)
+        with lock:
+            current -= 1
+        t_end = time.monotonic()
+        calls.append((label, t_start, t_end))
+        return profile.Exchange(max_tokens=max_tokens, t_start=t_start, t_end=t_end, t_first=t_start,
+                                completion_tokens=1, finish_reason="stop", text="x")
+
+    monkeypatch.setattr(profile, "_stream_chat", fake_stream_chat)
+    out = tmp_path / "run"
+    code = profile.run(
+        _args(out, _free_port(), "--max-batch-size", str(concurrency), "--concurrency", str(concurrency),
+             devices="gpu"),
+        max_exe=stub.exe,
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+
+    warmup_calls = [c for c in calls if c[0] == "warmup"]
+    page_calls = [c for c in calls if c[0] != "warmup"]
+    assert len(warmup_calls) == 1
+    assert sorted(label for label, _, _ in page_calls) == sorted(PAGES)  # every page sent, exactly once
+    _, _, warmup_end = warmup_calls[0]
+    assert all(t_start >= warmup_end for _, t_start, _ in page_calls)  # warmup finished before any page started
+    assert 2 <= max_concurrent <= concurrency  # genuine overlap happened, and never past the bound
+
+    # `_stream_chat` never touched the stub's HTTP endpoint, so its scheduler log (and therefore
+    # the "decode" figure the row's cell needs) is empty here; row() formatting at concurrency > 1
+    # is covered directly by test_row_decode_cell_above_concurrency_one_leads_with_the_aggregate_tok_s.
+    doc = json.loads((out / "profile.json").read_text())
+    concurrency_figure = doc["figures"]["concurrency"]
+    assert concurrency_figure["n"] == concurrency and concurrency_figure["max_batch_size"] == concurrency
+    assert concurrency_figure["tok_s"] > 0
+    assert concurrency_figure["by_batch_size"] == {}
 
 
 def test_the_stop_message_is_said_while_signals_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
