@@ -37,8 +37,10 @@ Invariants the emitted graph depends on:
   hands expert ``j`` to the same 64-term chain as a bf16 ``[N, K]`` weight. A
   graph-level slice of a weight stack is never staged in int8 mode: weight-only
   expressions are compile-folded and the folded slice is materialized on the
-  device (KON-142), which the kernels exist to avoid. The graph that stages
-  these ops needs ``custom_extensions=[MOJO_KERNELS]``.
+  device (KON-142), which the kernels exist to avoid. A custom op fed only
+  constants is such an expression too, so the prefill dequantization takes a
+  runtime-derived expert index (:meth:`MoE._runtime_zero`). The graph that
+  stages these ops needs ``custom_extensions=[MOJO_KERNELS]``.
 * Hidden states are rank-2 ``[seq_len, hidden]``; ``seq_len`` is a static graph
   dimension so the causal mask and the RoPE tables are graph constants.
 """
@@ -207,13 +209,26 @@ class StackedExperts(Module):
             "int8_dequant_expert", device=self.device, values=[weight, scales, expert_idx], out_types=[out_type]
         )[0].tensor
 
-    def expert(self, expert_idx: int) -> tuple[TensorValue, TensorValue, TensorValue]:
-        """Expert ``j``'s three rank-2 weights: static slices, or in int8 mode the kernel's bf16 dequantization."""
+    def expert(
+        self, expert_idx: int, runtime_zero: TensorValue | None = None
+    ) -> tuple[TensorValue, TensorValue, TensorValue]:
+        """Expert ``j``'s three rank-2 weights: static slices, or in int8 mode the kernel's bf16 dequantization.
+
+        ``runtime_zero`` (int8 only) is a ``[1]`` int32 zero computed from a
+        runtime value, added to the constant index. With only constants for
+        inputs the dequantization is a weight-only expression: MAX runs it at
+        ``session.load``, folds the fp32 upcast of the matmuls that consume it,
+        and keeps the result on the device -- 9.02 GiB for every expert of the
+        prefill graph (EXPERIMENTS.md, ID 27). A runtime-derived index keeps it
+        a prefill-time op on the int8 stacks, computing the same values.
+        """
         if not 0 <= expert_idx < self.num_experts:
             raise IndexError(f"expert {expert_idx} out of range for {self.num_experts}")
         if not self.int8:
             return self.gate_proj[expert_idx], self.up_proj[expert_idx], self.down_proj[expert_idx]
         index = ops.constant(np.asarray([expert_idx], dtype=np.int32), DType.int32, device=self.device)
+        if runtime_zero is not None:
+            index = runtime_zero + index
         gate, up, down = (self._dequant(weight, scales, index) for weight, scales in self._stacks())
         return gate, up, down
 
@@ -267,8 +282,8 @@ class StackedExperts(Module):
     def apply(self, x: TensorValue, gate: TensorValue, up: TensorValue, down: TensorValue) -> TensorValue:
         return (ops.silu(x @ gate.T) * (x @ up.T)) @ down.T
 
-    def __call__(self, expert_idx: int, x: TensorValue) -> TensorValue:
-        return self.apply(x, *self.expert(expert_idx))
+    def __call__(self, expert_idx: int, x: TensorValue, runtime_zero: TensorValue | None = None) -> TensorValue:
+        return self.apply(x, *self.expert(expert_idx, runtime_zero))
 
 
 class Attention(Module):
@@ -423,8 +438,21 @@ class MoE(Module):
         assert routed is not None
         return routed
 
-    def _routed_dense(self, x: TensorValue, router: TensorValue) -> TensorValue:
-        return self._accumulate(router, lambda j: self.experts(j, x))
+    def _routed_dense(self, x: TensorValue, router: TensorValue, runtime_zero: TensorValue | None = None) -> TensorValue:
+        return self._accumulate(router, lambda j: self.experts(j, x, runtime_zero))
+
+    def _runtime_zero(self, indices: TensorValue) -> TensorValue:
+        """A ``[1]`` int32 zero the compiler cannot prove is zero: ``min(indices[0, 0], 0)``.
+
+        Top-k expert ids are never negative, so this is always 0; but it is
+        derived from the router's runtime output, so anything it feeds is not a
+        weight-only expression and cannot be folded at load (see
+        :meth:`StackedExperts.expert`). ``x * 0`` or ``x - x`` could be
+        canonicalized back to a constant; a ``min`` against 0 needs a range fact
+        the compiler does not have.
+        """
+        first = ops.cast(ops.reshape(indices[0:1, 0:1], [1]), DType.int32)
+        return ops.min(first, ops.constant(np.zeros(1, dtype=np.int32), DType.int32, device=indices.device))
 
     def _routed_sparse(self, x: TensorValue, indices: TensorValue, router: TensorValue) -> TensorValue:
         """Top-k experts only, then the same 64-term chain with zero-weight rows substituted.
@@ -487,7 +515,10 @@ class MoE(Module):
         indices, weights = self.gate(x)
         router = self.router_matrix(indices, weights)
         if self.int8:
-            routed = self._routed_int8(x, indices, weights) if x.shape[0] == 1 else self._routed_dense(x, router)
+            if x.shape[0] == 1:
+                routed = self._routed_int8(x, indices, weights)
+            else:
+                routed = self._routed_dense(x, router, runtime_zero=self._runtime_zero(indices))
         elif self.native_routing:
             routed = self._routed_native(x, indices, weights)
         elif x.shape[0] == 1:

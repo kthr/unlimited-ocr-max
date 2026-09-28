@@ -496,3 +496,27 @@ def test_int8_prefill_moe_matches_bf16_on_dequantized_weights() -> None:
     print(f"[uocr] int8 prefill MoE: bitwise vs dequantized bf16 {bitwise}, min row cosine vs bf16 {cos:.6f}")
     np.testing.assert_allclose(got, ref_deq, rtol=1e-5, atol=1e-6)
     assert cos >= 0.999
+
+
+@pytest.mark.slow
+def test_int8_prefill_with_a_runtime_expert_index_computes_the_same_bits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fold-proof prefill (the dequant index derived from the router) is bitwise the constant-index build.
+
+    With only constants for inputs ``int8_dequant_expert`` is folded at load into
+    an fp32 copy of every expert (ID 27); the runtime zero keeps it a
+    prefill-time op. Same kernel, same int8 stacks, same index values, same
+    64-term chain after it -- so the output must not move a bit.
+    """
+    from unlimited_ocr_max.decoder import MoE
+
+    int8_cfg = _small_decoder_config(int8=True)
+    _, int8, _ = _moe_weights(_small_decoder_config(int8=False), seed=13)
+    x = np.random.default_rng(17).standard_normal((4, int8_cfg.hidden_size)).astype(np.float32)
+
+    runtime = _run(_moe_model(int8_cfg, int8, seq=4, tag="int8_prefill_runtime_idx"), x)
+    monkeypatch.setattr(MoE, "_runtime_zero", lambda self, indices: None)  # the pre-fix, constant-index build
+    constant = _run(_moe_model(int8_cfg, int8, seq=4, tag="int8_prefill_const_idx"), x)
+    assert np.all(np.isfinite(runtime))
+    assert np.array_equal(runtime, constant), (
+        f"max abs diff {float(np.max(np.abs(runtime.astype(np.float64) - constant.astype(np.float64)))):.3e}"
+    )
