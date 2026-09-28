@@ -1,6 +1,6 @@
 [project]
 name = "unlimited-ocr-max"
-version = "0.3.1"
+version = "0.3.2"
 description = "baidu/Unlimited-OCR served through MAX as an OpenAI-compatible endpoint on Metal, CUDA, ROCm or CPU"
 readme = "README.md"
 license = "MIT"

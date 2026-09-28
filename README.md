@@ -72,7 +72,7 @@ compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, mod
 | `--devices` | `gpu` \| `cpu` | **required** | `gpu` is Metal, CUDA or ROCm; `cpu` is slow |
 | `--weights` | `bf16` \| `int8` | `bf16` | `int8`: quantised routed experts, faster decode, **gpu only** |
 | `--model` | Hub repo or local dir | `kthierbach/unlimited-ocr-max` | a local dir needs this repository's layout |
-| `--revision` | tag | `v0.3.1` | the model-repo tag this package version was validated against |
+| `--revision` | tag | `v0.3.2` | the model-repo tag this package version was validated against |
 | `--port` | integer | `8010` | |
 | `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
 
@@ -101,7 +101,7 @@ EOF
 Offline:
 
 ```bash
-uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.1 --local-dir ocr-model
+uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.2 --local-dir ocr-model
 unlimited-ocr-max serve --devices gpu --model ocr-model
 ```
 
@@ -113,23 +113,27 @@ characters over all pages.
 
 | hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
 |---|---|---|---|---|---|---|
-| Apple M4 24 GB | bf16 | 12 pages | **19.5 tok/s** | 4.96 s | 18.4 / 1.7–1.8 GiB | **12/12 byte-identical** |
-| Apple M4 24 GB | int8 | 12 pages ² | **36.2 tok/s** | 7.04 s | 14.1 / 6.5 GiB | 6/12; CER 0.0011, all edits bbox digits |
-| NVIDIA A100 80 GB | bf16 | 1 page | **~96 tok/s** | 5.58 s | not measured | prose identical; 5 bbox digits off by 1–6 px |
-| NVIDIA A100 80 GB | int8 | not run | — | — | — | — |
+| Apple M4 24 GB | bf16 | 12 pages | **21.3 tok/s** | 3.20 s | 17.8 / 11.1–11.2 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages ² | **36.6 tok/s** | 6.86 s | 20.7 / 10.9 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| NVIDIA A100 80 GB | bf16 | 12 pages | **93.6 tok/s** | 3.56 s | device 10.6 / 10.6 GiB | 10/12; CER 0.022 ³ |
+| NVIDIA A100 80 GB | int8 | 12 pages | **82.7 tok/s** | 6.23 s | device 17.4 / 17.4 GiB | 6/12; CER 0.025 ³ |
 | NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
 | AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
-| CPU (Apple M4) | bf16 | 12 pages ² | 5.7 tok/s | 53.6 s | 16.0 / 6.3 GiB | **12/12 byte-identical** |
+| CPU (Apple M4) | bf16 | 12 pages ² | 5.1 tok/s | 47.9 s | 21.1 / 21.0 GiB | **12/12 byte-identical** |
 
-The three Apple M4 rows are one draw each with `unlimited-ocr-max profile` on
-v0.3.1 (macOS 26.5.2, `max` 26.6.0); the other rows predate `profile` and were
-not re-run. Peak memory is the first request's compile;
-steady is the server idle after the last page. ¹ Upstream: MAX's `ldmatrix`
-PTX needs sm_80, and Turing has no bf16 tensor cores
-([modular/modular#6653](https://github.com/modular/modular/issues/6653),
+Every measured row is one draw with `unlimited-ocr-max profile` on v0.3.2
+(Apple M4: macOS 26.5.2; A100: Linux; `max` 26.6.0 on both). Memory is the server's **physical
+footprint** on Apple silicon -- what `footprint` and `vmmap` report, which on
+unified memory includes the Metal allocations and excludes clean page cache --
+and its device memory on NVIDIA/AMD. Peak is reached in the first request
+(weight upload and graph compile); steady is the server idle between pages.
+¹ Upstream: MAX's `ldmatrix` PTX needs sm_80, and Turing has no bf16 tensor
+cores ([modular/modular#6653](https://github.com/modular/modular/issues/6653),
 [#6659](https://github.com/modular/modular/issues/6659)). ² System swap grew
 during these runs, so their timings are indicative; the text results are
-exact.
+exact. ³ On CUDA two of the twelve pages differ from the fp32 reference. The
+bf16 output is byte-identical to v0.3.1's on the same A100, so this is CUDA's
+arithmetic rather than a change in this release.
 
 ## Not supported
 

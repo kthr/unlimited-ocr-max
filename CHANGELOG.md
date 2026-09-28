@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.3.2] — 2026-09-28
+
+### Performance
+- **bf16 on a GPU: MAX no longer builds an fp32 copy of the weights inside each
+  language graph.** A bf16 weight read by an fp32 matmul is compile-folded by
+  MAX into an fp32 copy on the device at every `session.load`. The prefill
+  graph folded every expert stack this way (its dense 64-expert path), and
+  both graphs folded the projections, norms, router and `lm_head`. Two changes
+  remove it:
+  - prefill's routed experts now run through MAX's `grouped_matmul_ragged`, as
+    decode already did, which reads the bf16 stacks directly;
+  - the shared weight registry holds the non-expert weights as their exact fp32
+    upcast, once, so neither graph folds its own copy.
+
+  Device memory per graph at a 282-token prompt: prefill ~10.3 GiB → 0.002 GiB,
+  decode 1.29 → 0.000 GiB, registry 5.47 → 6.11 GiB. Holding both language
+  graphs now needs ~7.7 GiB of the M4's 17.8 GiB Metal budget, against ~18.6.
+
+  Served on an Apple M4 (`profile`, 12 pages):
+
+  | | v0.3.1 | v0.3.2 |
+  |---|---|---|
+  | prefill median | 4.94 s | **3.20 s** |
+  | TTFT median | 4.99 s | **3.25 s** |
+  | decode step median | 50.7–51.3 ms | **46.8 ms** (three draws) |
+  | total time, 12 pages | 391 s | **344 s** |
+  | model worker's peak physical footprint (`vmmap`) | 21.2 GB | **15.1 GB** |
+
+  Between requests the worker's footprint is unchanged, at 10.7 GB.
+
+### Behavior
+- **bf16 output is byte-identical to v0.3.1 on all 12 bundled pages**, on the
+  Apple M4 and on an NVIDIA A100.
+  - The fp32-resident weights are bitwise neutral: the prefill logits and eight
+    decode-step logits are sha256-identical, and a slow test pins it.
+  - The native prefill kernels sum in a different order, so the prefill logits
+    are not bitwise v0.3.1's; the served text is identical.
+- **CPU serving and `--weights int8` are unchanged.** Their emitted graphs are
+  identical to v0.3.1. On the M4, int8 serves 12/12 byte-identical to its
+  pinned transcripts.
+- **NVIDIA A100** (`profile`, 12 pages, the same host for both versions):
+
+  | | v0.3.1 | v0.3.2 |
+  |---|---|---|
+  | bf16 prefill median | 5.49 s | **3.56 s** |
+  | bf16 decode | 94.0 tok/s | 93.6 tok/s |
+  | bf16 device memory, peak / steady | 19.1 / 19.1 GiB | **10.6 / 10.6 GiB** |
+  | bf16 text vs reference | 10/12, CER 0.022 | 10/12, CER 0.022 |
+
+  - The two pages that differ from the fp32 reference are CUDA's arithmetic,
+    not this release: v0.3.2's output is byte-identical to v0.3.1's on that
+    host.
+  - int8 on the A100 is 6/12, CER 0.025. It decodes slower than bf16 there
+    (82.7 against 93.6 tok/s); its Mojo kernels have not been tuned for CUDA.
+  - AMD is not re-validated.
+
+### Changed
+- **`profile` reports the server's memory as its physical footprint on macOS.**
+  It used to report process-tree RSS. On Apple silicon RSS leaves out every
+  Metal allocation (on unified memory, the weights and graphs) and counts the
+  checkpoint's clean page cache, so it followed the host's free RAM rather than
+  the server: two builds with the same 10.7 GB footprint read 1.2 and 6.3 GiB.
+  It now sums `proc_pid_rusage().ri_phys_footprint` over the server's
+  processes, the figure `footprint` and `vmmap` print.
+  - Device memory still fills the cell on NVIDIA and AMD.
+  - `profile.json` keeps RSS as `host_memory`, next to the new
+    `host_footprint`.
+  - The README's M4 rows are re-measured this way, so their memory figures are
+    not comparable with v0.3.1's.
+
 ## [0.3.1] — 2026-09-27
 
 ### Added
