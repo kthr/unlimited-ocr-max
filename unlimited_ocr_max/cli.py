@@ -21,6 +21,10 @@ SERVED_MODEL_NAME = "unlimited-ocr-max"
 MAX_LENGTH = 2048
 #: Internal transport to the architecture inside the ``max serve`` child; see ``model.NGRAM_SIZE_ENV``.
 NGRAM_ENV = "_UNLIMITED_OCR_MAX_NGRAM_SIZE"
+#: Internal transport to the architecture inside the ``max serve`` child; see ``model.MAX_BATCH_SIZE_ENV``.
+MAX_BATCH_SIZE_ENV = "_UNLIMITED_OCR_MAX_MAX_BATCH_SIZE"
+#: ``model.MAX_BATCH_CAP``, repeated here so this module imports no MAX.
+MAX_BATCH_CAP = 8
 
 
 def weight_file(variant: str) -> str:
@@ -77,26 +81,38 @@ def serve_command(*, max_exe: str, model: str, weight_path: str, devices: str, p
     ]
 
 
-def check_devices_support_variant(weights: str, devices: str) -> None:
-    """Refuse a variant its device cannot serve, before any path or network work."""
+def check_devices_support_variant(weights: str, devices: str, max_batch_size: int) -> None:
+    """Refuse a --weights/--devices/--max-batch-size combination this port cannot serve, before any
+    path or network work."""
     if weights == "int8" and devices == "cpu":
         raise SystemExit("--weights int8 is GPU-only; serve on cpu with --weights bf16")
+    if max_batch_size < 1:
+        raise SystemExit(f"--max-batch-size {max_batch_size} must be >= 1")
+    if max_batch_size > 1:
+        if devices == "cpu":
+            raise SystemExit("--max-batch-size > 1 needs an accelerator; serve on cpu with --max-batch-size 1")
+        if weights == "int8":
+            raise SystemExit("--max-batch-size > 1 is bf16-only; serve int8 with --max-batch-size 1")
+        if max_batch_size > MAX_BATCH_CAP:
+            raise SystemExit(f"--max-batch-size {max_batch_size} exceeds the cap of {MAX_BATCH_CAP}")
 
 
-def serve_env(ngram_size: int) -> dict[str, str]:
-    """The environment ``max serve`` runs under: ours, plus the n-gram size for the architecture."""
+def serve_env(ngram_size: int, max_batch_size: int) -> dict[str, str]:
+    """The environment ``max serve`` runs under: ours, plus the n-gram size and max batch size for
+    the architecture."""
     env = dict(os.environ)
     env[NGRAM_ENV] = str(ngram_size)
+    env[MAX_BATCH_SIZE_ENV] = str(max_batch_size)
     return env
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    check_devices_support_variant(args.weights, args.devices)
+    check_devices_support_variant(args.weights, args.devices, args.max_batch_size)
     model, weight_path, revision = resolve_model(args.model, args.weights, args.revision)
     cmd = serve_command(
         max_exe=max_executable(), model=model, weight_path=weight_path, devices=args.devices, port=args.port, revision=revision
     )
-    env = serve_env(args.ngram_size)
+    env = serve_env(args.ngram_size, args.max_batch_size)
     print("[unlimited-ocr-max] " + " ".join(cmd), file=sys.stderr, flush=True)
     os.execvpe(cmd[0], cmd, env)
     return 1  # unreachable: execvpe only returns on failure, which raises
@@ -122,6 +138,9 @@ def add_server_arguments(parser: argparse.ArgumentParser) -> None:
     # 35 is `ngram.DEFAULT_NGRAM_SIZE`, repeated here so this module imports no MAX.
     parser.add_argument("--ngram-size", type=int, default=35,
                         help="no-repeat n-gram guard; 0 disables, which reproduces the PyTorch reference (default: %(default)s)")
+    parser.add_argument("--max-batch-size", type=int, default=1,
+                        help=f"requests batched per scheduler step; only bf16 on an accelerator batches past 1, "
+                             f"capped at {MAX_BATCH_CAP} (default: %(default)s)")
 
 
 def build_parser() -> argparse.ArgumentParser:
