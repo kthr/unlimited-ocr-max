@@ -121,20 +121,34 @@ def test_int8_gates_the_sharing_off_and_bf16_keeps_it() -> None:
     assert int8.releases_language_graphs is True
 
 
-def test_releases_language_graphs_is_the_device_not_the_sharing_flag() -> None:
-    """One graph at a time is ``on_accelerator`` verbatim, NOT gated by sharing.
+def test_releases_language_graphs_only_without_the_shared_registry() -> None:
+    """One graph at a time exactly where the graphs carry their own weights: an accelerator without the registry.
 
-    KON-113 measured hold-both over the Metal budget *with* sharing on (18.629
-    of 17.760 GiB, short from both load orders), so turning the sharing off or
-    on must not move the release policy in either direction.
+    With the registry the graphs hold no weights of their own since 0.3.2
+    (prefill 0.002 GiB, decode 0.000 GiB beyond it), so bf16 on an accelerator
+    holds both. Without it -- the sharing turned off, or int8 -- each graph
+    places its own copy, which KON-113 measured over the Metal budget. CPU never
+    releases.
     """
     cpu, gpu = _pipeline(DeviceRef.CPU()), _pipeline(DeviceRef.GPU(0))
+    int8 = _pipeline(DeviceRef.GPU(0), config=_config(int8=True))
     assert cpu.releases_language_graphs is False
-    assert gpu.releases_language_graphs is True
+    assert gpu.releases_language_graphs is False
+    assert int8.releases_language_graphs is True
     gpu._share_language_weights = False
     assert gpu.releases_language_graphs is True
     cpu._share_language_weights = True
     assert cpu.releases_language_graphs is False
+
+
+def test_retain_only_prefill_keeps_just_the_current_length() -> None:
+    pipeline = _pipeline(DeviceRef.GPU(0))
+    pipeline.retain_only_prefill(282)  # nothing cached: a no-op
+    pipeline._prefill.update({277: "p277", 282: "p282", 300: "p300"})
+    pipeline.retain_only_prefill(282)
+    assert pipeline._prefill == {282: "p282"}
+    pipeline.retain_only_prefill(277)  # a length not cached drops the rest too
+    assert pipeline._prefill == {}
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +180,7 @@ def test_releases_are_idempotent_safe_before_build_and_keep_the_registry() -> No
 
 
 def test_the_served_prefill_drops_the_decode_graph_first() -> None:
-    """The structural invariant: ``_prefill`` releases decode before anything else.
+    """The structural invariant: where it releases, ``_prefill`` releases decode before anything else.
 
     On an accelerator the decode release comes unconditionally first -- before
     the vision tower runs, before the prefill graph loads -- so no failure path
@@ -193,12 +207,16 @@ def test_the_served_prefill_drops_the_decode_graph_first() -> None:
         image_token_indices = None
 
     class _Pipeline:
-        def __init__(self, transient: bool) -> None:
+        def __init__(self, transient: bool, on_accelerator: bool) -> None:
             self.releases_language_graphs = transient
+            self.on_accelerator = on_accelerator
             self.calls: list[str] = []
 
         def release_decode(self):
             self.calls.append("release_decode")
+
+        def retain_only_prefill(self, seq_len):
+            self.calls.append(f"retain_only_prefill({seq_len})")
 
         def release_prefill(self):
             self.calls.append("release_prefill")
@@ -214,15 +232,19 @@ def test_the_served_prefill_drops_the_decode_graph_first() -> None:
             self.calls.append("run_prefill")
             return _Result()
 
-    for transient, expected in (
-        (True, ["release_decode", "run_vision", "drop_vision_weights", "run_prefill", "release_prefill"]),
-        (False, ["run_vision", "drop_vision_weights", "run_prefill"]),
+    for transient, on_accelerator, expected in (
+        # an accelerator without the registry (int8): one language graph at a time
+        (True, True, ["release_decode", "run_vision", "drop_vision_weights", "run_prefill", "release_prefill"]),
+        # an accelerator with the registry (bf16): both graphs stay, the prefill cache is bounded
+        (False, True, ["retain_only_prefill(3)", "run_vision", "drop_vision_weights", "run_prefill"]),
+        # CPU: everything stays resident, as before
+        (False, False, ["run_vision", "drop_vision_weights", "run_prefill"]),
     ):
         model = object.__new__(UnlimitedOCRModel)
-        model._pipeline = _Pipeline(transient)
+        model._pipeline = _Pipeline(transient, on_accelerator)
         model._served = {}
         logits = UnlimitedOCRModel._prefill(model, "r1", _Inputs(), np.array([1, 2, 3], dtype=np.int64))
-        assert model._pipeline.calls == expected, transient
+        assert model._pipeline.calls == expected, (transient, on_accelerator)
         # The request's state is recorded either way -- a release that also
         # dropped the host KV cache would break decoding entirely.
         assert model._served["r1"].cache == "cache-sentinel"

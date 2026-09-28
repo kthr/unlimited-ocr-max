@@ -1,12 +1,14 @@
 """The in-process pipeline: vision graph(s) + prefill graph + decode graph, and greedy decoding.
 
-Graphs are compiled lazily. On an accelerator the pipeline holds one language
-graph at a time (prefill is released once its host outputs are back, the decode
-graph before the next prefill -- :attr:`UnlimitedOcrPipeline.releases_language_graphs`),
-binds both language graphs to ONE shared device copy of the language weights
+Graphs are compiled lazily. On an accelerator the pipeline binds both language
+graphs to ONE shared device copy of the language weights
 (:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT` -- **bf16 only**; the int8 variant
-serves unshared, KON-162), and keeps the KV cache
-device-resident; on CPU every graph stays resident and the cache is host numpy.
+serves unshared, KON-162) and keeps the KV cache device-resident. With that
+registry both language graphs stay resident; without it (int8) the pipeline
+holds one at a time -- prefill is released once its host outputs are back, the
+decode graph before the next prefill
+(:attr:`UnlimitedOcrPipeline.releases_language_graphs`). On CPU every graph
+stays resident and the cache is host numpy.
 ``base`` mode is one 1024px view; a tiled
 :class:`~unlimited_ocr_max.batch_processor.CropLayout`
 selects ``gundam`` (a 640px tile tower plus a layout graph), which is usable
@@ -54,10 +56,10 @@ __all__ = ["SHARE_LANGUAGE_WEIGHTS_DEFAULT", "PrefillResult", "UnlimitedOcrPipel
 #: language graphs (KON-113, shipped by KON-158), instead of letting each graph
 #: materialise its own device copy of the same ~5.5 GiB. Served-validated in the
 #: research port: 12-page transcripts byte-identical in both walk orders, decode
-#: reload 8.4 -> 1.54 s. It shares the *weights* only -- the one-graph-at-a-time
-#: release policy is :attr:`UnlimitedOcrPipeline.releases_language_graphs` and is
-#: deliberately separate (holding both graphs measured over the Metal budget even
-#: with sharing on). Accelerator-only via
+#: reload 8.4 -> 1.54 s. It shares the *weights*; the release policy is
+#: :attr:`UnlimitedOcrPipeline.releases_language_graphs`, which since 0.3.2's
+#: fp32-resident non-expert weights keeps both graphs resident wherever this
+#: registry is on (they no longer hold weights of their own). Accelerator-only via
 #: :attr:`UnlimitedOcrPipeline.shares_language_weights`; CPU is untouched.
 #:
 #: **bf16 only (KON-162 / KON-161 round 2).** The served int8 identity gate at
@@ -191,16 +193,19 @@ class UnlimitedOcrPipeline:
     def releases_language_graphs(self) -> bool:
         """Whether a caller must hold **one** language graph at a time.
 
-        :attr:`on_accelerator` verbatim -- named so the served path
-        (``UnlimitedOCRModel._prefill``) honours the policy with the reason
-        travelling along, instead of reading the device raw. Deliberately
-        **not** gated by :attr:`shares_language_weights`: sharing removes the
-        duplicate weight copy, but holding both graphs was measured over the
-        Metal budget even with sharing on (KON-113: 18.629 of 17.760 GiB, short
-        from both load orders), so one graph at a time stands on its own. On
-        CPU every graph stays resident and a reload would be pure loss.
+        On an accelerator **without** the shared weight registry -- int8 today --
+        each graph places its own weight copy, and holding both was measured
+        over the Metal budget (KON-113: 18.629 of 17.760 GiB); int8's own
+        hold-both ledger is unmeasured. **With** the registry (bf16 on an
+        accelerator) the graphs hold no weights of their own since 0.3.2: the
+        prefill graph costs 0.002 GiB and the decode graph 0.000 GiB beyond the
+        registry, 7.67 of 17.760 GiB for everything on an M4, so releasing
+        them would only re-pay a graph reload on every request. On CPU every
+        graph stays resident and a reload would be pure loss. Named so the
+        served path (``UnlimitedOCRModel._prefill``) carries the reason along
+        instead of reading the device raw.
         """
-        return self.on_accelerator
+        return self.on_accelerator and not self.shares_language_weights
 
     @property
     def max_total_len(self) -> int:
@@ -464,6 +469,20 @@ class UnlimitedOcrPipeline:
         """
         self._prefill.clear()
         gc.collect()
+
+    def retain_only_prefill(self, seq_len: int) -> None:
+        """Drop every cached prefill graph except ``seq_len``'s.
+
+        The bound a pipeline that holds its language graphs needs: prefill
+        graphs are compiled per static prompt length and cached, and without a
+        per-request release a server fed prompts of many lengths would keep one
+        compiled graph for each.
+        """
+        stale = [length for length in self._prefill if length != seq_len]
+        for length in stale:
+            del self._prefill[length]
+        if stale:
+            gc.collect()
 
     # -- execution ---------------------------------------------------------- #
     def _execute(
