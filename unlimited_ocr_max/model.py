@@ -5,7 +5,8 @@ memory planner requires an ``ArchConfigWithKVCache``, so both declare a
 deliberately empty paged cache (1 layer, 1 head, ``head_dim`` 1: 16 KiB at
 ``--max-length 2048``) that nothing reads. The real cache is
 :class:`~unlimited_ocr_max.kv_cache.KvCache`, one per in-flight request, keyed
-by request id. ``base`` mode and batch size 1 only.
+by request id. ``base`` mode only; batch size 1 unless ``--max-batch-size`` raises it, bf16 on an
+accelerator only, capped at ``MAX_BATCH_CAP``.
 """
 
 from __future__ import annotations

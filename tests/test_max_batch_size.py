@@ -16,9 +16,10 @@ from unlimited_ocr_max import cli
 # env parsing: model.serve_max_batch_size()
 # --------------------------------------------------------------------------- #
 def test_serve_max_batch_size_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
-    from unlimited_ocr_max.model import MAX_BATCH_SIZE_ENV, serve_max_batch_size
+    from unlimited_ocr_max.model import MAX_BATCH_CAP, MAX_BATCH_SIZE_ENV, serve_max_batch_size
 
     assert MAX_BATCH_SIZE_ENV == cli.MAX_BATCH_SIZE_ENV
+    assert MAX_BATCH_CAP == cli.MAX_BATCH_CAP
 
     monkeypatch.delenv(MAX_BATCH_SIZE_ENV, raising=False)
     assert serve_max_batch_size() == 1  # unset
