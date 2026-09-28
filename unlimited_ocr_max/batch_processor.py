@@ -229,7 +229,14 @@ def preprocess_page_gundam(source: str | Path | Image.Image) -> GundamViews:
 
 
 class UnlimitedOcrBatchProcessor(BatchProcessor[TextAndVisionContext, "UnlimitedOcrInputs"]):
-    """One page per request, batch size 1: the prefill graph's ``seq_len`` is static."""
+    """One page per request, up to ``--max-batch-size`` requests per scheduler step.
+
+    The prefill graph's ``seq_len`` is static, so ``UnlimitedOCRModel.execute``
+    runs a prefill batch as one batch-1 prefill per context: every input is
+    kept per context -- ``token_counts`` splits the concatenated ``tokens``,
+    and ``pixel_values`` / ``image_token_indices`` hold one buffer per context,
+    in batch order.
+    """
 
     def __init__(self, config: ArchConfig, runtime: BatchProcessorRuntime) -> None:
         super().__init__(config, runtime)
@@ -249,40 +256,52 @@ class UnlimitedOcrBatchProcessor(BatchProcessor[TextAndVisionContext, "Unlimited
         ]
 
     def _pixel_values(self, context_batch: Sequence[TextAndVisionContext]) -> list[Buffer] | None:
-        views: list[np.ndarray] = []
+        """One ``[n_views, 3, H, W]`` buffer per context on a prefill step, in batch order; ``None`` on a decode step.
+
+        A prefill step is one where the contexts still need vision encoding.
+        In-flight batching is off, so a step is all-prefill or all-decode: a
+        batch that mixes the two cannot be split into per-context prefills and
+        is refused.
+        """
+        pending = [context.needs_vision_encoding for context in context_batch]
+        if not any(pending):
+            return None
+        if not all(pending):
+            raise ValueError(
+                f"{pending.count(False)} of {len(pending)} requests in a prefill batch carry no page to encode; "
+                "Unlimited-OCR takes exactly one page per request"
+            )
+        buffers: list[Buffer] = []
         for context in context_batch:
-            if not context.needs_vision_encoding:
-                continue
             images = context.next_images
             if len(images) != 1:
                 raise ValueError(f"Unlimited-OCR takes exactly one page per request, got {len(images)}")
             pixels = np.asarray(images[0].pixel_values, dtype=np.float32)
-            if pixels.ndim == IMAGE_NDIMS:
-                views.extend(pixels)
-            elif pixels.ndim == IMAGE_NDIMS - 1:
-                views.append(pixels)
-            else:
+            if pixels.ndim == IMAGE_NDIMS - 1:
+                pixels = pixels[None, ...]
+            elif pixels.ndim != IMAGE_NDIMS:
                 raise ValueError(f"expected pixel_values of rank 3 or 4, got shape {pixels.shape}")
-        if not views:
-            return None
-        buffer = Buffer.from_numpy(np.ascontiguousarray(np.stack(views), dtype=np.float32))
-        return [buffer.to(device) for device in self._devices]
+            buffers.append(Buffer.from_numpy(np.ascontiguousarray(pixels, dtype=np.float32)).to(self._devices[0]))
+        return buffers
 
     def _image_token_indices(self, context_batch: Sequence[TextAndVisionContext]) -> list[Buffer] | None:
-        """Placeholder rows, only for contexts still needing vision encoding (i.e. on a prefill step)."""
-        parts: list[np.ndarray] = []
-        offset = 0
-        for context in context_batch:
-            if not context.needs_vision_encoding:
-                continue
-            indices = context.extra_model_args.get("image_token_indices")
-            if indices is not None:
-                parts.append(np.asarray(indices, dtype=np.int32) + offset)
-            offset += context.tokens.active_length
-        if not parts:
+        """Each context's own placeholder rows, one buffer per context on a prefill step; else ``None``.
+
+        Indices are into that context's own tokens (each context is prefilled
+        on its own), so there is no offset across the batch. ``None`` too when
+        no context carries them; a batch where only some do is refused.
+        """
+        pending = [context for context in context_batch if context.needs_vision_encoding]
+        indices = [context.extra_model_args.get("image_token_indices") for context in pending]
+        present = [value is not None for value in indices]
+        if not any(present):
             return None
-        buffer = Buffer.from_numpy(np.concatenate(parts).astype(np.int32, copy=False))
-        return [buffer.to(device) for device in self._devices]
+        if not all(present):
+            raise ValueError(
+                f"{present.count(False)} of {len(present)} requests in a prefill batch carry no image_token_indices"
+            )
+        device = self._devices[0]
+        return [Buffer.from_numpy(np.ascontiguousarray(value, dtype=np.int32)).to(device) for value in indices]
 
     def prepare_initial_token_inputs(
         self,
@@ -295,12 +314,14 @@ class UnlimitedOcrBatchProcessor(BatchProcessor[TextAndVisionContext, "Unlimited
         if len(replica_batches) != 1:
             raise ValueError("Unlimited-OCR does not support data parallelism")
         context_batch = replica_batches[0]
-        if len(context_batch) != 1:
-            raise ValueError(f"the batch size must be 1 (static prompt length per graph); got {len(context_batch)}")
-        tokens = np.concatenate([context.tokens.active for context in context_batch]).astype(np.int64, copy=False)
+        if not context_batch:
+            raise ValueError("an empty batch has nothing to run")
+        active = [context.tokens.active for context in context_batch]
+        tokens = np.concatenate(active).astype(np.int64, copy=False)
         del return_n_logits
         return UnlimitedOcrInputs(
             tokens=Buffer.from_numpy(tokens).to(self._devices[0]),
+            token_counts=tuple(int(row.shape[0]) for row in active),
             pixel_values=self._pixel_values(context_batch),
             image_token_indices=self._image_token_indices(context_batch),
             request_ids=tuple(request_key(context.request_id) for context in context_batch),

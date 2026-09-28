@@ -1,7 +1,9 @@
 """The in-process pipeline: vision graph(s) + prefill graph + decode graph(s), and greedy decoding.
 
-Graphs are compiled lazily. On an accelerator the pipeline binds every language
-graph to ONE shared device copy of the language weights
+Graphs are compiled lazily, except the batched decode graphs a caller loads
+up front with :meth:`UnlimitedOcrPipeline.warm_decode_graphs`. On an
+accelerator the pipeline binds every language graph to ONE shared device
+copy of the language weights
 (:data:`SHARE_LANGUAGE_WEIGHTS_DEFAULT` -- **bf16 only**; the int8 variant
 serves unshared, KON-162) and keeps the KV cache device-resident. With that
 registry the language graphs stay resident; without it (int8) the pipeline
@@ -11,6 +13,8 @@ decode graphs before the next prefill
 stays resident and the cache is host numpy. The decode graphs are the batch-1
 step and, for :meth:`UnlimitedOcrPipeline.decode_rows`, one batched step per
 row count ``B >= 2``; :meth:`UnlimitedOcrPipeline.release_decode` drops them all.
+:attr:`UnlimitedOcrPipeline.min_decode_rows` pads a ``decode_rows`` call with
+fewer real rows up to that many with pipeline-owned dummy rows.
 ``base`` mode is one 1024px view; a tiled
 :class:`~unlimited_ocr_max.batch_processor.CropLayout`
 selects ``gundam`` (a 640px tile tower plus a layout graph), which is usable
@@ -86,6 +90,14 @@ __all__ = ["SHARE_LANGUAGE_WEIGHTS_DEFAULT", "PrefillResult", "UnlimitedOcrPipel
 #: steady decode-step cost with it.
 SHARE_LANGUAGE_WEIGHTS_DEFAULT = True
 
+#: The token a padding row feeds (:attr:`UnlimitedOcrPipeline.min_decode_rows`): any valid id
+#: does, its outputs are discarded; fixed so every padded step is the same computation.
+PADDING_TOKEN_ID = 0
+
+#: A padding cache's pinned prefix: one zero row, then a one-slot ring. Reset before every padded
+#: step, it always writes row 1 at position 1 and attends over two rows.
+PADDING_PREFIX_LEN = 1
+
 
 @dataclass(frozen=True)
 class PrefillResult:
@@ -151,6 +163,17 @@ class UnlimitedOcrPipeline:
         self._decode: tuple[DecodeGraph, Model] | None = None
         #: The batched decode graphs, keyed by row count ``B >= 2``.
         self._batched_decode: dict[int, tuple[DecodeGraph, Model]] = {}
+        #: The fewest rows :meth:`decode_rows` executes: a call with fewer real
+        #: rows is padded up to this many with dummy rows (:meth:`_padding_rows`),
+        #: whose outputs are discarded. 1 (the default) runs a lone request on
+        #: the batch-1 graph, as before; 2 runs it on the 2-row graph, which is
+        #: not bitwise the batch-1 graph but whose row bits do not depend on
+        #: what rides alongside -- so a request's output does not depend on
+        #: load. A plain attribute: the served model sets it at startup.
+        self.min_decode_rows = 1
+        #: The dummy caches padding rows run against, allocated on first need
+        #: and kept: ``_padding_caches[k]`` is padding row ``k``.
+        self._padding_caches: list[KvCache] = []
         # Compile the Mojo guard now, so a missing Metal Toolchain fails at load
         # rather than on the first request. Its own graph; the model graphs are unaffected.
         if self.ngram_blocker is not None:
@@ -440,7 +463,8 @@ class UnlimitedOcrPipeline:
         return self._decode
 
     def batched_decode_graph(self, batch: int) -> tuple[DecodeGraph, Model]:
-        """The decode step for ``batch >= 2`` independent requests, compiled lazily and cached per ``batch``.
+        """The decode step for ``batch >= 2`` independent requests, compiled on first use (or up front by
+        :meth:`warm_decode_graphs`) and cached per ``batch``.
 
         Built and loaded exactly like :attr:`decode_graph` -- a fresh decoder,
         the same ``max_seq_len``, the same weight declaration and registry --
@@ -460,6 +484,19 @@ class UnlimitedOcrPipeline:
             cached = (staged, self.session.load(staged.graph, weights_registry=decoder.state_dict()))
             self._batched_decode[batch] = cached
         return cached
+
+    def warm_decode_graphs(self, max_batch: int) -> None:
+        """Load :meth:`batched_decode_graph` for ``B = 2 .. max_batch``, in that order; a no-op below 2.
+
+        The eager startup a served ``--max-batch-size N > 1`` pays once so no
+        request waits on a compile (24-33 s cold per ``B`` on the real
+        checkpoint, ~0.8 s once MAX's cache holds it). Each graph binds the
+        language weights, so on an accelerator the first one also builds the
+        shared registry (:meth:`_resolved_language_weights`) if nothing has
+        yet. The graphs stay loaded until :meth:`release_decode`.
+        """
+        for batch in range(2, max_batch + 1):
+            self.batched_decode_graph(batch)
 
     # -- lifetime ----------------------------------------------------------- #
     def drop_vision_weights(self) -> None:
@@ -608,22 +645,38 @@ class UnlimitedOcrPipeline:
     def decode_rows(self, caches: Sequence[KvCache], token_ids: Sequence[int]) -> np.ndarray:
         """Feed ``token_ids[b]`` to request ``b`` at ``caches[b].position``; ``[B, vocab]`` fp32 logits, row ``b`` for it.
 
-        ``B == 1`` is :meth:`decode_step` -- the unchanged batch-1 graph --
-        reshaped to ``[1, vocab]``. ``B >= 2`` is one execute of
-        :meth:`batched_decode_graph`, then each cache appends its own row
-        ``b`` of every ``key_i`` / ``value_i``. On a
+        Fewer than :attr:`min_decode_rows` real rows are first padded up to it
+        with :meth:`_padding_rows`, appended after the real ones, each fed
+        :data:`PADDING_TOKEN_ID`; only the ``B`` real rows' logits come back
+        and the padding rows' outputs are discarded. So with the default
+        ``min_decode_rows == 1`` nothing is padded, and with 2 a lone request
+        runs the 2-row graph, never the batch-1 one.
+
+        Then one row is :meth:`decode_step` -- the unchanged batch-1 graph --
+        reshaped to ``[1, vocab]``, and two or more are one execute of
+        :meth:`batched_decode_graph`, after which each cache appends its own
+        row ``b`` of every ``key_i`` / ``value_i``. On a
         :class:`~unlimited_ocr_max.kv_cache.DeviceKvCache` those rows are
         ``[b : b + 1, :, :]`` views of the graph's own device outputs, ordered
         behind the submission that produced them, so the async copy needs no
         drain (the rule ``DeviceKvCache._write_row`` states).
 
-        Every cache must be of one class: the single execute brings back one
-        set of host outputs, ``caches[0].HOST_OUTPUTS``.
+        No cache may appear twice (one execute would hand it two rows and it
+        would append both), and every cache, padding included, must be of one
+        class: the single execute brings back one set of host outputs,
+        ``caches[0].HOST_OUTPUTS``.
         """
         if len(caches) != len(token_ids):
             raise ValueError(f"{len(caches)} caches for {len(token_ids)} tokens")
         if not caches:
             raise ValueError("decode_rows needs at least one row")
+        if len({id(cache) for cache in caches}) != len(caches):
+            raise ValueError("the same cache appears more than once in one decode_rows call")
+        real = len(caches)
+        if real < self.min_decode_rows:
+            padding = self._padding_rows(self.min_decode_rows - real)
+            caches = [*caches, *padding]
+            token_ids = [*token_ids, *([PADDING_TOKEN_ID] * len(padding))]
         kinds = {type(cache) for cache in caches}
         if len(kinds) != 1:
             raise TypeError(f"every cache must be of one class, got {sorted(kind.__name__ for kind in kinds)}")
@@ -642,7 +695,43 @@ class UnlimitedOcrPipeline:
                 [outputs[f"key_{i}"][b : b + 1, :, :] for i in range(staged.num_layers)],
                 [outputs[f"value_{i}"][b : b + 1, :, :] for i in range(staged.num_layers)],
             )
-        return outputs["logits"]
+        logits = outputs["logits"]
+        return logits if len(caches) == real else logits[:real]
+
+    def _padding_rows(self, count: int) -> list[KvCache]:
+        """``count`` pipeline-owned dummy caches for :meth:`decode_rows`, their ring state reset.
+
+        Each is allocated once, on first need, on this pipeline's device and
+        so of the class :meth:`run_prefill` allocates (a
+        :class:`~unlimited_ocr_max.kv_cache.DeviceKvCache` on an accelerator):
+        a :data:`PADDING_PREFIX_LEN`-row prefix of zeros and a one-slot ring.
+        The ring state is put back to the seeded one before every padded step,
+        so however many steps it pads, a dummy writes row 1 at position 1 over
+        two attended rows: its position never runs past :attr:`max_total_len`,
+        and the step it contributes is the same computation every time. Only
+        the state is reset; the row it wrote last step is overwritten by the
+        graph's own ``write_sel`` substitution before anything reads it.
+        """
+        dec = self.config.decoder
+        while len(self._padding_caches) < count:
+            cache = allocate_kv_cache(
+                num_layers=dec.num_hidden_layers,
+                prefill_len=PADDING_PREFIX_LEN,
+                window=1,
+                num_kv_heads=dec.num_key_value_heads,
+                head_dim=dec.head_dim,
+                device=self._driver_device if self.on_accelerator else None,
+            )
+            shape = (PADDING_PREFIX_LEN, dec.num_key_value_heads, dec.head_dim)
+            zeros = [np.zeros(shape, dtype=np.float32) for _ in range(dec.num_hidden_layers)]
+            cache.seed(zeros, zeros)
+            self._padding_caches.append(cache)
+        rows = self._padding_caches[:count]
+        for cache in rows:
+            # What `seed` set: the prefix pinned, the ring empty, the next position right after it.
+            cache.length = cache.prefill_len = cache.position = PADDING_PREFIX_LEN
+            cache.ring_pos = 0
+        return rows
 
     def generate(self, *, pixels: np.ndarray, token_ids: np.ndarray, local_pixels: np.ndarray | None = None) -> list[int]:
         """Greedy decode to EOS (included) or ``max_new_tokens``; the n-gram guard, if on, is applied to every step."""
