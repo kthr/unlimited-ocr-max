@@ -383,7 +383,8 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
     assert host["hardware"].endswith(", CPU")
     assert set(doc["versions"]) == {"unlimited-ocr-max", "max", "mojo"}
     assert doc["flags"] == {"devices": "cpu", "weights": "bf16", "model": cli.DEFAULT_MODEL, "revision": cli.DEFAULT_REVISION,
-                            "port": port, "ngram_size": 35, "ready_timeout_s": 1800, "out": str(out)}
+                            "port": port, "ngram_size": 35, "ready_timeout_s": 1800, "out": str(out),
+                            "max_batch_size": 1, "concurrency": 1}
     assert doc["served_command"] == served
     assert isinstance(doc["device_baseline"], dict)
     assert doc["void"] == [] and doc["teardown_warnings"] == []
@@ -1418,11 +1419,24 @@ def test_row_decode_cell_at_concurrency_one_is_byte_identical_to_before_concurre
 
 
 def test_row_decode_cell_above_concurrency_one_leads_with_the_aggregate_tok_s() -> None:
+    """Aggregate tok/s, then the FULL batch's step time -- not the median over every batch size."""
+    by_batch = {3: {"median_ms": 85.8, "n": 6}, 1: {"median_ms": 65.5, "n": 12}}
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}, "concurrency": {
+        "n": 3, "max_batch_size": 4, "tok_s": 55.5, "latency_median_s": 0.2, "by_batch_size": by_batch,
+    }}
+    cell = _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3]
+    assert cell == "**55.5 tok/s** (85.8 ms/step at 3 rows, n=6, concurrency 3)"
+    # Read back from profile.json the keys are strings; the same cell comes out.
+    figures["concurrency"]["by_batch_size"] = {str(k): v for k, v in by_batch.items()}
+    assert _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3] == cell
+
+
+def test_row_decode_cell_without_a_full_batch_figure_says_it_is_the_mixed_median() -> None:
     figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}, "concurrency": {
         "n": 3, "max_batch_size": 4, "tok_s": 55.5, "latency_median_s": 0.2, "by_batch_size": {},
     }}
     cell = _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3]
-    assert cell == "**55.5 tok/s** (50.0 ms/step, n=39, concurrency 3)"
+    assert cell == "**55.5 tok/s** (50.0 ms/step over all batch sizes, n=39, concurrency 3)"
 
 
 def test_concurrency_figure_raises_when_no_page_completed() -> None:

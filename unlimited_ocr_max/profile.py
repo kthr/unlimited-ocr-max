@@ -1010,8 +1010,9 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
 
     The decode cell is unchanged at ``concurrency`` 1 (or when the figure never got computed): the
     single-request decode rate and step time. Above 1, it instead leads with the run's aggregate
-    tok/s -- what concurrent clients actually achieved -- and names the concurrency, keeping the
-    decode step time and count from the same steady population as before.
+    tok/s -- what concurrent clients actually achieved -- and names the concurrency. Its step time
+    is then the full batch's (``concurrency`` rows, from ``by_batch_size``), not a median over
+    every batch size the run passed through; without a full-batch figure it says so.
     """
     decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
     concurrency = figures.get("concurrency")
@@ -1020,8 +1021,12 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
     else:
         memory = _memory_cell(host_memory_figure(figures)[1])
     if decode and concurrency and concurrency["n"] > 1:
-        decode_cell = (f"**{concurrency['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, "
-                       f"n={decode['n']}, concurrency {concurrency['n']})")
+        n = concurrency["n"]
+        by_batch = concurrency.get("by_batch_size") or {}
+        full = by_batch.get(n) or by_batch.get(str(n))  # int keys in process, str keys from profile.json
+        step = (f"{full['median_ms']:.1f} ms/step at {n} rows, n={full['n']}" if full
+                else f"{decode['median_ms']:.1f} ms/step over all batch sizes, n={decode['n']}")
+        decode_cell = f"**{concurrency['tok_s']:.1f} tok/s** ({step}, concurrency {n})"
     elif decode:
         decode_cell = f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})"
     else:
@@ -1369,6 +1374,8 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         "flags": {
             "devices": args.devices, "weights": args.weights, "model": args.model, "revision": args.revision,
             "port": args.port, "ngram_size": args.ngram_size, "ready_timeout_s": args.ready_timeout_s, "out": str(out),
+            "max_batch_size": args.max_batch_size,
+            "concurrency": _resolve_concurrency(args.max_batch_size, args.concurrency),
         },
         "served_command": server.cmd,
         "server_ready_s": ready_s,
