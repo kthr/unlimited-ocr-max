@@ -8,9 +8,12 @@
   `--weights int8` and `--devices cpu` are refused above `1`. `--max-batch-size 1` runs exactly the
   previous single-request path.
 - **Load-independent decode.** With `N > 1` every decode step runs a multi-row graph; a lone
-  request is padded to 2 rows, so its output is identical whatever else is in flight. Prefill still
-  runs one request at a time: a new request's prefill pauses the running decodes (no in-flight
-  batching).
+  request is padded to 2 rows, so its output is identical whatever else is in flight. That graph's
+  arithmetic is not bitwise the single-request graph's (on Metal, logits within 3.7e-3 over 256
+  steps on each of 8 pages), so on
+  other inputs text can differ from `--max-batch-size 1`; on the 12 bundled pages it does not.
+  Prefill still runs one request at a time: a new request's prefill pauses the running decodes (no
+  in-flight batching).
 - **Startup now eagerly compiles every batch size.** The multi-row graphs for `B = 2..N` compile at
   server startup. Apple M4: first boot 142.5 s, with 4 of the 7 graphs compiling cold (a fully cold
   boot is estimated at 7 × 24–33 s); 24.6–28.5 s once cached, against 14.3–22.4 s at `N = 1`.

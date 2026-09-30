@@ -155,6 +155,11 @@ arithmetic rather than a change in this release.
 Concurrency 8 is 1.81× the default server's aggregate over the same corpus
 (19.2 tok/s, 26.2 s per-page latency median).
 
+Above `--max-batch-size 1` every decode step runs on a multi-row graph, whose
+arithmetic is not bitwise the single-request graph's (on Metal its logits
+differed by up to 3.7e-3, over 256 steps on each of 8 pages). So on other inputs its text can differ from
+`--max-batch-size 1`; on these 12 pages it does not.
+
 ## Not supported
 
 `gundam` (tiled) mode; batch size > 1 with `--weights int8` or `--devices cpu`;
