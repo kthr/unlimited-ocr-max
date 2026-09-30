@@ -241,6 +241,13 @@ class UnlimitedOCRModel(PipelineModelWithKVCache[TextAndVisionContext]):
         is_int8 = self._weights_are_int8(weights)
         max_batch_size = serve_max_batch_size()
         check_max_batch_size(max_batch_size, device=self.device_refs[0], int8=is_int8)
+        if int(self.max_batch_size) != max_batch_size:
+            # `required_arguments` makes them equal; only `max serve --force` skips it, and then
+            # the scheduler would batch rows this worker has neither warmed nor padded for.
+            raise ValueError(
+                f"the scheduler batches up to {self.max_batch_size} requests but {MAX_BATCH_SIZE_ENV} "
+                f"is {max_batch_size}; set the batch size with `unlimited-ocr-max serve --max-batch-size`"
+            )
         if is_int8:
             # The decoder the adapter checks the file against must declare the int8 stacks and their scales.
             self._arch_config.model = self._arch_config.model.with_int8_experts()

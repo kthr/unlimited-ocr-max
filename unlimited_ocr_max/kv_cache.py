@@ -67,9 +67,18 @@ class KvCache:
                 f"{length + self.window} rows, but only {self.max_seq_len} are allocated"
             )
         self._write_prefix(keys, values, length)
-        self.length = length
         self.prefill_len = length
-        self.position = length
+        self.rewind_to_seed()
+
+    def rewind_to_seed(self) -> None:
+        """Back to the state :meth:`seed` leaves: the prefix pinned, the ring empty, the next position right after it.
+
+        State only: rows the ring wrote since keep their bytes, and the next
+        decode step's ``write_sel`` substitution replaces the one it reads
+        before anything else does.
+        """
+        self.length = self.prefill_len
+        self.position = self.prefill_len
         self.ring_pos = 0
 
     def _write_prefix(self, keys: Sequence[Any], values: Sequence[Any], length: int) -> None:

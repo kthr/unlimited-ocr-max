@@ -236,8 +236,10 @@ class UnlimitedOcrPipeline:
         A batched decode graph (:meth:`batched_decode_graph`) is one more
         language graph under the same rule: without the registry it places its
         own weight copy, so it counts against the one-at-a-time budget
-        alongside the batch-1 decode graph. Its footprint beyond the registry
-        is not measured yet.
+        alongside the batch-1 decode graph -- unreachable today, since
+        :func:`~unlimited_ocr_max.model.check_max_batch_size` refuses int8
+        above batch 1. With the registry each batched graph costs 0.002 GiB
+        beyond it (EXPERIMENTS.md, KON-213).
         """
         return self.on_accelerator and not self.shares_language_weights
 
@@ -728,9 +730,7 @@ class UnlimitedOcrPipeline:
             self._padding_caches.append(cache)
         rows = self._padding_caches[:count]
         for cache in rows:
-            # What `seed` set: the prefix pinned, the ring empty, the next position right after it.
-            cache.length = cache.prefill_len = cache.position = PADDING_PREFIX_LEN
-            cache.ring_pos = 0
+            cache.rewind_to_seed()
         return rows
 
     def generate(self, *, pixels: np.ndarray, token_ids: np.ndarray, local_pixels: np.ndarray | None = None) -> list[int]:

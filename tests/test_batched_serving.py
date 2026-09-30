@@ -33,7 +33,7 @@ import unlimited_ocr_max.model as model_module
 import unlimited_ocr_max.pipeline as pipeline_module
 from unlimited_ocr_max.batch_processor import UnlimitedOcrBatchProcessor
 from unlimited_ocr_max.graphs import DecodeGraph
-from unlimited_ocr_max.kv_cache import DeviceKvCache, KvCache, to_host
+from unlimited_ocr_max.kv_cache import DeviceKvCache, KvCache, allocate_kv_cache, to_host
 from unlimited_ocr_max.model import (
     MAX_BATCH_SIZE_ENV,
     ServedRequest,
@@ -514,10 +514,13 @@ class _RecordingPipeline:
         self.warmed.append((max_batch, self.min_decode_rows))
 
 
-def _init_model(monkeypatch: pytest.MonkeyPatch, max_batch_size: int) -> UnlimitedOCRModel:
+def _init_model(
+    monkeypatch: pytest.MonkeyPatch, max_batch_size: int, scheduler_max_batch_size: int | None = None
+) -> UnlimitedOCRModel:
     """``UnlimitedOCRModel.__init__`` itself, over a fake base init, arch config, prompt length and pipeline."""
 
     def base_init(self, *args: Any, **kwargs: Any) -> None:
+        self.max_batch_size = max_batch_size if scheduler_max_batch_size is None else scheduler_max_batch_size
         self.pipeline_config = SimpleNamespace()
         self.devices = [CPU()]
         self.device_refs = [DeviceRef.GPU(0)]
@@ -546,6 +549,15 @@ def test_init_pads_and_warms_only_above_batch_one(monkeypatch: pytest.MonkeyPatc
     else:
         assert (pipeline.min_decode_rows, pipeline.warmed) == (2, [(max_batch_size, 2)])
     assert model._served == {}
+
+
+@pytest.mark.parametrize(("env", "scheduler"), [(1, 8), (8, 1), (4, 8)])
+def test_init_refuses_a_scheduler_batch_size_the_env_did_not_set(
+    monkeypatch: pytest.MonkeyPatch, env: int, scheduler: int
+) -> None:
+    """``max serve --force`` skips ``required_arguments``; the worker must not serve a batch size it did not warm."""
+    with pytest.raises(ValueError, match=f"the scheduler batches up to {scheduler} requests but"):
+        _init_model(monkeypatch, env, scheduler_max_batch_size=scheduler)
 
 
 # --------------------------------------------------------------------------
@@ -641,3 +653,18 @@ def test_a_padded_lone_row_computes_the_bits_it_computes_beside_real_rows(_accel
         assert np.array_equal(logits, alone_logits), (order, delta)
         for got, want in zip(kv, alone_kv, strict=True):
             assert np.array_equal(got, want), (order, delta)
+
+
+def test_rewind_to_seed_restores_exactly_the_state_seed_left() -> None:
+    """Warm-up appends, then ring overwrites, then a rewind: ``length``/``prefill_len``/``position``/``ring_pos`` as seeded."""
+    cache = allocate_kv_cache(num_layers=2, prefill_len=3, window=2, num_kv_heads=1, head_dim=2, device=None)
+    prefix = [np.ones((3, 1, 2), dtype=np.float32) for _ in range(2)]
+    cache.seed(prefix, prefix)
+    seeded = (cache.length, cache.prefill_len, cache.position, cache.ring_pos)
+    row = [np.full((1, 1, 2), 7.0, dtype=np.float32) for _ in range(2)]
+    for _ in range(5):  # two appends fill the ring, three more overwrite it
+        cache.append(row, row)
+    assert (cache.length, cache.position) == (5, 8)
+    cache.rewind_to_seed()
+    assert (cache.length, cache.prefill_len, cache.position, cache.ring_pos) == seeded == (3, 3, 3, 0)
+    assert cache.write_index == 3
