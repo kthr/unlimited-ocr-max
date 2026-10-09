@@ -5,25 +5,34 @@ first (MAX assigns weight FQNs while walking the tree, and doing that with a
 graph open raises), and a ``Weight`` binds to the first graph it is added to,
 so each graph needs a fresh module instance.
 
-An int8 decoder (``config.decoder.int8_experts``) stages ``ops.custom`` calls
-into ``kernels/moe_int8.mojo``, so both language graphs are then opened with
-``custom_extensions=[MOJO_KERNELS]``; a bf16 decoder's graphs are opened exactly
-as before. int8 is accelerator-only in this port and both builders refuse a CPU
-``DeviceRef`` (the CLI refuses ``--weights int8`` on cpu first; this is the
-second line).
+The decode graph (one per row count ``B``, ``B = 1`` included) attends through
+the pipeline's KV page pool -- MAX's ragged paged store and attention ops, one
+attention op per layer for all ``B`` rows (:class:`~unlimited_ocr_max.decoder.PagedKv`)
+-- stages the routed experts as ``ops.custom`` calls into the Mojo qmv kernels
+in either weight dtype (``moe_bf16_qmv`` / ``moe_int8_qmv``) and applies the
+no-repeat-n-gram guard to its own logits (``ngram_block``,
+:func:`~unlimited_ocr_max.ngram.apply_ngram_guard`); an int8 prefill graph stages
+``int8_dequant_expert``. Every language graph reads ``lm_head`` -- and the
+decode graph every other projection -- through ``dense_bf16_qmv`` (KON-238),
+so every one is opened with ``custom_extensions=[MOJO_KERNELS]``. The
+builders take any ``DeviceRef``, in either weight dtype: serving refuses a CPU
+device before any graph is built (:func:`~unlimited_ocr_max.model.check_serving_device`),
+and the model-free tests stage graphs on CPU.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
+import numpy as np
 from max.dtype import DType
-from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
+from max.graph import BufferType, DeviceRef, Graph, TensorType, TensorValue, Value, ops
 from max.nn import Module
+from max.nn.kv_cache import PACKED_PAGE_STRIDE, KVCacheInputsPerDevice, MHAKVCacheParams
 
 from .batch_processor import BASE_SIZE, ViewGeometry
-from .decoder import COMPUTE_DTYPE, UnlimitedOcrDecoder
+from .decoder import COMPUTE_DTYPE, PagedKv, UnlimitedOcrDecoder
+from .kv_cache import PAGE_SIZE
 from .layers.clip_l import ClipL, ClipLConfig, fuse_clip_sam
 from .layers.projector import (
     PROJECTOR_OUTPUT_DIM,
@@ -34,7 +43,7 @@ from .layers.projector import (
 )
 from .layers.sam_vit import IN_CHANS, SamViT
 from .model_config import DecoderConfig, UnlimitedOCRConfig
-from .ngram import MOJO_KERNELS
+from .ngram import MOJO_KERNELS, apply_ngram_guard
 
 __all__ = [
     "IMAGE_TOKEN_ID",
@@ -48,24 +57,79 @@ __all__ = [
     "build_language_graph",
     "build_layout_graph",
     "build_vision_graph",
-    "check_int8_device",
     "declare_device_resident_weights",
+    "paged_kv_from_inputs",
+    "paged_kv_input_types",
 ]
 
 
-def check_int8_device(config: DecoderConfig, device: DeviceRef) -> None:
-    """Refuse int8 experts on CPU: the port ships that path for accelerators only."""
-    if config.int8_experts and device.is_cpu():
-        raise ValueError(
-            "the int8 expert weights are GPU-only in this port; serve the bf16 weights on cpu "
-            "(or pick an accelerator device for int8)"
-        )
+def _guard_input_types(batch: int, window: int, device: DeviceRef) -> list[TensorType]:
+    """A decode graph's last two inputs: each row's guard history ``[batch, window]`` and the n-gram size ``[1]``, int32."""
+    return [
+        TensorType(DType.int32, [batch, window], device=device),
+        TensorType(DType.int32, [1], device=device),
+    ]
 
 
-def _language_graph_kwargs(decoder: UnlimitedOcrDecoder, device: DeviceRef) -> dict[str, Any]:
-    """Extra ``Graph(...)`` arguments for the decoder's mode: the Mojo kernels for int8, nothing for bf16."""
-    check_int8_device(decoder.config, device)
-    return {"custom_extensions": [MOJO_KERNELS]} if decoder.config.int8_experts else {}
+def paged_kv_input_types(config: DecoderConfig, batch: int, device: DeviceRef) -> list[BufferType | TensorType]:
+    """The decode graph's page-pool inputs, in the order :meth:`~unlimited_ocr_max.kv_cache.PagedStep.graph_inputs` returns them.
+
+    ``kv_blocks [pages, 2, layers, PAGE_SIZE, n_kv_heads, head_dim]`` fp32 (the
+    page count is symbolic: the pool's size is the pipeline's, not the
+    graph's), the lookup table ``[B, cols]`` uint32 (``cols`` symbolic), the
+    attention's cache lengths ``[B]`` and their max ``[1]``, the store's cache
+    lengths ``[B]`` and their max ``[1]``, and MAX's MHA dispatch key ``[4]``
+    int64. The two maxima and the dispatch key are host-resident, as MAX's
+    kernels read them.
+    """
+    cpu = DeviceRef.CPU()
+    blocks = [2, config.num_hidden_layers, PAGE_SIZE, config.num_key_value_heads, config.head_dim]
+    return [
+        BufferType(COMPUTE_DTYPE, ["total_num_pages", *blocks], device=device),
+        TensorType(DType.uint32, [batch, "lut_cols"], device=device),
+        TensorType(DType.uint32, [batch], device=device),
+        TensorType(DType.uint32, [1], device=cpu),
+        TensorType(DType.uint32, [batch], device=device),
+        TensorType(DType.uint32, [1], device=cpu),
+        TensorType(DType.int64, [4], device=cpu),
+    ]
+
+
+def paged_kv_from_inputs(values: list[Value], config: DecoderConfig, batch: int, device: DeviceRef) -> PagedKv:
+    """:class:`~unlimited_ocr_max.decoder.PagedKv` over the graph values typed by :func:`paged_kv_input_types`.
+
+    What is the same every step is a graph constant, as MAX itself spells the
+    packed page stride (``packed_page_stride``): the page stride (``-1``,
+    packed pages), the prompt width (1: one query per row) and the row offsets
+    ``0 .. B``. The number of KV partitions is 1 on every device, written into
+    the dispatch key by :meth:`~unlimited_ocr_max.kv_cache.KvPagePool.step`.
+    """
+    kv_blocks, lookup, attend_lengths, attend_max, write_index, write_max, dispatch = values
+    cpu = DeviceRef.CPU()
+    shared = {
+        "kv_blocks": kv_blocks.buffer,
+        "lookup_table": lookup.tensor,
+        "max_prompt_length": ops.constant(np.asarray([1], dtype=np.uint32), DType.uint32, device=cpu),
+        "page_stride": ops.constant(np.asarray([PACKED_PAGE_STRIDE], dtype=np.int64), DType.int64, device=cpu),
+    }
+    return PagedKv(
+        params=MHAKVCacheParams(
+            dtype=COMPUTE_DTYPE,
+            head_dim=config.head_dim,
+            num_layers=config.num_hidden_layers,
+            devices=[device],
+            n_kv_heads=config.num_key_value_heads,
+            page_size=PAGE_SIZE,
+        ),
+        store=KVCacheInputsPerDevice(cache_lengths=write_index.tensor, max_cache_length=write_max.tensor, **shared),
+        attend=KVCacheInputsPerDevice(
+            cache_lengths=attend_lengths.tensor,
+            max_cache_length=attend_max.tensor,
+            attention_dispatch_metadata=dispatch.tensor,
+            **shared,
+        ),
+        row_offsets=ops.constant(np.arange(batch + 1, dtype=np.uint32), DType.uint32, device=device),
+    )
 
 
 def declare_device_resident_weights(graph: Graph, decoder: UnlimitedOcrDecoder) -> int:
@@ -89,7 +153,7 @@ def declare_device_resident_weights(graph: Graph, decoder: UnlimitedOcrDecoder) 
     weights disappear. The declaration set itself is unchanged. The registry
     values ``session.load`` binds must then be device-resident
     (:meth:`~unlimited_ocr_max.pipeline.UnlimitedOcrPipeline._resolved_language_weights`
-    builds them), which is what lets both language graphs share **one** device
+    builds them), which is what lets every language graph share **one** device
     copy of the weights instead of materialising one each (KON-113/KON-158).
     On CPU the weight's device *is* the host, so this is never called there.
     """
@@ -285,7 +349,9 @@ def build_language_graph(
         TensorType(COMPUTE_DTYPE, [n_image_tokens, hidden], device=device),
     ]
     with Graph(
-        f"unlimited_ocr_language_tokens_{seq_len}", input_types=input_types, **_language_graph_kwargs(decoder, device)
+        f"unlimited_ocr_language_tokens_{seq_len}",
+        input_types=input_types,
+        custom_extensions=[MOJO_KERNELS],
     ) as graph:
         if device_resident_weights:
             declare_device_resident_weights(graph, decoder)
@@ -306,7 +372,8 @@ def build_language_graph(
 class DecodeGraph:
     graph: Graph
     output_names: tuple[str, ...]
-    num_layers: int
+    #: Requests stepped per execute.
+    batch: int = 1
 
 
 def build_decode_graph(
@@ -315,44 +382,56 @@ def build_decode_graph(
     *,
     max_seq_len: int,
     device: DeviceRef,
+    batch: int = 1,
     device_resident_weights: bool = False,
 ) -> DecodeGraph:
-    """The one-token step: ``(token_id, position, write_sel, key_cache_0..n, value_cache_0..n) -> (logits, key_*, value_*)``.
+    """One decode step for ``batch >= 1`` independent requests in one execute; the only output is ``logits [B, vocab]``.
 
-    The cache dimension ``past_len`` is symbolic; ``max_seq_len`` only sizes the
-    RoPE table. The MoE dispatch at ``seq == 1`` follows the device (see
-    :class:`~unlimited_ocr_max.decoder.MoE`). ``device_resident_weights`` is
+    Inputs, ``B = batch``:
+
+    * ``tokens [B]`` int64 and ``positions [B]`` int32, row ``b`` for request ``b``;
+    * the page pool, :func:`paged_kv_input_types` (``kv_blocks``, lookup table,
+      the attention's and the store's cache lengths and maxima, the dispatch
+      key) -- what :meth:`~unlimited_ocr_max.kv_cache.KvPagePool.step` builds;
+    * last, the n-gram guard's two (:func:`~unlimited_ocr_max.ngram.apply_ngram_guard`):
+      ``history [B, window]`` int32, row ``b``'s last ``window`` token ids
+      with the fed token last (``window`` is the R-SWA ring,
+      ``sliding_window_size``), and the n-gram size ``[1]`` int32, shared by
+      every row, 0 with the guard off.
+
+    Per layer the graph stores every row's new k/v into its pages and runs ONE
+    attention op for all ``B`` rows (:func:`~unlimited_ocr_max.decoder.paged_decode_attention`):
+    no per-row cache inputs, no ring write by selection, no KV outputs. The
+    logits come out guarded, each row against its own history, by one
+    ``ngram_block`` op. The MoE runs the stack dtype's Mojo qmv kernel on every
+    device (:meth:`~unlimited_ocr_max.decoder.MoE.decode_rows`).
+    ``max_seq_len`` only sizes the RoPE table. ``device_resident_weights`` is
     :func:`build_language_graph`'s parameter of the same name, same contract.
+
+    The step is not batch-invariant as a whole (only the attention op is), so
+    each ``B`` is its own graph and whether two are bitwise equal is measured,
+    not assumed.
     """
+    if batch < 1:
+        raise ValueError(f"batch must be >= 1, got {batch}")
     dec = config.decoder
-    num_layers = dec.num_hidden_layers
-    cache_type = TensorType(COMPUTE_DTYPE, ["past_len", dec.num_key_value_heads, dec.head_dim], device=device)
-    input_types: list[TensorType] = [
-        TensorType(DType.int64, [1], device=device),
-        TensorType(DType.int32, [1], device=device),
-        TensorType(DType.bool, [1, "past_len", 1], device=device),
-        *([cache_type] * (2 * num_layers)),
+    input_types: list[BufferType | TensorType] = [
+        TensorType(DType.int64, [batch], device=device),
+        TensorType(DType.int32, [batch], device=device),
+        *paged_kv_input_types(dec, batch, device),
+        *_guard_input_types(batch, dec.sliding_window_size, device),
     ]
     with Graph(
-        f"unlimited_ocr_decode_{max_seq_len}_ring", input_types=input_types, **_language_graph_kwargs(decoder, device)
+        f"unlimited_ocr_decode_{max_seq_len}_paged_b{batch}",
+        input_types=input_types,
+        custom_extensions=[MOJO_KERNELS],
     ) as graph:
         if device_resident_weights:
             declare_device_resident_weights(graph, decoder)
-        token_id = graph.inputs[0].tensor
-        position = graph.inputs[1].tensor
-        write_sel = graph.inputs[2].tensor
-        caches = [value.tensor for value in graph.inputs[3:]]
-        past_kv = [(caches[i], caches[num_layers + i]) for i in range(num_layers)]
-        normed, new_kv = decoder.decode(
-            decoder.embed(token_id), position=position, max_seq_len=max_seq_len, past_kv=past_kv, write_sel=write_sel
-        )
-        outputs: list[TensorValue] = [decoder.logits(normed)]
-        names: list[str] = ["logits"]
-        for i, (key, _) in enumerate(new_kv):
-            outputs.append(key)
-            names.append(f"key_{i}")
-        for i, (_, value) in enumerate(new_kv):
-            outputs.append(value)
-            names.append(f"value_{i}")
-        graph.output(*outputs)
-    return DecodeGraph(graph=graph, output_names=tuple(names), num_layers=num_layers)
+        tokens = graph.inputs[0].tensor
+        positions = graph.inputs[1].tensor
+        kv = paged_kv_from_inputs(list(graph.inputs[2:-2]), dec, batch, device)
+        history, ngram_size = (value.tensor for value in graph.inputs[-2:])
+        normed = decoder.decode(decoder.embed(tokens), positions=positions, max_seq_len=max_seq_len, kv=kv)
+        graph.output(apply_ngram_guard(decoder.logits_rows(normed), history, ngram_size))
+    return DecodeGraph(graph=graph, output_names=("logits",), batch=batch)

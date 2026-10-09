@@ -38,15 +38,15 @@ jobs:
       - name: Build wheel and sdist
         run: uv build
 
-      # Nothing without both Mojo sources reaches PyPI; see the same check in
-      # ci.yml for why the listing is matched from a here-string.
+      # Nothing without every kernels/*.mojo of the checkout reaches PyPI; see
+      # the same check in ci.yml for why the listing is matched from a
+      # here-string.
       - name: The Mojo custom op sources are inside the wheel
         run: |
           wheel="$(ls dist/*.whl)"
           listing="$(unzip -l "$wheel")"
           echo "$listing"
-          for f in unlimited_ocr_max/kernels/__init__.mojo \
-                   unlimited_ocr_max/kernels/ngram_block.mojo; do
+          for f in unlimited_ocr_max/kernels/*.mojo; do
             grep -qE "[[:space:]]${f}$" <<<"$listing" \
               || { echo "::error file=pyproject.toml::${f} is missing from ${wheel}"; exit 1; }
           done

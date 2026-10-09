@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.4.0] — 2026-10-09
+
+All figures: `unlimited-ocr-max profile`, the 12 bundled pages, one draw each, on an Apple M4
+(24 GB) and an NVIDIA A100 80GB PCIe, MAX nightly `26.7.0.dev2026100105`.
+
+### Highlights
+- **Decode is 1.5× (A100) to 3× (Apple M4) faster, and prefill is faster too:**
+
+  | | 0.3.2 | 0.4.0 |
+  |---|---|---|
+  | Apple M4, bf16 decode | 21.3 tok/s | **66.8 tok/s** |
+  | Apple M4, int8 decode | 36.6 tok/s | **69.3 tok/s** |
+  | NVIDIA A100, bf16 decode | 93.6 tok/s | **141.8 tok/s** |
+  | NVIDIA A100, int8 decode | 82.7 tok/s | **123.3 tok/s** |
+  | Apple M4, prefill bf16 / int8 | 3.20 / 6.86 s | **2.12 / 3.05 s** |
+  | NVIDIA A100, prefill bf16 / int8 | 3.56 / 6.23 s | **1.94 / 1.68 s** |
+
+  The text is unchanged: bf16 is 12/12 byte-identical to the reference on the M4 (10/12 on the
+  A100, as before), and int8 matches its pinned transcripts.
+- **Serve several requests at once: `--max-batch-size N`** (`serve` and `profile`, up to 8, bf16
+  and int8). At 8 concurrent requests the aggregate is 85.7 tok/s on the M4 and 150.7 tok/s on
+  the A100 (bf16). Each request's output does not depend on what else is in flight: on the
+  bundled pages it is byte-identical to `--max-batch-size 1`. A new request's prefill briefly
+  pauses the running decodes. `profile --concurrency N` measures it.
+
+### Changed
+- **Install from Modular's nightly index again.** MAX is pinned to `26.7.0.dev2026100105`, so
+  installs need `--extra-index-url https://whl.modular.com/nightly/simple/` (see the README). The
+  pin moves to the 26.7 stable release once it ships.
+- **Prompts are limited to 512 tokens**, the page's image tokens included (274 in `base` mode),
+  which leaves about 238 tokens of text. A longer prompt gets an HTTP 400.
+- **The KV cache is allocated at startup**: 90 MiB at `--max-batch-size 1`, 615 MiB at 8. A GPU
+  that cannot hold it fails at startup instead of at the first request.
+- **Startup and first requests:** with `--max-batch-size` above 1 the server compiles the batched
+  graphs at startup (20–31 s cached; 3–3.5 minutes the first time on the M4). On a fresh
+  install the first bf16 request takes about 100 s on the M4 and the first int8 request about
+  5.5 minutes. That int8 compile puts heavy memory pressure on the machine while it runs (on the
+  24 GB M4: resident memory peaked at about 16.6 GiB, swap grew by less than 1 GiB). It happens
+  once: MAX caches the compiled graphs.
+- **Less memory for int8:** server peak footprint on the M4 20.7 → 13.0 GiB; device memory on the
+  A100 17.4 → 10.4 GiB.
+- **Leave GPU memory free on Apple silicon:** bf16 needs 2.0 GiB free and int8 2.5 GiB. Below that
+  MAX returns wrong values without an error.
+- **The numerics changed** (new kernels sum in another order), but the served text on the bundled
+  pages is as stated above.
+- `serve` now passes `--sample-on-host`: MAX's 26.7 nightlies sample much more slowly on Metal.
+
+### Removed
+- **CPU serving.** `serve` and `profile` refuse `--devices cpu`. The MAX 26.7 nightlies compute
+  part of the model wrongly on CPU without an error, so served CPU pages were wrong. `--devices`
+  stays required, with `gpu` (Metal, CUDA or ROCm) as the only value. `profile.json` loses its
+  `gpu_guard` key.
+
+### Fixed
+- The package imports again with MAX 26.7, which removed `KVCacheInputsInterface`.
+
 ## [0.3.2] — 2026-09-28
 
 ### Performance

@@ -1,7 +1,7 @@
 [project]
 name = "unlimited-ocr-max"
-version = "0.3.2"
-description = "baidu/Unlimited-OCR served through MAX as an OpenAI-compatible endpoint on Metal, CUDA, ROCm or CPU"
+version = "0.4.0"
+description = "baidu/Unlimited-OCR served through MAX as an OpenAI-compatible endpoint on Metal, CUDA or ROCm"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -22,8 +22,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Recognition",
 ]
 dependencies = [
-    # The exact release this port is validated on; published on PyPI.
-    "max[all]==26.6.0",
+    # The exact build this port is validated on; published on Modular's nightly index only.
+    "max[all]==26.7.0.dev2026100105",
     "numpy>=2.5.2",
     "pillow>=12.3.0",
 ]
@@ -61,3 +61,10 @@ include = ["unlimited_ocr_max", "tests", "README.md", "LICENSE", "pyproject.toml
 markers = [
     "slow: compiles Mojo kernels through a MAX InferenceSession; CI runs -m 'not slow'",
 ]
+
+# The 26.7 dev build lives on Modular's nightly index, not PyPI. This block
+# applies to a checkout of this repository; an install from PyPI or a git URL
+# must pass --extra-index-url https://whl.modular.com/nightly/simple/ itself.
+[[tool.uv.index]]
+name = "modular-nightly"
+url = "https://whl.modular.com/nightly/simple/"

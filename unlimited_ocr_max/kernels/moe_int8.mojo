@@ -14,7 +14,31 @@ constant.
     out[s, n] = sum_g scales[e_s, n, g] * sum_{kk in group g} float(w[e_s, n, kk]) * x[s, kk]
 
 fp32 accumulation, group sum first and the group scale after, matching the
-formula's association.
+formula's association. Like ``moe_bf16_qmv``'s elementwise kernel
+(``moe_bf16.mojo``, which explains the scheme) it reads each selected expert
+ONCE per call: only the first row carrying an expert id works, serving every
+row of a tile of up to ``TILE`` rows carrying it from one read of the weight
+row and its scales (``moe_routing.mojo``). It runs on every device: a
+hand-launched GPU kernel like ``moe_bf16_qmv``'s, whole SIMD groups or lane
+groups per column, was no faster on the Apple M4 and up to 2.5x slower
+(TODO ID 52).
+
+A group is LOADED ``VEC`` int8 at a time (one 16-byte load, with ``VEC`` fp32
+of ``x`` against it) but SUMMED one element at a time, lane by lane in ``kk``
+order into one fp32 group sum, and each row keeps its own sums: the operation
+order of the one-element kernel at 6e190af, so the int8 decode bits are
+unchanged since then and do not depend on which rows share an expert
+(``tests/test_kernels_int8.py`` pins them to a reference in that order). A
+group size that is not a multiple of ``VEC`` takes the same loop one element
+at a time (``SCALAR``): same sums, same bits. KON-240 first summed a group into ``VEC``
+lane-wise partial sums reduced at the group's end -- another order, so other
+int8 decode bits (a re-pin of the int8 transcripts) -- and with real weights
+it measured +3.1 % on the B = 8 decode step and nothing above the ~2 % draw
+spread at B = 1, so that was dropped. The vector LOADS stay because inside a
+value-capture closure the one-element loads run 3x slower on the M4 (1.49 vs
+0.49 ms per k = 48 call at the real shape; through raw pointers still 2x; only
+the deprecated by-reference ``@parameter`` closure ran them at the base's
+speed), while ``VEC``-wide loads with the same sums run at the base's speed.
 
 ``int8_dequant_expert``: ``expert_idx int32 [1]`` (a scalar carried as a
 one-element tensor, the ``ngram`` idiom) → ``[N, K]`` in the output's dtype
@@ -22,15 +46,136 @@ one-element tensor, the ``ngram`` idiom) → ``[N, K]`` in the output's dtype
 
     out[n, kk] = result.dtype(float(w[e, n, kk]) * scales[e, n, kk // G])
 
-Expert ids are runtime device data, readable only inside the ``foreach``
-closure, and a closure cannot raise -- so out-of-range ids are CLAMPED to
-``[0, E)`` instead of aborting. Shape mismatches still raise host-side.
+computed at the target's SIMD width: a lane-wise multiply and cast, so the
+same bits as one element at a time.
+
+Expert ids are runtime device data, readable only inside the kernels' closures,
+and a closure cannot raise -- so out-of-range ids are CLAMPED to ``[0, E)``
+instead of aborting. Shape mismatches still raise host-side.
+
+Vector loads claim ``LOAD_ALIGN`` (``loads.mojo``) when ``execute``
+finds both tensors packed and both bases aligned (``ALIGNED``), else one
+element (``UNALIGNED``) -- without the claim a 16-wide load may be split and
+the qmv runs at half speed on the M4; the sums, and so the bits, are the same
+on all three paths -- and the shapes reach the closures as VALUE captures: see
+``moe_bf16.mojo`` for both, and for why a by-reference capture of a host
+scalar is garbage in the work items. ``int8_dequant_expert`` claims the
+alignment under the same two conditions.
 """
 
 from extensibility import InputTensor, OutputTensor, foreach, register
 from layout import Coord
+from max.algorithm.functional import elementwise
 from max.gpu.host import DeviceContext
-from std.utils import IndexList
+from std.utils import IndexList, StaticTuple
+
+from .loads import (
+    ALIGNED,
+    LOAD_ALIGN,
+    UNALIGNED,
+    load_alignment,
+    load_path,
+    packed,
+)
+from .moe_routing import (
+    FOLLOWS,
+    clamped_expert,
+    group_tail,
+    next_tile,
+    routed_id,
+)
+
+#: int8 weights per vector load along a group: 16 bytes, with ``VEC`` fp32
+#: lanes of ``x`` against them. The loads are vectors; the sums are not
+#: (module docstring). 32 crashes Metal's pipeline compiler as it does for
+#: ``moe_bf16_qmv``.
+comptime VEC = 16
+
+#: Rows served per read of a weight row; see ``moe_bf16.mojo``. The int8
+#: accumulators are scalars, so registers do not cap the tile here, but 8 is
+#: no faster than 4 at ``B = 8`` on the M4 and slower at ``B = 1``.
+comptime TILE = 4
+
+
+@always_inline
+def _dot_rows_by[
+    count: Int, width: Int, aligned: Bool
+](
+    result: OutputTensor[dtype = DType.float32, rank=2, static_spec=_],
+    x: InputTensor[dtype = DType.float32, rank=2, static_spec=_],
+    w: InputTensor[dtype = DType.int8, rank=3, static_spec=_],
+    scales: InputTensor[dtype = DType.float32, rank=3, static_spec=_],
+    groups: Int,
+    gsize: Int,
+    expert: Int,
+    n: Int,
+    rows: StaticTuple[Int, TILE],
+):
+    """``result[rows[r], n]`` for ``r < count``, ``width`` elements per load, summed one at a time.
+
+    ``gsize % width == 0``. The loads claim ``LOAD_ALIGN`` if ``aligned`` (the
+    ``ALIGNED`` path's preconditions hold), else one element. The sums are the
+    one-element kernel's: ``gsum = fma(w, x, gsum)`` lane by lane in ``kk``
+    order, then ``acc = fma(scale, gsum, acc)`` per group. The fused
+    multiply-adds are explicit because that is what the base's ``+=`` of a
+    product compiled to on the CPU and the M4 alike, while a lane-wise ``gsum
+    += wv[lane] * xv[lane]`` left to the compiler fuses on the M4 but not on
+    the CPU (41-88 % of the outputs off in the low bits, measured). ``width``
+    and ``aligned`` change the loads, not the bits.
+    """
+    var acc = StaticTuple[Float32, count](fill=0)
+    for g in range(groups):
+        var base = g * gsize
+        var gsum = StaticTuple[Float32, count](fill=0)
+        for kk in range(base, base + gsize, width):
+            var wv = w.load[
+                width,
+                element_alignment = load_alignment[DType.int8, width, aligned](),
+            ](IndexList[3](expert, n, kk)).cast[DType.float32]()
+            comptime for r in range(count):
+                var xv = x.load[
+                    width,
+                    element_alignment = load_alignment[
+                        DType.float32, width, aligned
+                    ](),
+                ](IndexList[2](rows[r], kk))
+                comptime for lane in range(width):
+                    gsum[r] = wv[lane].fma(xv[lane], gsum[r])
+        var scale = scales.load[1](IndexList[3](expert, n, g))[0]
+        comptime for r in range(count):
+            acc[r] = scale.fma(gsum[r], acc[r])
+    comptime for r in range(count):
+        result.store[1](IndexList[2](rows[r], n), SIMD[DType.float32, 1](acc[r]))
+
+
+@always_inline
+def _dot_rows[
+    count: Int
+](
+    result: OutputTensor[dtype = DType.float32, rank=2, static_spec=_],
+    x: InputTensor[dtype = DType.float32, rank=2, static_spec=_],
+    w: InputTensor[dtype = DType.int8, rank=3, static_spec=_],
+    scales: InputTensor[dtype = DType.float32, rank=3, static_spec=_],
+    groups: Int,
+    gsize: Int,
+    path: Int,
+    expert: Int,
+    n: Int,
+    rows: StaticTuple[Int, TILE],
+):
+    """``result[rows[r], n]`` for ``r < count`` from one read of ``w[expert, n, :]`` and its scales: ``VEC``-wide loads on the ``ALIGNED`` and ``UNALIGNED`` paths, else one element at a time; the same sums on all three."""
+    if path == ALIGNED:
+        _dot_rows_by[count, VEC, True](
+            result, x, w, scales, groups, gsize, expert, n, rows
+        )
+    elif path == UNALIGNED:
+        _dot_rows_by[count, VEC, False](
+            result, x, w, scales, groups, gsize, expert, n, rows
+        )
+    else:
+        _dot_rows_by[count, 1, False](
+            result, x, w, scales, groups, gsize, expert, n, rows
+        )
 
 
 @register("moe_int8_qmv")
@@ -39,18 +184,13 @@ struct MoeInt8Qmv:
     def execute[
         target: StaticString
     ](
-        result: OutputTensor,
-        x: InputTensor[dtype = result.dtype, rank=2, static_spec=_],
+        result: OutputTensor[dtype = DType.float32, rank=2, static_spec=_],
+        x: InputTensor[dtype = DType.float32, rank=2, static_spec=_],
         expert_ids: InputTensor[dtype = DType.int32, rank=1, static_spec=_],
         w: InputTensor[dtype = DType.int8, rank=3, static_spec=_],
-        scales: InputTensor[dtype = result.dtype, rank=3, static_spec=_],
+        scales: InputTensor[dtype = DType.float32, rank=3, static_spec=_],
         ctx: DeviceContext,
     ) raises:
-        comptime assert result.rank == 2, "moe_int8_qmv output is rank-2 [k, N]"
-        comptime assert (
-            result.dtype == DType.float32
-        ), "moe_int8_qmv accumulates in float32 (the contract pins fp32)"
-
         if Int(x.dim_size(0)) != Int(result.dim_size(0)):
             raise Error("moe_int8_qmv: x and output disagree on k")
         if Int(expert_ids.dim_size(0)) != Int(result.dim_size(0)):
@@ -65,43 +205,57 @@ struct MoeInt8Qmv:
             raise Error("moe_int8_qmv: scales and w disagree on E")
         if Int(scales.dim_size(1)) != Int(w.dim_size(1)):
             raise Error("moe_int8_qmv: scales and w disagree on N")
-        var groups_host = Int(scales.dim_size(2))
-        if groups_host < 1 or Int(w.dim_size(2)) % groups_host != 0:
+        var groups = Int(scales.dim_size(2))
+        if groups < 1 or Int(w.dim_size(2)) % groups != 0:
             raise Error("moe_int8_qmv: K must be a multiple of the group count")
 
-        @parameter
-        def qmv[width: Int](idx: Coord[...]) -> SIMD[result.dtype, width]:
-            # Every scalar is re-derived from the captured tensors: a runtime
-            # scalar captured into a `foreach` closure is garbage on CPU worker
-            # threads once the tensor is large enough to be split across them.
-            var kdim = Int(w.dim_size(2))
-            var groups = Int(scales.dim_size(2))
-            var gsize = kdim // groups
-            var num_experts = Int(w.dim_size(0))
-            var s = Int(idx[0].value())
-            var n0 = Int(idx[1].value())
-            var e = Int(expert_ids.load[1](IndexList[1](s))[0])
-            # Bound-check: clamp, because a closure cannot raise (see above).
-            if e < 0:
-                e = 0
-            if e >= num_experts:
-                e = num_experts - 1
-            var out_v = SIMD[result.dtype, width](0)
-            for lane in range(width):
-                var n = n0 + lane
-                var acc = SIMD[result.dtype, 1](0)
-                for g in range(groups):
-                    var base = g * gsize
-                    var gsum = SIMD[result.dtype, 1](0)
-                    for kk in range(gsize):
-                        var wv = w.load[1](IndexList[3](e, n, base + kk))[0]
-                        var xv = x.load[1](IndexList[2](s, base + kk))[0]
-                        gsum += wv.cast[result.dtype]() * xv
-                    acc += scales.load[1](IndexList[3](e, n, g))[0] * gsum
-                out_v[lane] = acc[0]
-            return out_v
+        var rows = Int(result.dim_size(0))
+        var nd = Int(result.dim_size(1))
+        var gsize = Int(w.dim_size(2)) // groups
+        var num_experts = Int(w.dim_size(0))
+        var path = load_path(gsize, VEC, w, x)
 
-        foreach[qmv, target=target, simd_width=1](result, ctx)
+        @always_inline
+        def qmv[
+            width: Int, alignment: Int = 1
+        ](idx: Coord[...]) {
+            var result,
+            var x,
+            var expert_ids,
+            var w,
+            var scales,
+            var rows,
+            var nd,
+            var groups,
+            var gsize,
+            var num_experts,
+            var path,
+        }:
+            var i = Int(idx[0].value())
+            var s = i // nd
+            var n = i - s * nd
+            var later = group_tail(expert_ids, s, rows)
+            if later == FOLLOWS:
+                return
+            var key = routed_id(expert_ids, s)
+            var e = clamped_expert(key, num_experts)
+            if later == 0:  # alone on its expert, as every row is at B = 1
+                _dot_rows[1](
+                    result, x, w, scales, groups, gsize, path, e, n,
+                    StaticTuple[Int, TILE](fill=s),
+                )
+                return
+            var cursor = s
+            while cursor < rows:
+                var tile_rows = StaticTuple[Int, TILE](fill=0)
+                var count = next_tile(expert_ids, key, rows, cursor, tile_rows)
+                comptime for c in range(1, TILE + 1):
+                    if count == c:
+                        _dot_rows[c](
+                            result, x, w, scales, groups, gsize, path, e, n, tile_rows
+                        )
+
+        elementwise[simd_width=1, target=target](qmv, (rows * nd,), ctx)
 
 
 @register("int8_dequant_expert")
@@ -135,36 +289,54 @@ struct Int8DequantExpert:
             raise Error("int8_dequant_expert: scales and w disagree on N")
         if Int(expert_idx.dim_size(0)) != 1:
             raise Error("int8_dequant_expert: `expert_idx` must be a single int32")
-        var groups_host = Int(scales.dim_size(2))
-        if groups_host < 1 or Int(w.dim_size(2)) % groups_host != 0:
+        var groups = Int(scales.dim_size(2))
+        if groups < 1 or Int(w.dim_size(2)) % groups != 0:
             raise Error(
                 "int8_dequant_expert: K must be a multiple of the group count"
             )
 
-        @parameter
-        def dequant[width: Int](idx: Coord[...]) -> SIMD[result.dtype, width]:
-            # Every scalar is re-derived from the captured tensors; see
-            # `moe_int8_qmv` above for why.
-            var kdim = Int(w.dim_size(2))
-            var groups = Int(scales.dim_size(2))
-            var gsize = kdim // groups
-            var num_experts = Int(w.dim_size(0))
-            var e = Int(expert_idx.load[1](IndexList[1](0))[0])
-            # Bound-check: clamp, because a closure cannot raise (see above).
-            if e < 0:
-                e = 0
-            if e >= num_experts:
-                e = num_experts - 1
+        var kdim = Int(w.dim_size(2))
+        var gsize = kdim // groups
+        var num_experts = Int(w.dim_size(0))
+        var aligned = packed(w) and Int(w.unsafe_ptr()) % LOAD_ALIGN == 0
+
+        def dequant[
+            width: Int
+        ](idx: Coord[...]) {
+            var w,
+            var scales,
+            var expert_idx,
+            var kdim,
+            var gsize,
+            var num_experts,
+            var aligned,
+        } -> SIMD[result.dtype, width]:
+            var e = clamped_expert(
+                expert_idx.load[1](IndexList[1](0))[0], num_experts
+            )
             var n = Int(idx[0].value())
             var k0 = Int(idx[1].value())
-            var out_v = SIMD[result.dtype, width](0)
-            for lane in range(width):
-                var kk = k0 + lane
-                var wv = w.load[1](IndexList[3](e, n, kk))[0]
-                var sv = scales.load[1](IndexList[3](e, n, kk // gsize))[0]
-                out_v[lane] = (wv.cast[DType.float32]() * sv).cast[
-                    result.dtype
-                ]()[0]
-            return out_v
+            # `foreach` hands a width > 1 only to a pack inside one row that
+            # starts a multiple of `width` elements into the flattened
+            # tensor, so with K % width == 0 its offset in a packed `w` is
+            # one too.
+            var wv: SIMD[DType.int8, width]
+            if aligned and kdim % width == 0:
+                wv = w.load[
+                    width,
+                    element_alignment = load_alignment[DType.int8, width](),
+                ](IndexList[3](e, n, k0))
+            else:
+                wv = w.load[width](IndexList[3](e, n, k0))
+            var group = k0 // gsize
+            var sv = SIMD[DType.float32, width](
+                scales.load[1](IndexList[3](e, n, group))[0]
+            )
+            if (k0 + width - 1) // gsize != group:  # the pack spans groups
+                comptime for lane in range(1, width):
+                    sv[lane] = scales.load[1](
+                        IndexList[3](e, n, (k0 + lane) // gsize)
+                    )[0]
+            return (wv.cast[DType.float32]() * sv).cast[result.dtype]()
 
-        foreach[dequant, target=target, simd_width=1](result, ctx)
+        foreach[target=target](dequant, result, ctx)

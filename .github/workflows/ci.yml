@@ -16,6 +16,12 @@ defaults:
   run:
     shell: bash
 
+env:
+  # `max[all]==26.7.0.dev2026100105` is published on Modular's nightly index only, so every
+  # install of this package needs this index in addition to PyPI -- for CI and
+  # for end users alike (see README "Serve").
+  MODULAR_INDEX: https://whl.modular.com/nightly/simple/
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -57,15 +63,14 @@ jobs:
 
       # The listing is captured once and matched from a here-string: with
       # `pipefail` on, `unzip -l | grep -q` fails intermittently because grep
-      # exits on the first match and unzip dies of SIGPIPE.
+      # exits on the first match and unzip dies of SIGPIPE. The list is every
+      # kernels/*.mojo in the checkout, so a new kernel file is checked too.
       - name: The Mojo custom op sources are inside the wheel
         run: |
           wheel="$(ls dist/*.whl)"
           listing="$(unzip -l "$wheel")"
           echo "$listing"
-          for f in unlimited_ocr_max/kernels/__init__.mojo \
-                   unlimited_ocr_max/kernels/ngram_block.mojo \
-                   unlimited_ocr_max/kernels/moe_int8.mojo; do
+          for f in unlimited_ocr_max/kernels/*.mojo; do
             grep -qE "[[:space:]]${f}$" <<<"$listing" \
               || { echo "::error file=pyproject.toml::${f} is missing from ${wheel}"; exit 1; }
           done
@@ -76,7 +81,7 @@ jobs:
       # The venv lives outside the checkout so the tests import the *installed*
       # wheel (site-packages), never the source tree next to them -- that is
       # what makes the kernels/*.mojo and `max` version assertions meaningful.
-      # `max[all]==26.6.0` comes from PyPI like everything else; no extra index.
+      # `max[all]==26.7.0.dev2026100105` is on Modular's nightly index only, hence MODULAR_INDEX.
       # The `test` extra is what brings pytest and torch in -- torch is not a
       # runtime dependency of the wheel itself, only of this extra (the
       # bit-exactness oracle a few tests hold their numpy conversions against).
@@ -87,6 +92,7 @@ jobs:
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/venv"
           uv pip install --python "$RUNNER_TEMP/venv" \
+            --extra-index-url "$MODULAR_INDEX" \
             "$(ls dist/*.whl)[test]"
 
       # The model-free set: every file under tests/, no weights and no server
@@ -122,7 +128,7 @@ jobs:
       - name: The wheel installs and imports without torch
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/venv-no-extras"
-          uv pip install --python "$RUNNER_TEMP/venv-no-extras" "$(ls dist/*.whl)"
+          uv pip install --python "$RUNNER_TEMP/venv-no-extras" --extra-index-url "$MODULAR_INDEX" "$(ls dist/*.whl)"
           "$RUNNER_TEMP/venv-no-extras/bin/python" -P -c "
           import importlib.util
           assert importlib.util.find_spec('torch') is None, 'the no-extras install resolved torch'
@@ -131,8 +137,8 @@ jobs:
           assert 'site-packages' in unlimited_ocr_max.__file__, unlimited_ocr_max.__file__
 
           from unlimited_ocr_max.cli import build_parser
-          args = build_parser().parse_args(['serve', '--devices', 'cpu'])
-          assert args.command == 'serve', args
+          args = build_parser().parse_args(['serve', '--devices', 'gpu'])
+          assert args.command == 'serve' and args.devices == 'gpu', args
 
           from PIL import Image
           from unlimited_ocr_max.batch_processor import preprocess_page

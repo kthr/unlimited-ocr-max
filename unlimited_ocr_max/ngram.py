@@ -1,8 +1,14 @@
-"""The no-repeat-n-gram guard: a one-op graph around the ``ngram_block`` Mojo kernel.
+"""The no-repeat-n-gram guard: the ``ngram_block`` Mojo kernel, and a one-op graph around it for the prefill.
 
 Applied to the prefill logits and to every decode step over the whole sequence,
 prompt included, as the reference's ``SlidingWindowNoRepeatNgramProcessor`` is.
-Kept out of the decode graph so switching it off changes no decode numerics.
+:func:`apply_ngram_guard` stages the op. :class:`NgramBlocker` guards the
+prefill logits, once per request. The decode graphs guard their own logits
+(one op over all ``B`` rows, row ``b`` against request ``b``'s own history), so a
+decode step needs no separate execute and no logits round trip. Switching the
+guard off feeds the decode graphs ``n = 0``, which the kernel returns unchanged:
+the same graph, no recompile, and logits bitwise those of the same graph built
+without the op (``tests/test_batched_decode.py``).
 """
 
 from __future__ import annotations
@@ -14,15 +20,35 @@ import numpy as np
 from max.driver import CPU, Buffer, Device
 from max.dtype import DType
 from max.engine import InferenceSession, Model
-from max.graph import DeviceRef, Graph, TensorType, ops
+from max.graph import DeviceRef, Graph, TensorType, TensorValue, ops
 
-__all__ = ["DEFAULT_NGRAM_SIZE", "MOJO_KERNELS", "NgramBlocker"]
+__all__ = ["DEFAULT_NGRAM_SIZE", "MOJO_KERNELS", "NgramBlocker", "apply_ngram_guard"]
 
 #: The Mojo custom-op package (``Graph(custom_extensions=...)`` wants a directory).
 MOJO_KERNELS = Path(__file__).resolve().parent / "kernels"
 
 #: The reference's pairing for this model; the window equals the R-SWA ring. `cli.py` repeats the 35.
 DEFAULT_NGRAM_SIZE = 35
+
+
+def apply_ngram_guard(logits: TensorValue, history: TensorValue, ngram_size: TensorValue) -> TensorValue:
+    """The no-repeat-n-gram guard on ``logits [B, vocab]``: ONE ``ngram_block`` op for all ``B`` rows.
+
+    Row ``b`` is guarded against row ``b`` of ``history [B, window]`` (that
+    request's last ``window`` token ids, the token just fed last) and nothing
+    else; ``ngram_size [1]`` is shared. One row may also come rank 1,
+    ``logits [vocab]`` against ``history [hist_len]`` (:class:`NgramBlocker`).
+    An n-gram size below 1 returns the logits unchanged, so a graph with the
+    guard switched off is the same graph fed ``n = 0`` (the kernel docstring
+    has the semantics). The graph needs ``custom_extensions=[MOJO_KERNELS]``.
+    """
+    device = logits.device
+    return ops.custom(
+        "ngram_block",
+        device=device,
+        values=[logits, history, ngram_size],
+        out_types=[TensorType(logits.dtype, logits.shape, device=device)],
+    )[0]
 
 
 class NgramBlocker:
@@ -60,14 +86,7 @@ class NgramBlocker:
                 ],
                 custom_extensions=[MOJO_KERNELS],
             ) as graph:
-                graph.output(
-                    ops.custom(
-                        "ngram_block",
-                        device=self.device,
-                        values=[graph.inputs[i].tensor for i in range(3)],
-                        out_types=[TensorType(DType.float32, [self.vocab_size], device=self.device)],
-                    )[0]
-                )
+                graph.output(apply_ngram_guard(*(value.tensor for value in graph.inputs)))
             self._model = self.session.load(graph)
         return self._model
 

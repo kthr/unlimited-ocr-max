@@ -161,6 +161,7 @@ class SamAttention(Module):
         qkv = ops.permute(qkv, [2, 0, 3, 1, 4])
         q, k, v = (ops.squeeze(part, 0) for part in ops.split(qkv, [1, 1, 1], axis=0))
 
+        # Query-first is the faster GPU spelling; the MAX nightly's CPU path miscompiles it (one reason CPU serving is unsupported).
         logits = ops.matmul(q, ops.transpose(k, -1, -2)) * (head_dim**-0.5)
         rel_h, rel_w = self._decomposed_rel_pos(q, height, width)
         attn_bias = rel_h + rel_w

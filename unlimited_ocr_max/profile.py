@@ -9,7 +9,7 @@ into one row of the README's "Where it has run" table (:mod:`.profile_metrics`) 
 Three rules shape this module:
 
 * **It never measures someone else's server or someone else's GPU load.** A port that already
-  answers is refused (exit 2). Every ``--devices gpu`` run is guarded: another process on the
+  answers is refused (exit 2). Every run is guarded: another process on the
   GPU -- or a GPU whose processes cannot be listed -- refuses the run before the server starts
   (exit 3) or voids it afterwards (exit 5).
 * **It never leaves the server behind.** ``max serve`` runs in its own session, so a Ctrl-C in
@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import concurrent.futures
 import datetime as dt
 import http.client
 import importlib.metadata
@@ -67,7 +68,7 @@ if TYPE_CHECKING:
 PROMPT = "<|grounding|>Convert the document to markdown."
 WARMUP_MAX_TOKENS = 8
 PAGE_MAX_TOKENS = 8192
-#: Per socket operation, not per request: a CPU prefill can keep the first byte away for minutes.
+#: Per socket operation, not per request: a prefill that compiles can keep the first byte away for minutes.
 REQUEST_TIMEOUT_S = 3600.0
 READY_POLL_S = 2.0
 EXIT_POLL_S = 0.5
@@ -555,6 +556,119 @@ def _stream_chat(port: int, png: bytes, max_tokens: int) -> Exchange:
     return exchange
 
 
+def _send_pages(port: int, log_path: Path, out: Path, pages: list[str],
+                concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """Send ``pages``, keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight.
+
+    At ``concurrency`` 1 this is :func:`_send_pages_sequential`: one request after another, on
+    this thread, with no executor at all -- byte-identical to how ``profile`` sent pages before
+    concurrency existed, Ctrl-C included. Above 1 it is :func:`_send_pages_concurrent`.
+    """
+    if concurrency == 1:
+        return _send_pages_sequential(port, log_path, out, pages)
+    return _send_pages_concurrent(port, log_path, out, pages, concurrency)
+
+
+def _send_pages_sequential(port: int, log_path: Path, out: Path,
+                           pages: list[str]) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """One request after another, on this thread -- no executor, no worker thread. A failure voids
+    the run and stops further sending; an interrupt (Ctrl-C/SIGTERM/SIGHUP) is not caught here at
+    all, so it propagates the instant it is raised, exactly as it did before concurrency existed.
+    """
+    exchanges: dict[str, Exchange] = {}
+    busy: list[tuple[float, float]] = []
+    void: list[str] = []
+    for page in pages:
+        t_start = time.monotonic()
+        try:
+            exchange = _stream_chat(port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
+        except ExchangeFailed as e:
+            busy.append((t_start, time.monotonic()))
+            void.append(f"request {page} failed: {e}")
+            _say(void[-1])
+            _print_log_tail(log_path)
+            break
+        busy.append((exchange.t_start, exchange.t_end))
+        exchanges[page] = exchange
+        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
+        _say(f"{page}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+    return exchanges, busy, void
+
+
+def _send_pages_concurrent(port: int, log_path: Path, out: Path, pages: list[str],
+                           concurrency: int) -> tuple[dict[str, Exchange], list[tuple[float, float]], list[str]]:
+    """Send ``pages`` keeping at most ``concurrency`` :func:`_stream_chat` exchanges in flight at
+    once (a thread per in-flight exchange). Every result is read back and every write happens on
+    this thread, never on a worker thread, so none of the state below needs a lock.
+
+    Returns ``(exchanges keyed by page, busy intervals, void reasons)`` -- the same shapes the
+    sequential sender uses, so its overlapping ``busy`` intervals still feed :func:`memory_stats`
+    correctly (a sample is excluded if it falls in *any* busy window, overlapping or not).
+
+    The first :class:`ExchangeFailed` stops further submissions -- voiding the run, as a failure
+    always has -- but whatever was already in flight is still waited for (in the loop below, not
+    the ``except``) and recorded, so a failure in one thread never leaves a sibling unreported;
+    this never raises out of the loop.
+
+    An actual interrupt (``KeyboardInterrupt``, ``SystemExit`` from SIGTERM/SIGHUP) or a genuine
+    bug is different: a worker's :func:`_stream_chat` is not interrupted by the signal that raised
+    it here -- only this thread sees it -- so waiting for one to finish on its own could block for
+    up to ``REQUEST_TIMEOUT_S``. Instead the pool is shut down without waiting and with pending
+    futures cancelled, and the exception is re-raised at once: the outer teardown kills the
+    server's process group right after, which breaks every in-flight request's socket and ends
+    the worker threads, without this function waiting on them.
+    """
+    exchanges: dict[str, Exchange] = {}
+    busy: list[tuple[float, float]] = []
+    void: list[str] = []
+    pending = list(pages)
+    in_flight: dict[concurrent.futures.Future[Exchange], tuple[str, float]] = {}
+    tail_printed = False
+
+    def _finish(future: concurrent.futures.Future[Exchange], page: str) -> None:
+        exchange = future.result()
+        busy.append((exchange.t_start, exchange.t_end))
+        exchanges[page] = exchange
+        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
+        _say(f"{page}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+
+    def _voided(page: str, t_start: float, error: ExchangeFailed) -> None:
+        nonlocal tail_printed
+        busy.append((t_start, time.monotonic()))
+        void.append(f"request {page} failed: {error}")
+        _say(void[-1])
+        if not tail_printed:
+            _print_log_tail(log_path)
+            tail_printed = True
+
+    def _fill(pool: concurrent.futures.ThreadPoolExecutor) -> None:
+        while not void and pending and len(in_flight) < concurrency:
+            page = pending.pop(0)
+            t_start = time.monotonic()
+            future = pool.submit(_stream_chat, port, profile_corpus.page_png(page), PAGE_MAX_TOKENS)
+            in_flight[future] = (page, t_start)
+
+    # Not a `with` block: `ThreadPoolExecutor.__exit__` calls `shutdown(wait=True)` unconditionally,
+    # which would wait for in-flight workers on the way out of the `except` below too.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        _fill(pool)
+        while in_flight:
+            done, _ = concurrent.futures.wait(list(in_flight), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                page, t_start = in_flight.pop(future)
+                try:
+                    _finish(future, page)
+                except ExchangeFailed as e:
+                    _voided(page, t_start, e)
+            _fill(pool)
+    except BaseException:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True)  # nothing is left in flight here, so this returns at once
+    return exchanges, busy, void
+
+
 def _wait_ready(server: _Server, port: int, timeout_s: float) -> str | None:
     """``None`` once ``/v1/models`` lists the served model, else why it never did."""
     deadline = time.monotonic() + timeout_s
@@ -697,13 +811,11 @@ def _host(baseline: dict[str, dict[str, int]]) -> dict[str, Any]:
     }
 
 
-def _hardware(host: dict[str, Any], devices: str) -> str:
-    """The README's hardware cell: CPU brand and RAM, then what served (``Metal``, the GPU, ``CPU``)."""
+def _hardware(host: dict[str, Any]) -> str:
+    """The README's hardware cell: CPU brand and RAM, then what served (``Metal`` or the GPU)."""
     cpu = host.get("cpu_brand") or host.get("machine") or "unknown CPU"
     if host.get("ram_bytes"):
         cpu += f" {round(host['ram_bytes'] / _GIB)} GB"
-    if devices == "cpu":
-        return f"{cpu}, CPU"
     named = [gpu for gpu in host["gpus"] if gpu.get("name")]
     if named:
         gpu = named[0]
@@ -822,6 +934,32 @@ def _text(text_by_variant: dict[str, dict[str, Any]], variant: str, n_done: int,
     return {key: value for key, value in text_by_variant[variant].items() if key != "pages"}
 
 
+def _concurrency_figure(exchanges: dict[str, Exchange], concurrency: int, max_batch_size: int, log: str) -> dict[str, Any]:
+    """Aggregate throughput, per-request latency and per-batch-size decode step time over the page
+    exchanges -- what both :func:`row` (when ``concurrency`` is above 1) and ``profile.json``'s
+    ``concurrency`` figure report.
+
+    ``tok_s`` is every completed page's completion tokens summed, divided by the span from the
+    first page's start to the last page's end -- the aggregate this run actually achieved, not a
+    single request's rate. ``latency_median_s`` is the median of each page's own wall time.
+    ``by_batch_size`` is :func:`profile_metrics.decode_stats_by_batch` over the same scheduler log
+    :func:`_scheduler_figures` already parsed.
+    """
+    if not exchanges:
+        raise ValueError("no page completed")
+    total_tokens = sum(e.completion_tokens or 0 for e in exchanges.values())
+    span = max(e.t_end for e in exchanges.values()) - min(e.t_start for e in exchanges.values())
+    if span <= 0:
+        raise ValueError("the first page's start and the last page's end are not far enough apart to rate")
+    return {
+        "n": concurrency,
+        "max_batch_size": max_batch_size,
+        "tok_s": total_tokens / span,
+        "latency_median_s": statistics.median(e.wall_s for e in exchanges.values()),
+        "by_batch_size": profile_metrics.decode_stats_by_batch(log),
+    }
+
+
 def _gib(n: int) -> str:
     return f"{n / _GIB:.1f}"
 
@@ -866,17 +1004,36 @@ def row(hardware: str, weights: str, status: str, figures: dict[str, Any]) -> st
     The memory cell is the server's device memory where it was measured (a discrete GPU); else its
     physical footprint where that was sampled (macOS: host and Metal allocations, clean page cache
     excluded -- see :func:`host_memory_figure`); else its host RSS. Device memory from a device
-    sampler that stopped mid-run is marked ``(partial)``."""
+    sampler that stopped mid-run is marked ``(partial)``.
+
+    The decode cell is unchanged at ``concurrency`` 1 (or when the figure never got computed): the
+    single-request decode rate and step time. Above 1, it instead leads with the run's aggregate
+    tok/s -- what concurrent clients actually achieved -- and names the concurrency. Its step time
+    is then the full batch's (``concurrency`` rows, from ``by_batch_size``), not a median over
+    every batch size the run passed through; without a full-batch figure it says so.
+    """
     decode, prefill, device_memory = figures.get("decode"), figures.get("prefill"), figures.get("device_memory")
+    concurrency = figures.get("concurrency")
     if device_memory:
         memory = f"device {_memory_cell(device_memory)}" + (" (partial)" if device_memory.get("partial") else "")
     else:
         memory = _memory_cell(host_memory_figure(figures)[1])
+    if decode and concurrency and concurrency["n"] > 1:
+        n = concurrency["n"]
+        by_batch = concurrency.get("by_batch_size") or {}
+        full = by_batch.get(n) or by_batch.get(str(n))  # int keys in process, str keys from profile.json
+        step = (f"{full['median_ms']:.1f} ms/step at {n} rows, n={full['n']}" if full
+                else f"{decode['median_ms']:.1f} ms/step over all batch sizes, n={decode['n']}")
+        decode_cell = f"**{concurrency['tok_s']:.1f} tok/s** ({step}, concurrency {n})"
+    elif decode:
+        decode_cell = f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})"
+    else:
+        decode_cell = "—"
     cells = [
         hardware,
         weights,
         status,
-        f"**{decode['tok_s']:.1f} tok/s** ({decode['median_ms']:.1f} ms/step, n={decode['n']})" if decode else "—",
+        decode_cell,
         f"{prefill['median_s']:.2f} s" if prefill else "—",
         memory,
         _text_cell(figures.get("text")),
@@ -916,6 +1073,18 @@ def _page_rows(pages: list[str], exchanges: dict[str, Exchange],
 # --------------------------------------------------------------------------- #
 # the command
 # --------------------------------------------------------------------------- #
+def _resolve_concurrency(max_batch_size: int, concurrency: int | None) -> int:
+    """``--concurrency``, defaulting to ``--max-batch-size`` when ``None``; refused up front, the
+    same ``SystemExit`` style ``cli.check_max_batch_size`` uses for a bad
+    ``--max-batch-size``, before the server starts."""
+    resolved = max_batch_size if concurrency is None else concurrency
+    if resolved < 1:
+        raise SystemExit(f"--concurrency {resolved} must be >= 1")
+    if resolved > max_batch_size:
+        raise SystemExit(f"--concurrency {resolved} exceeds --max-batch-size {max_batch_size}")
+    return resolved
+
+
 def _out_dir(out: Path | None) -> Path:
     if out is None:
         out = Path(f"unlimited-ocr-max-profile-{dt.datetime.now(dt.UTC).strftime('%Y%m%dT%H%M%SZ')}")
@@ -949,7 +1118,8 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
     if shutil.which("ps") is None:
         _say("refusing: `ps` is required (install procps)")
         return EXIT_NO_PS
-    cli.check_devices_support_variant(args.weights, args.devices)
+    cli.check_max_batch_size(args.max_batch_size)
+    concurrency = _resolve_concurrency(args.max_batch_size, args.concurrency)
     model, weight_path, revision = cli.resolve_model(args.model, args.weights, args.revision)
     out = _out_dir(args.out)
     cmd = cli.serve_command(
@@ -968,22 +1138,20 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
     probe = profile_sampling.open_device_probe()
     server: _Server | None = None
     try:
-        # Every GPU run is guarded, whatever the probe found: on Metal the process list is
+        # Every run is guarded, whatever the probe found: on Metal the process list is
         # legitimately empty, and a CUDA/ROCm host whose device diagnostics failed must be
         # refused (GpuProcessListUnavailable), never measured unguarded.
-        guarded = args.devices == "gpu"
-        if guarded and not probe.device_available:
+        if not probe.device_available:
             _say("no NVIDIA/AMD device statistics on this host (Metal, or none found): device figures do not apply")
-        if guarded:
-            reasons = _gpu_not_idle(set(), after_run=False)
-            if reasons:
-                _say("refusing: the measurement needs an otherwise idle GPU")
-                for reason in reasons:
-                    _say(f"  {reason}")
-                return EXIT_GPU_BUSY
+        reasons = _gpu_not_idle(set(), after_run=False)
+        if reasons:
+            _say("refusing: the measurement needs an otherwise idle GPU")
+            for reason in reasons:
+                _say(f"  {reason}")
+            return EXIT_GPU_BUSY
         baseline = probe.stats()
-        server = _Server(cmd, cli.serve_env(args.ngram_size), out / "serve.log", probe)
-        return _profile(args, server, out, baseline=baseline, guarded=guarded, started_utc=started_utc)
+        server = _Server(cmd, cli.serve_env(args.ngram_size, args.max_batch_size), out / "serve.log", probe)
+        return _profile(args, server, out, baseline=baseline, started_utc=started_utc, concurrency=concurrency)
     except KeyboardInterrupt:
         if server is None or server.proc is None:
             _say("interrupted")
@@ -1000,7 +1168,7 @@ def _run(args: argparse.Namespace, *, max_exe: str | None) -> int:
 
 
 def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: dict[str, dict[str, int]],
-             guarded: bool, started_utc: str) -> int:
+             started_utc: str, concurrency: int) -> int:
     pages = profile_corpus.page_names()
     (out / "pages").mkdir(parents=True)
     exchanges: dict[str, Exchange] = {}
@@ -1028,37 +1196,32 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
                 ready_s = time.monotonic() - t_spawn
                 _say(f"ready after {ready_s:.1f} s")
 
-                for label, page, max_tokens in [("warmup", pages[0], WARMUP_MAX_TOKENS)] + [
-                    (page, page, PAGE_MAX_TOKENS) for page in pages
-                ]:
-                    t_start = time.monotonic()
-                    try:
-                        exchange = _stream_chat(args.port, profile_corpus.page_png(page), max_tokens)
-                    except ExchangeFailed as e:
-                        busy.append((t_start, time.monotonic()))
-                        void.append(f"request {label} failed: {e}")
-                        _say(void[-1])
-                        _print_log_tail(server.log_path)
-                        break
-                    busy.append((exchange.t_start, exchange.t_end))
-                    if label == "warmup":
-                        warmup = exchange
-                        # The pages' swap baseline: loading and compiling have paged by now, if at all.
-                        swap_warm, swap_warm_error = _swap_now("at the warmup's end")
-                    else:
-                        exchanges[page] = exchange
-                        (out / "pages" / f"{page}.md").write_bytes(exchange.text.encode("utf-8"))
-                    _say(f"{label}: {exchange.completion_tokens} tokens in {exchange.wall_s:.1f} s")
+                # The warmup is always sequential and alone -- concurrency is only for the 12 pages.
+                t_start = time.monotonic()
+                try:
+                    warmup = _stream_chat(args.port, profile_corpus.page_png(pages[0]), WARMUP_MAX_TOKENS)
+                except ExchangeFailed as e:
+                    busy.append((t_start, time.monotonic()))
+                    void.append(f"request warmup failed: {e}")
+                    _say(void[-1])
+                    _print_log_tail(server.log_path)
+                else:
+                    busy.append((warmup.t_start, warmup.t_end))
+                    # The pages' swap baseline: loading and compiling have paged by now, if at all.
+                    swap_warm, swap_warm_error = _swap_now("at the warmup's end")
+                    _say(f"warmup: {warmup.completion_tokens} tokens in {warmup.wall_s:.1f} s")
+                    exchanges, page_busy, page_void = _send_pages(args.port, server.log_path, out, pages, concurrency)
+                    busy += page_busy
+                    void += page_void
 
                 if not void:
                     time.sleep(STEADY_DWELL_S)
-                if guarded:
-                    own = _snapshot(server.sampler.pids_seen) | {server.proc.pid}
-                    try:
-                        own |= set(profile_sampling.process_tree(server.proc.pid))
-                    except (OSError, subprocess.SubprocessError):
-                        pass
-                    void += _gpu_not_idle(own, after_run=True)
+                own = _snapshot(server.sampler.pids_seen) | {server.proc.pid}
+                try:
+                    own |= set(profile_sampling.process_tree(server.proc.pid))
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                void += _gpu_not_idle(own, after_run=True)
                 # Last, so it covers the whole run. A server that could not bind the port (taken
                 # after the check in `run`) exits -- while whatever took it answers the requests.
                 if server.leader_exited():
@@ -1069,9 +1232,9 @@ def _profile(args: argparse.Namespace, server: _Server, out: Path, *, baseline: 
         if server.stopped:  # otherwise the teardown failed part-way; leave atexit to retry it
             atexit.unregister(server.stop)
     void += server.void
-    return _report(args, server, out, pages, exchanges, warmup, busy, void, baseline=baseline, guarded=guarded,
+    return _report(args, server, out, pages, exchanges, warmup, busy, void, baseline=baseline,
                    ready_s=ready_s, started_utc=started_utc, swap_start=swap_start, swap_start_error=swap_start_error,
-                   swap_warm=swap_warm, swap_warm_error=swap_warm_error)
+                   swap_warm=swap_warm, swap_warm_error=swap_warm_error, concurrency=concurrency)
 
 
 def _swap_now(when: str) -> tuple[int | None, str | None]:
@@ -1120,16 +1283,11 @@ def _scheduler_figures(figures: _Figures, log: str) -> None:
     figures.compute("prefill_all_ce", lambda: profile_metrics.prefill_stats(sched["CE"], skip_first=0))
 
 
-def _device_figures(figures: _Figures, args: argparse.Namespace, sampler: profile_sampling.Sampler, *,
+def _device_figures(figures: _Figures, sampler: profile_sampling.Sampler, *,
                     baseline: dict[str, dict[str, int]], busy: list[tuple[float, float]],
                     steady_after: float | None, page_windows: list[tuple[float, float]]) -> None:
     """Device memory and GPU utilisation, counted on the serving GPU(s) only; ``partial`` once
     device sampling stopped early."""
-    if args.devices == "cpu":  # the server ran on no GPU: whatever a GPU did meanwhile is not its work
-        for name in ("device_memory", "gpu_utilisation"):
-            figures.values[name] = None
-            figures.unavailable[name] = "--devices cpu"
-        return
     device_process = [(t, v) for t, v in list(sampler.device_process) if v is not None]
     device_stats = list(sampler.device_stats)
     # Per process: the server tree's own allocations, which are only on the GPU(s) it serves from.
@@ -1151,9 +1309,9 @@ def _device_figures(figures: _Figures, args: argparse.Namespace, sampler: profil
 
 def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[str], exchanges: dict[str, Exchange],
             warmup: Exchange | None, busy: list[tuple[float, float]], void: list[str], *,
-            baseline: dict[str, dict[str, int]], guarded: bool, ready_s: float | None, started_utc: str,
+            baseline: dict[str, dict[str, int]], ready_s: float | None, started_utc: str,
             swap_start: int | None, swap_start_error: str | None,
-            swap_warm: int | None, swap_warm_error: str | None) -> int:
+            swap_warm: int | None, swap_warm_error: str | None, concurrency: int) -> int:
     sampler = server.sampler
     assert sampler is not None
     rss = list(sampler.rss)
@@ -1168,7 +1326,9 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     text_by_variant = _text_stats_by_variant(refs, responses, done)
 
     figures = _Figures()
-    _scheduler_figures(figures, server.log_path.read_bytes().decode("utf-8", "replace"))
+    log_text = server.log_path.read_bytes().decode("utf-8", "replace")
+    _scheduler_figures(figures, log_text)
+    figures.compute("concurrency", lambda: _concurrency_figure(exchanges, concurrency, args.max_batch_size, log_text))
     figures.compute("host_memory", lambda: _memory(
         rss, busy, steady_after, empty="no host RSS samples", figures=figures, name="host_memory"))
     if profile_sampling.FOOTPRINT_SUPPORTED:
@@ -1180,7 +1340,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     else:
         figures.values["host_footprint"] = None
         figures.unavailable["host_footprint"] = f"physical footprint is sampled on macOS only, not {sys.platform}"
-    _device_figures(figures, args, sampler, baseline=baseline, busy=busy, steady_after=steady_after,
+    _device_figures(figures, sampler, baseline=baseline, busy=busy, steady_after=steady_after,
                     page_windows=page_windows)
     for variant, name in (("bf16", "text"), ("int8", "text_vs_int8")):
         if variant in refs:
@@ -1190,7 +1350,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
     swap_moved = swap["growth_bytes"] is not None and swap["growth_bytes"] > SWAP_MOVED_BYTES
 
     host = _host(baseline)
-    hardware = _hardware(host, args.devices)
+    hardware = _hardware(host)
     status = f"{'void' if void else 'profiled'}, {len(exchanges)} pages" + (", swap moved" if swap_moved else "")
     table_row = row(hardware, args.weights, status, figures.values)
     profile_path = out / "profile.json"
@@ -1203,11 +1363,12 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         "flags": {
             "devices": args.devices, "weights": args.weights, "model": args.model, "revision": args.revision,
             "port": args.port, "ngram_size": args.ngram_size, "ready_timeout_s": args.ready_timeout_s, "out": str(out),
+            "max_batch_size": args.max_batch_size,
+            "concurrency": _resolve_concurrency(args.max_batch_size, args.concurrency),
         },
         "served_command": server.cmd,
         "server_ready_s": ready_s,
         "device_baseline": baseline,
-        "gpu_guard": guarded,
         "figures": figures.values,
         "unavailable": figures.unavailable,
         "sampling": {
@@ -1234,7 +1395,7 @@ def _report(args: argparse.Namespace, server: _Server, out: Path, pages: list[st
         if sampler.device_error is not None:
             device_line += f" (partial: device sampling stopped: {sampler.device_error})"
         print(device_line)
-    elif sampler.device_error is not None and args.devices != "cpu":  # a CPU run reports no device figures anyway
+    elif sampler.device_error is not None:
         print(f"note: device sampling stopped: {sampler.device_error}; no device figures")
     if "int8" in refs:
         print(f"vs pinned int8: {_text_cell(figures.values.get('text_vs_int8'))}")

@@ -376,7 +376,7 @@ def test_sampler_ps_failure_on_one_tick_is_skipped_and_rss_continues(
 
 
 def test_private_max_profiler_gpu_process_api_pin() -> None:
-    """Pin check for max[all]==26.6.0's private per-process GPU memory API.
+    """Pin check for the pinned max's private per-process GPU memory API.
 
     ``NVMLContext``/``RSMIContext`` and their ``get_process_memory_bytes``
     methods are private MAX modules that :func:`DeviceProbe.process_bytes`

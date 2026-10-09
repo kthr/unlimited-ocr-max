@@ -15,10 +15,10 @@ import pytest
 from unlimited_ocr_max import cli
 
 ROOT = Path(__file__).resolve().parent.parent
-PINNED_MAX_VERSION = "26.6.0"
+PINNED_MAX_VERSION = "26.7.0.dev2026100105"
 
 
-def test_installed_max_is_the_pinned_release() -> None:
+def test_installed_max_is_the_pinned_build() -> None:
     assert importlib.metadata.version("max") == PINNED_MAX_VERSION
     assert f'"max[all]=={PINNED_MAX_VERSION}"' in (ROOT / "pyproject.toml").read_text()
     # The README states the pin to the reader, so it must not drift from pyproject.
@@ -54,6 +54,9 @@ def test_mojo_kernel_ships_with_the_package() -> None:
     assert (kernels / "__init__.mojo").is_file()
     assert (kernels / "ngram_block.mojo").is_file()
     assert (kernels / "moe_int8.mojo").is_file()
+    assert (kernels / "moe_bf16.mojo").is_file()
+    assert (kernels / "moe_routing.mojo").is_file()  # imported by both qmv kernels
+    assert (kernels / "dense_bf16.mojo").is_file()
 
 
 TAIL = [
@@ -62,6 +65,7 @@ TAIL = [
     "--quantization-encoding", "float32",
     "--max-length", "2048",
     "--served-model-name", "unlimited-ocr-max",
+    "--sample-on-host",
     "--port", "8010",
 ]
 
@@ -130,22 +134,41 @@ def test_max_filename_parser_ignores_our_weight_filenames() -> None:
     assert parse_supported_encoding_from_file_name("model-bf16.safetensors") is not None
 
 
-def test_int8_on_cpu_is_refused_before_any_path_work() -> None:
+@pytest.mark.parametrize("cpu", ["cpu", "CPU"])
+@pytest.mark.parametrize("command", ["serve", "profile"])
+@pytest.mark.parametrize("weights", cli.WEIGHT_VARIANTS)
+def test_devices_cpu_is_refused_with_its_reason_before_any_path_work(
+    command: str, weights: str, cpu: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     missing = "/nonexistent/unlimited-ocr-max"  # resolve_model would fail on this, with another message
     with pytest.raises(SystemExit) as refused:
-        cli.main(["serve", "--devices", "cpu", "--weights", "int8", "--model", missing])
-    assert str(refused.value) == "--weights int8 is GPU-only; serve on cpu with --weights bf16"
+        cli.main([command, "--devices", cpu, "--weights", weights, "--model", missing])
+    assert refused.value.code == 2
+    err = capsys.readouterr().err
+    assert cli.CPU_REFUSED in err and "MAX 26.7 nightlies miscompile" in err and "no longer a served, tested target" in err
+    assert "neither an existing directory" not in err
 
-    for weights, devices in (("bf16", "cpu"), ("int8", "gpu")):  # every other combination gets that far
-        with pytest.raises(SystemExit) as reached_resolve_model:
-            cli.main(["serve", "--devices", devices, "--weights", weights, "--model", missing])
-        assert "neither an existing directory" in str(reached_resolve_model.value)
+
+@pytest.mark.parametrize("command", ["serve", "profile"])
+@pytest.mark.parametrize("weights", cli.WEIGHT_VARIANTS)
+def test_devices_gpu_is_the_only_accepted_value_and_is_required(
+    command: str, weights: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = "/nonexistent/unlimited-ocr-max"
+    with pytest.raises(SystemExit) as reached_resolve_model:  # gpu gets as far as the model path
+        cli.main([command, "--devices", "gpu", "--weights", weights, "--model", missing])
+    assert "neither an existing directory" in str(reached_resolve_model.value)
+
+    for argv in ([command, "--model", missing], [command, "--devices", "tpu", "--model", missing]):
+        with pytest.raises(SystemExit) as refused:  # required; and nothing else is accepted
+            cli.main(argv)
+        assert refused.value.code == 2
+    assert "invalid choice: 'tpu'" in capsys.readouterr().err
 
 
 def test_ngram_size_travels_to_the_server_through_the_private_variable(monkeypatch: pytest.MonkeyPatch) -> None:
     from unlimited_ocr_max.model import NGRAM_SIZE_ENV, serve_ngram_size
 
-    assert NGRAM_SIZE_ENV == cli.NGRAM_ENV
     monkeypatch.delenv(NGRAM_SIZE_ENV, raising=False)
     assert serve_ngram_size() == 35
     monkeypatch.setenv(NGRAM_SIZE_ENV, "0")

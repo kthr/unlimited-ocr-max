@@ -14,13 +14,31 @@ from pathlib import Path
 
 DEFAULT_MODEL = "kthierbach/unlimited-ocr-max"
 #: The model-repo tag this package version was validated against; ignored for a local ``--model``.
-DEFAULT_REVISION = "v0.3.2"
+DEFAULT_REVISION = "v0.4.0"
 WEIGHT_VARIANTS = ("bf16", "int8")
 PACKAGE_DIR = Path(__file__).resolve().parent
 SERVED_MODEL_NAME = "unlimited-ocr-max"
 MAX_LENGTH = 2048
-#: Internal transport to the architecture inside the ``max serve`` child; see ``model.NGRAM_SIZE_ENV``.
-NGRAM_ENV = "_UNLIMITED_OCR_MAX_NGRAM_SIZE"
+#: Internal transport, set by ``serve`` for the ``max serve`` child it launches and read by
+#: ``model.serve_ngram_size``: ``no_repeat_ngram_size`` is neither an OpenAI request field nor a
+#: ``max serve`` flag. Unset means the shipped default, so a direct ``max serve
+#: --custom-architectures`` user gets it too.
+NGRAM_SIZE_ENV = "_UNLIMITED_OCR_MAX_NGRAM_SIZE"
+#: Internal transport, set by ``serve`` for the ``max serve`` child and read by
+#: ``model.serve_max_batch_size``: ``arch.py``'s ``required_arguments`` forces ``max_batch_size`` (MAX
+#: applies it over user flags, so a ``--max-batch-size`` passed straight to ``max serve`` would just
+#: be overridden), so this is how the CLI's flag actually reaches the architecture. Unset or blank
+#: means batch size 1, so a direct ``max serve --custom-architectures`` user gets it too.
+MAX_BATCH_SIZE_ENV = "_UNLIMITED_OCR_MAX_MAX_BATCH_SIZE"
+#: Above this, ``--max-batch-size`` is refused: batched decoding (bf16 or int8 alike) is unvalidated past it.
+MAX_BATCH_CAP = 8
+#: Why CPU serving is refused. ``--devices cpu`` exits 2 with this text; ``model.UnlimitedOCRModel`` raises
+#: the same text for a plain ``max serve --devices cpu``.
+CPU_REFUSED = (
+    "CPU serving was removed: the MAX 26.7 nightlies miscompile a CPU matmul whose output is reshaped and "
+    "broadcast (served pages came out wrong, with no error), and CPU is no longer a served, tested target; "
+    "use --devices gpu"
+)
 
 
 def weight_file(variant: str) -> str:
@@ -73,30 +91,36 @@ def serve_command(*, max_exe: str, model: str, weight_path: str, devices: str, p
         "--quantization-encoding", "float32",
         "--max-length", str(MAX_LENGTH),
         "--served-model-name", SERVED_MODEL_NAME,
+        # The logits are host-side already (the n-gram guard), and MAX's Metal sampler is slow on 26.7.
+        "--sample-on-host",
         "--port", str(port),
     ]
 
 
-def check_devices_support_variant(weights: str, devices: str) -> None:
-    """Refuse a variant its device cannot serve, before any path or network work."""
-    if weights == "int8" and devices == "cpu":
-        raise SystemExit("--weights int8 is GPU-only; serve on cpu with --weights bf16")
+def check_max_batch_size(max_batch_size: int) -> None:
+    """Refuse a --max-batch-size this port cannot serve, before any path or network work."""
+    if max_batch_size < 1:
+        raise SystemExit(f"--max-batch-size {max_batch_size} must be >= 1")
+    if max_batch_size > MAX_BATCH_CAP:
+        raise SystemExit(f"--max-batch-size {max_batch_size} exceeds the cap of {MAX_BATCH_CAP}")
 
 
-def serve_env(ngram_size: int) -> dict[str, str]:
-    """The environment ``max serve`` runs under: ours, plus the n-gram size for the architecture."""
+def serve_env(ngram_size: int, max_batch_size: int) -> dict[str, str]:
+    """The environment ``max serve`` runs under: ours, plus the n-gram size and max batch size for
+    the architecture."""
     env = dict(os.environ)
-    env[NGRAM_ENV] = str(ngram_size)
+    env[NGRAM_SIZE_ENV] = str(ngram_size)
+    env[MAX_BATCH_SIZE_ENV] = str(max_batch_size)
     return env
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    check_devices_support_variant(args.weights, args.devices)
+    check_max_batch_size(args.max_batch_size)
     model, weight_path, revision = resolve_model(args.model, args.weights, args.revision)
     cmd = serve_command(
         max_exe=max_executable(), model=model, weight_path=weight_path, devices=args.devices, port=args.port, revision=revision
     )
-    env = serve_env(args.ngram_size)
+    env = serve_env(args.ngram_size, args.max_batch_size)
     print("[unlimited-ocr-max] " + " ".join(cmd), file=sys.stderr, flush=True)
     os.execvpe(cmd[0], cmd, env)
     return 1  # unreachable: execvpe only returns on failure, which raises
@@ -108,25 +132,34 @@ def cmd_profile(args: argparse.Namespace) -> int:
     return profile.run(args)
 
 
+def _gpu_only(value: str) -> str:
+    """``--devices`` type: ``cpu``, in any case, is refused with its reason (argparse exits 2), anything else is left to ``choices``."""
+    if value.lower() == "cpu":
+        raise argparse.ArgumentTypeError(CPU_REFUSED)
+    return value
+
+
 def add_server_arguments(parser: argparse.ArgumentParser) -> None:
     """The flags that decide what ``max serve`` runs; shared by ``serve`` and ``profile``."""
-    parser.add_argument("--devices", choices=("cpu", "gpu"), required=True,
-                        help="gpu (Metal, CUDA or ROCm; see the README prerequisites) or cpu (supported, slow)")
+    parser.add_argument("--devices", type=_gpu_only, choices=("gpu",), required=True,
+                        help="gpu (Metal, CUDA or ROCm; see the README prerequisites); CPU serving was removed")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="Hub repository or a local directory with its layout (default: %(default)s)")
     parser.add_argument("--revision", default=DEFAULT_REVISION,
                         help="Hub revision for config, tokenizer and weights; ignored for a local directory (default: %(default)s)")
     parser.add_argument("--weights", default="bf16", choices=WEIGHT_VARIANTS,
-                        help="weight variant: bf16 is the unquantised model.safetensors (cpu or gpu), int8 is model-int8.safetensors (gpu only) (default: %(default)s)")
+                        help="weight variant: bf16 is the unquantised model.safetensors, int8 is model-int8.safetensors (default: %(default)s)")
     parser.add_argument("--port", type=int, default=8010, help="(default: %(default)s)")
     # 35 is `ngram.DEFAULT_NGRAM_SIZE`, repeated here so this module imports no MAX.
     parser.add_argument("--ngram-size", type=int, default=35,
                         help="no-repeat n-gram guard; 0 disables, which reproduces the PyTorch reference (default: %(default)s)")
+    parser.add_argument("--max-batch-size", type=int, default=1,
+                        help=f"requests batched per scheduler step, capped at {MAX_BATCH_CAP} (default: %(default)s)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="unlimited-ocr-max", description="Serve baidu/Unlimited-OCR through MAX on Metal, CUDA, ROCm or CPU."
+        prog="unlimited-ocr-max", description="Serve baidu/Unlimited-OCR through MAX on Metal, CUDA or ROCm."
     )
     sub = ap.add_subparsers(dest="command", required=True)
     srv = sub.add_parser("serve", help="run `max serve` with this port's flags")
@@ -145,6 +178,9 @@ def build_parser() -> argparse.ArgumentParser:
                       help="new or empty directory for profile.json, serve.log and pages/ (default: ./unlimited-ocr-max-profile-<UTC time>)")
     prof.add_argument("--ready-timeout-s", type=float, default=1800, metavar="SECONDS",
                       help="how long the server may take to come up; a cold kernel compile takes minutes (default: %(default)s)")
+    prof.add_argument("--concurrency", type=int, default=None, metavar="N",
+                      help="requests kept in flight while sending the 12-page corpus, 1..--max-batch-size "
+                           "(default: --max-batch-size)")
     prof.set_defaults(func=cmd_profile)
     return ap
 

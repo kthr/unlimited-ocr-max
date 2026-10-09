@@ -85,10 +85,8 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def _args(out: Path, port: int, *extra: str, devices: str = "cpu") -> argparse.Namespace:
-    return cli.build_parser().parse_args(
-        ["profile", "--devices", devices, "--port", str(port), "--out", str(out), *extra]
-    )
+def _args(out: Path, port: int, *extra: str) -> argparse.Namespace:
+    return cli.build_parser().parse_args(["profile", "--devices", "gpu", "--port", str(port), "--out", str(out), *extra])
 
 
 def _gone(pid: int, *, allow_zombie: bool) -> bool:
@@ -208,9 +206,17 @@ class _ProbeFailingMidRun(_FakeProbe):
 
 def _idle_gpu(monkeypatch: pytest.MonkeyPatch, probe: Any) -> None:
     """Patch ``open_device_probe`` to ``probe`` (a class or a zero-arg factory) and stub
-    ``foreign_gpu_processes`` so a guarded ``--devices gpu`` run treats the GPU as otherwise idle."""
+    ``foreign_gpu_processes`` so the run treats the GPU as otherwise idle."""
     monkeypatch.setattr(profile_sampling, "open_device_probe", probe)
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", lambda own: [])
+
+
+@pytest.fixture(autouse=True)
+def _metal_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every run is a ``--devices gpu`` run, so every test needs a probe: by default the one
+    ``open_device_probe`` returns on Metal (no device statistics) and no foreign GPU process. A
+    test that wants another host calls :func:`_idle_gpu` itself, which replaces this."""
+    _idle_gpu(monkeypatch, _NoDeviceProbe)
 
 
 def _no_spawn(self: Any) -> None:
@@ -245,7 +251,8 @@ def test_profile_help_does_not_import_max() -> None:
     modules, help_text = _modules_and_stdout("from unlimited_ocr_max import cli\ncli.main(['profile', '--help'])")
     assert not _imports_max(modules)
     assert "unlimited_ocr_max.profile" not in modules
-    for flag in ("--devices", "--model", "--revision", "--weights", "--port", "--ngram-size", "--out", "--ready-timeout-s"):
+    for flag in ("--devices", "--model", "--revision", "--weights", "--port", "--ngram-size", "--max-batch-size",
+                 "--out", "--ready-timeout-s", "--concurrency"):
         assert flag in help_text
 
 
@@ -291,22 +298,22 @@ def test_serve_and_profile_share_one_definition_of_the_server_flags() -> None:
         }
 
     serve, prof = spec(subparsers.choices["serve"]), spec(subparsers.choices["profile"])
-    assert list(serve) == ["devices", "model", "revision", "weights", "port", "ngram_size"]
+    assert list(serve) == ["devices", "model", "revision", "weights", "port", "ngram_size", "max_batch_size"]
     assert {dest: prof[dest] for dest in serve} == serve
-    assert list(prof)[len(serve):] == ["out", "ready_timeout_s"]
+    assert list(prof)[len(serve):] == ["out", "ready_timeout_s", "concurrency"]
     assert prof["ready_timeout_s"][1] == 1800
     assert prof["out"][1] is None  # resolved at run time, to the run's own UTC timestamp
+    assert prof["concurrency"][1] is None  # resolved at run time, to --max-batch-size
 
 
-def test_int8_on_cpu_is_refused_as_serve_refuses_it() -> None:
-    missing = "/nonexistent/unlimited-ocr-max"
+def test_devices_cpu_is_refused_as_serve_refuses_it(monkeypatch: pytest.MonkeyPatch,
+                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    """Exit 2 with the reason, from the argument parser: ``profile`` itself is never entered."""
+    monkeypatch.setattr(profile, "run", lambda *args, **kwargs: pytest.fail("profile ran for --devices cpu"))
     with pytest.raises(SystemExit) as refused:
-        cli.main(["profile", "--devices", "cpu", "--weights", "int8", "--model", missing])
-    assert str(refused.value) == "--weights int8 is GPU-only; serve on cpu with --weights bf16"
-    for weights, devices in (("bf16", "cpu"), ("int8", "gpu")):
-        with pytest.raises(SystemExit) as reached_resolve_model:
-            cli.main(["profile", "--devices", devices, "--weights", weights, "--model", missing])
-        assert "neither an existing directory" in str(reached_resolve_model.value)
+        cli.main(["profile", "--devices", "cpu"])
+    assert refused.value.code == 2
+    assert cli.CPU_REFUSED in capsys.readouterr().err
 
 
 def test_default_out_is_a_fresh_utc_stamped_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,7 +367,7 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
 
     # The server ran with exactly `serve`'s command and environment.
     model, weight_path, revision = cli.resolve_model(cli.DEFAULT_MODEL, "bf16", cli.DEFAULT_REVISION)
-    served = cli.serve_command(max_exe=stub.exe, model=model, weight_path=weight_path, devices="cpu", port=port,
+    served = cli.serve_command(max_exe=stub.exe, model=model, weight_path=weight_path, devices="gpu", port=port,
                                revision=revision)
     pids = stub.pids()
     assert pids["argv"] == served[1:]
@@ -378,10 +385,10 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
     for key in ("platform", "machine", "cpu_brand", "ram_bytes", "accelerator", "gpus", "hardware"):
         assert key in host
     assert {"api", "architecture"} <= set(host["accelerator"])
-    assert host["hardware"].endswith(", CPU")
     assert set(doc["versions"]) == {"unlimited-ocr-max", "max", "mojo"}
-    assert doc["flags"] == {"devices": "cpu", "weights": "bf16", "model": cli.DEFAULT_MODEL, "revision": cli.DEFAULT_REVISION,
-                            "port": port, "ngram_size": 35, "ready_timeout_s": 1800, "out": str(out)}
+    assert doc["flags"] == {"devices": "gpu", "weights": "bf16", "model": cli.DEFAULT_MODEL, "revision": cli.DEFAULT_REVISION,
+                            "port": port, "ngram_size": 35, "ready_timeout_s": 1800, "out": str(out),
+                            "max_batch_size": 1, "concurrency": 1}
     assert doc["served_command"] == served
     assert isinstance(doc["device_baseline"], dict)
     assert doc["void"] == [] and doc["teardown_warnings"] == []
@@ -399,8 +406,11 @@ def test_profile_end_to_end_against_the_stub(stub: Stub, tmp_path: Path, capsys:
     memory = figures["host_memory"]
     assert memory["peak_bytes"] > 0 and memory["n"] > 0
     assert memory["n_steady"] >= 1 and memory["steady_min_bytes"] <= memory["steady_max_bytes"] <= memory["peak_bytes"]
-    assert figures["device_memory"] is None and doc["unavailable"]["device_memory"] == "--devices cpu"
-    assert figures["gpu_utilisation"] is None and doc["unavailable"]["gpu_utilisation"] == "--devices cpu"
+    # The default probe is a Metal host's: no device statistics, so no device figures.
+    assert figures["device_memory"] is None
+    assert doc["unavailable"]["device_memory"] == "no per-process device memory sampled on this host"
+    assert figures["gpu_utilisation"] is None
+    assert doc["unavailable"]["gpu_utilisation"] == "no device statistics sampled on this host"
     assert doc["swap"] == {"start_bytes": GIB, "warm_bytes": GIB, "load_growth_bytes": 0, "max_bytes": GIB,
                            "growth_bytes": 0, "reason": None}
     assert doc["sampling"]["swap_samples"] > 0
@@ -449,7 +459,7 @@ def test_int8_weights_are_also_compared_against_the_pinned_int8_references(
 ) -> None:
     _idle_gpu(monkeypatch, _FakeProbe)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), "--weights", "int8", devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port(), "--weights", "int8"), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
@@ -513,7 +523,7 @@ def test_gpu_guard_refuses_a_foreign_process_before_spawning(
                         lambda own: [{"pid": 4242, "name": "python", "used_bytes": 1536 * 2**20}])
     monkeypatch.setattr(profile._Server, "start", _no_spawn)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    code = profile.run(_args(out, _free_port()), max_exe="/nonexistent/max")
     err = capsys.readouterr().err
     assert code == 3
     assert "otherwise idle GPU" in err and "pid 4242 python 1536 MiB" in err
@@ -530,7 +540,7 @@ def test_gpu_guard_refuses_when_the_process_list_is_unavailable(
     monkeypatch.setattr(profile_sampling, "open_device_probe", _FakeProbe)
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", unavailable)
     monkeypatch.setattr(profile._Server, "start", _no_spawn)
-    code = profile.run(_args(tmp_path / "run", _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    code = profile.run(_args(tmp_path / "run", _free_port()), max_exe="/nonexistent/max")
     err = capsys.readouterr().err
     assert code == 3
     assert "otherwise idle GPU" in err and "nvidia-smi is not on PATH" in err
@@ -552,7 +562,7 @@ def test_gpu_guard_runs_without_device_statistics_and_refuses_an_unlistable_gpu(
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", unavailable)
     monkeypatch.setattr(profile._Server, "start", _no_spawn)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    code = profile.run(_args(out, _free_port()), max_exe="/nonexistent/max")
     err = capsys.readouterr().err
     assert code == 3
     assert "otherwise idle GPU" in err and "GPUDiagContext failed to report device stats" in err
@@ -573,7 +583,7 @@ def test_gpu_guard_runs_without_device_statistics_and_refuses_a_foreign_process(
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", foreign)
     monkeypatch.setattr(profile._Server, "start", _no_spawn)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    code = profile.run(_args(out, _free_port()), max_exe="/nonexistent/max")
     err = capsys.readouterr().err
     assert code == 3
     assert calls == [set()]
@@ -593,38 +603,31 @@ def test_the_post_run_gpu_recheck_also_runs_without_device_statistics(
     monkeypatch.setattr(profile_sampling, "open_device_probe", _NoDeviceProbe)
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", foreign)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 5, captured.err
     assert _tree_gone(stub)
     assert len(calls) == 2 and {stub.pids()["pid"], stub.pids()["child"]} <= calls[1]
     doc = json.loads((out / "profile.json").read_text())
-    assert doc["gpu_guard"] is True
     assert len(doc["void"]) == 1 and "pid 4242 intruder ? MiB" in doc["void"][0]
     assert doc["figures"]["device_memory"] is None
 
 
-def test_a_cpu_run_never_consults_the_gpu_process_list_and_reports_no_device_figures(
-    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_a_host_without_device_statistics_reports_its_physical_footprint(
+    stub: Stub, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """On a host with a GPU (the fake probe samples one), a --devices cpu run still has no device
-    figures: whatever the GPU did meanwhile is not the server's work."""
-
-    def must_not_run(own: set[int]) -> list[dict[str, Any]]:
-        raise AssertionError("foreign_gpu_processes was called for a --devices cpu run")
-
-    monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", must_not_run)
-    monkeypatch.setattr(profile_sampling, "open_device_probe", _FakeProbe)
+    """A Metal host (the default probe: no device statistics) has no device figures; the row's
+    memory cell is the host's."""
     out = tmp_path / "run"
     code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
     doc = json.loads((out / "profile.json").read_text())
-    assert doc["gpu_guard"] is False and doc["void"] == []
-    assert doc["sampling"]["device_samples"] > 0  # sampled, and deliberately not reported
+    assert doc["void"] == []
+    assert doc["sampling"]["device_samples"] == 0
     for name in ("device_memory", "gpu_utilisation"):
-        assert doc["figures"][name] is None and doc["unavailable"][name] == "--devices cpu"
+        assert doc["figures"][name] is None and name in doc["unavailable"]
     # The memory figure is the physical footprint on macOS, sampled for real over the stub's tree.
     if profile_sampling.FOOTPRINT_SUPPORTED:
         assert doc["sampling"]["footprint_samples"] > 0 and doc["sampling"]["footprint_error"] is None
@@ -633,7 +636,7 @@ def test_a_cpu_run_never_consults_the_gpu_process_list_and_reports_no_device_fig
         assert doc["figures"]["host_footprint"] is None
         assert "macOS only" in doc["unavailable"]["host_footprint"]
     lines = captured.out.splitlines()
-    assert _cells(lines[0])[5] == profile._memory_cell(profile.host_memory_figure(doc["figures"])[1])  # host RSS, not "device ..."
+    assert _cells(lines[0])[5] == profile._memory_cell(profile.host_memory_figure(doc["figures"])[1])  # host, not "device ..."
     assert lines[1:] == [f"profile.json: {out / 'profile.json'}"]
 
 
@@ -651,7 +654,7 @@ def test_a_foreign_gpu_process_found_after_the_run_voids_it(
     monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: probe)
     monkeypatch.setattr(profile_sampling, "foreign_gpu_processes", foreign)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 5, captured.err
     assert _tree_gone(stub)
@@ -659,7 +662,6 @@ def test_a_foreign_gpu_process_found_after_the_run_voids_it(
     assert calls[0] == set() and {pids["pid"], pids["child"]} <= calls[1]
     doc = json.loads((out / "profile.json").read_text())
     assert len(doc["void"]) == 1 and "pid 4242 intruder ? MiB" in doc["void"][0]
-    assert doc["gpu_guard"] is True
     assert doc["device_baseline"] == probe.stats()
     assert doc["figures"]["device_memory"]["peak_bytes"] == 3 * GIB
     assert doc["figures"]["device_memory"]["partial"] is False
@@ -819,7 +821,7 @@ def test_a_host_without_ps_is_refused_before_any_probe_or_spawn(
     monkeypatch.setattr(profile_sampling, "open_device_probe", lambda: pytest.fail("the device probe was opened"))
     monkeypatch.setattr(profile._Server, "start", _no_spawn)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe="/nonexistent/max")
+    code = profile.run(_args(out, _free_port()), max_exe="/nonexistent/max")
     assert code == 2
     assert "`ps` is required (install procps)" in capsys.readouterr().err
     assert not out.exists()
@@ -1071,13 +1073,13 @@ def test_hardware_picks_the_first_named_gpu() -> None:
         ],
         "accelerator": {"api": "cuda", "architecture": "sm_90"},
     }
-    assert profile._hardware(host, "gpu") == "Test CPU 32 GB, NVIDIA A100 80 GB"
+    assert profile._hardware(host) == "Test CPU 32 GB, NVIDIA A100 80 GB"
 
 
 def test_hardware_falls_back_to_metal_when_no_gpu_is_named() -> None:
     host = {"cpu_brand": "Apple M4", "ram_bytes": 16 * GIB, "gpus": [],
             "accelerator": {"api": "metal", "architecture": None}}
-    assert profile._hardware(host, "gpu") == "Apple M4 16 GB, Metal"
+    assert profile._hardware(host) == "Apple M4 16 GB, Metal"
 
 
 def test_hardware_falls_back_to_the_architecture_string_when_no_gpu_is_named_and_not_metal() -> None:
@@ -1085,7 +1087,7 @@ def test_hardware_falls_back_to_the_architecture_string_when_no_gpu_is_named_and
     probe's architecture ends up in the hardware cell instead; the figures are unaffected."""
     host = {"cpu_brand": "AMD EPYC", "ram_bytes": 64 * GIB, "gpus": [],
             "accelerator": {"api": "hip", "architecture": "gfx90a"}}
-    assert profile._hardware(host, "gpu") == "AMD EPYC 64 GB, gfx90a"
+    assert profile._hardware(host) == "AMD EPYC 64 GB, gfx90a"
 
 
 def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row(
@@ -1094,7 +1096,7 @@ def test_a_gpu_run_counts_only_the_serving_gpu_and_puts_device_memory_in_the_row
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")  # page windows long enough for several device samples
     _idle_gpu(monkeypatch, _TwoGpuProbe)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
@@ -1116,7 +1118,7 @@ def test_device_figures_are_marked_partial_when_device_sampling_stops_mid_run(
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")
     _idle_gpu(monkeypatch, lambda: _ProbeFailingMidRun(stub))
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err  # partial is marked, not void
     assert _tree_gone(stub)
@@ -1152,7 +1154,7 @@ def test_device_sampling_that_fails_before_its_first_sample_is_said_not_silent(
 ) -> None:
     _idle_gpu(monkeypatch, _ProbeFailingAfterTheBaseline)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
@@ -1172,7 +1174,7 @@ def test_a_malformed_device_sample_is_an_unavailable_figure_not_a_crash() -> Non
     sampler = argparse.Namespace(device_process=[(1.0, 3 * GIB)], device_error=None,
                                  device_stats=[(1.0, {"nv0": {"gpu_usage_percent": 40}})])  # no used_bytes
     figures = profile._Figures()
-    profile._device_figures(figures, argparse.Namespace(devices="gpu"), sampler, baseline={"nv0": _gpu(1, 0)},
+    profile._device_figures(figures, sampler, baseline={"nv0": _gpu(1, 0)},
                             busy=[(0.5, 1.5)], steady_after=0.0, page_windows=[(0.5, 1.5)])
     assert figures.values["gpu_utilisation"] is None
     assert figures.unavailable["gpu_utilisation"] == "'used_bytes'"
@@ -1185,7 +1187,7 @@ def test_gpu_utilisation_without_device_memory_is_still_printed(
     monkeypatch.setenv("PROFILE_STUB_PREFILL_S", "0.3")
     _idle_gpu(monkeypatch, _UtilisationOnlyProbe)
     out = tmp_path / "run"
-    code = profile.run(_args(out, _free_port(), devices="gpu"), max_exe=stub.exe)
+    code = profile.run(_args(out, _free_port()), max_exe=stub.exe)
     captured = capsys.readouterr()
     assert code == 0, captured.err
     assert _tree_gone(stub)
@@ -1204,7 +1206,7 @@ def test_the_row_memory_cell_is_device_memory_else_physical_footprint_else_host_
     discrete = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": device})
     partial = profile.row("hw", "bf16", "profiled, 12 pages",
                           {"host_memory": host, "device_memory": {**device, "partial": True}})
-    metal_or_cpu = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": None})
+    host_only = profile.row("hw", "bf16", "profiled, 12 pages", {"host_memory": host, "device_memory": None})
     footprint = {"peak_bytes": 4 * GIB, "steady_min_bytes": 3 * GIB, "steady_max_bytes": 3 * GIB}
     macos = profile.row("hw", "bf16", "profiled, 12 pages",
                         {"host_memory": host, "host_footprint": footprint, "device_memory": None})
@@ -1212,7 +1214,7 @@ def test_the_row_memory_cell_is_device_memory_else_physical_footprint_else_host_
                                  {"host_memory": host, "host_footprint": footprint, "device_memory": device})
     assert _cells(discrete)[5] == "device 3.0 / 2.5 GiB"
     assert _cells(partial)[5] == "device 3.0 / 2.5 GiB (partial)"
-    assert _cells(metal_or_cpu)[5] == "2.0 / 1.0 GiB"
+    assert _cells(host_only)[5] == "2.0 / 1.0 GiB"
     # macOS: the physical footprint (Metal allocations in, clean page cache out) wins over RSS...
     assert _cells(macos)[5] == "4.0 / 3.0 GiB"
     assert profile.host_memory_figure({"host_memory": host, "host_footprint": footprint}) == (
@@ -1371,6 +1373,217 @@ def test_prefill_all_ce_is_the_median_over_every_ce_line_the_warmups_included() 
     assert _cells(profile.row("hw", "bf16", "s", figures.values))[4] == "2.00 s"  # the row keeps the primary
 
 
+# --------------------------------------------------------------------------- #
+# --concurrency (KON-216)
+# --------------------------------------------------------------------------- #
+def test_concurrency_defaults_to_max_batch_size() -> None:
+    assert profile._resolve_concurrency(max_batch_size=4, concurrency=None) == 4
+    assert profile._resolve_concurrency(max_batch_size=4, concurrency=2) == 2
+
+
+def test_concurrency_below_one_is_refused() -> None:
+    with pytest.raises(SystemExit) as refused:
+        profile._resolve_concurrency(max_batch_size=4, concurrency=0)
+    assert str(refused.value) == "--concurrency 0 must be >= 1"
+
+
+def test_concurrency_above_max_batch_size_is_refused() -> None:
+    with pytest.raises(SystemExit) as refused:
+        profile._resolve_concurrency(max_batch_size=2, concurrency=3)
+    assert str(refused.value) == "--concurrency 3 exceeds --max-batch-size 2"
+
+
+def test_concurrency_out_of_range_is_refused_before_the_server_would_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(profile._Server, "start", _no_spawn)
+    out = tmp_path / "run"
+    with pytest.raises(SystemExit, match=r"--concurrency 0 must be >= 1"):
+        profile.run(_args(out, _free_port(), "--concurrency", "0"), max_exe="/nonexistent/max")
+    assert not out.exists()
+    with pytest.raises(SystemExit, match=r"--concurrency 2 exceeds --max-batch-size 1"):
+        profile.run(_args(out, _free_port(), "--concurrency", "2", "--max-batch-size", "1"), max_exe="/nonexistent/max")
+    assert not out.exists()
+
+
+def test_row_decode_cell_at_concurrency_one_is_byte_identical_to_before_concurrency_existed() -> None:
+    """The concurrency figure being present (at ``n`` 1) must not change the decode cell at all."""
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}}
+    before = profile.row("hw", "bf16", "profiled, 12 pages", figures)
+    assert before == "| hw | bf16 | profiled, 12 pages | **20.0 tok/s** (50.0 ms/step, n=39) | — | — | — |"
+    figures_with_concurrency = {**figures, "concurrency": {
+        "n": 1, "max_batch_size": 4, "tok_s": 999.0, "latency_median_s": 0.1, "by_batch_size": {},
+    }}
+    assert profile.row("hw", "bf16", "profiled, 12 pages", figures_with_concurrency) == before
+
+
+def test_row_decode_cell_above_concurrency_one_leads_with_the_aggregate_tok_s() -> None:
+    """Aggregate tok/s, then the FULL batch's step time -- not the median over every batch size."""
+    by_batch = {3: {"median_ms": 85.8, "n": 6}, 1: {"median_ms": 65.5, "n": 12}}
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}, "concurrency": {
+        "n": 3, "max_batch_size": 4, "tok_s": 55.5, "latency_median_s": 0.2, "by_batch_size": by_batch,
+    }}
+    cell = _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3]
+    assert cell == "**55.5 tok/s** (85.8 ms/step at 3 rows, n=6, concurrency 3)"
+    # Read back from profile.json the keys are strings; the same cell comes out.
+    figures["concurrency"]["by_batch_size"] = {str(k): v for k, v in by_batch.items()}
+    assert _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3] == cell
+
+
+def test_row_decode_cell_without_a_full_batch_figure_says_it_is_the_mixed_median() -> None:
+    figures = {"decode": {"tok_s": 20.0, "median_ms": 50.0, "n": 39}, "concurrency": {
+        "n": 3, "max_batch_size": 4, "tok_s": 55.5, "latency_median_s": 0.2, "by_batch_size": {},
+    }}
+    cell = _cells(profile.row("hw", "bf16", "profiled, 12 pages", figures))[3]
+    assert cell == "**55.5 tok/s** (50.0 ms/step over all batch sizes, n=39, concurrency 3)"
+
+
+def test_concurrency_figure_raises_when_no_page_completed() -> None:
+    with pytest.raises(ValueError):
+        profile._concurrency_figure({}, concurrency=2, max_batch_size=4, log="")
+
+
+def test_concurrency_figure_aggregate_tok_s_and_latency_median_over_synthetic_exchanges() -> None:
+    exchanges = {
+        "a": profile.Exchange(max_tokens=8192, t_start=0.0, t_end=1.0, completion_tokens=100),
+        "b": profile.Exchange(max_tokens=8192, t_start=0.5, t_end=2.0, completion_tokens=50),
+        "c": profile.Exchange(max_tokens=8192, t_start=1.0, t_end=1.5, completion_tokens=25),
+    }
+    figure = profile._concurrency_figure(exchanges, concurrency=3, max_batch_size=4, log="")
+    assert figure["n"] == 3
+    assert figure["max_batch_size"] == 4
+    # tokens 100+50+25=175 over the span from the first start (0.0) to the last end (2.0): 87.5 tok/s.
+    assert figure["tok_s"] == pytest.approx(87.5)
+    # wall_s per exchange: a=1.0, b=1.5, c=0.5 -> median 1.0.
+    assert figure["latency_median_s"] == pytest.approx(1.0)
+    assert figure["by_batch_size"] == {}
+
+
+def test_concurrent_sending_keeps_at_most_n_in_flight_all_12_pages_sent_warmup_first_and_alone(
+    stub: Stub, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``profile._stream_chat`` itself is stubbed here (a lock-guarded counter, a short sleep to
+    force overlap): the real HTTP path is exercised by every other test in this module, this one
+    only pins the concurrency mechanism and the warmup's ordering."""
+    concurrency = 3
+    _idle_gpu(monkeypatch, _FakeProbe)
+    png_to_page = {profile_corpus.page_png(page): page for page in PAGES}
+    lock = threading.Lock()
+    current = 0
+    max_concurrent = 0
+    calls: list[tuple[str, float, float]] = []  # (page, or "warmup", t_start, t_end)
+
+    def fake_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        nonlocal current, max_concurrent
+        label = "warmup" if max_tokens == profile.WARMUP_MAX_TOKENS else png_to_page[png]
+        t_start = time.monotonic()
+        with lock:
+            current += 1
+            max_concurrent = max(max_concurrent, current)
+        time.sleep(0.05)
+        with lock:
+            current -= 1
+        t_end = time.monotonic()
+        calls.append((label, t_start, t_end))
+        return profile.Exchange(max_tokens=max_tokens, t_start=t_start, t_end=t_end, t_first=t_start,
+                                completion_tokens=1, finish_reason="stop", text="x")
+
+    monkeypatch.setattr(profile, "_stream_chat", fake_stream_chat)
+    out = tmp_path / "run"
+    code = profile.run(
+        _args(out, _free_port(), "--max-batch-size", str(concurrency), "--concurrency", str(concurrency)),
+        max_exe=stub.exe,
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert _tree_gone(stub)
+
+    warmup_calls = [c for c in calls if c[0] == "warmup"]
+    page_calls = [c for c in calls if c[0] != "warmup"]
+    assert len(warmup_calls) == 1
+    assert sorted(label for label, _, _ in page_calls) == sorted(PAGES)  # every page sent, exactly once
+    _, _, warmup_end = warmup_calls[0]
+    assert all(t_start >= warmup_end for _, t_start, _ in page_calls)  # warmup finished before any page started
+    assert 2 <= max_concurrent <= concurrency  # genuine overlap happened, and never past the bound
+
+    # `_stream_chat` never touched the stub's HTTP endpoint, so its scheduler log (and therefore
+    # the "decode" figure the row's cell needs) is empty here; row() formatting at concurrency > 1
+    # is covered directly by test_row_decode_cell_above_concurrency_one_leads_with_the_aggregate_tok_s.
+    doc = json.loads((out / "profile.json").read_text())
+    concurrency_figure = doc["figures"]["concurrency"]
+    assert concurrency_figure["n"] == concurrency and concurrency_figure["max_batch_size"] == concurrency
+    assert concurrency_figure["tok_s"] > 0
+    assert concurrency_figure["by_batch_size"] == {}
+
+
+@pytest.mark.parametrize("concurrency", [1, 2])
+def test_interrupt_with_a_page_genuinely_in_flight_propagates_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, concurrency: int
+) -> None:
+    """Review round 1 (KON-216), blocker: a SIGINT arriving while a page request is genuinely in
+    flight must raise ``KeyboardInterrupt`` out of ``_send_pages`` at once, at concurrency 1 (the
+    sequential sender, no executor) and above 1 (the concurrent sender must not drain in-flight
+    futures on the way out). Before the fix this blocked for as long as the in-flight request took
+    to finish on its own -- up to ``REQUEST_TIMEOUT_S`` (3600 s) -- because a worker thread's
+    ``_stream_chat`` is never interrupted by a signal delivered to the main thread.
+    """
+    if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
+        pytest.skip("SIGINT does not raise KeyboardInterrupt in this test process")
+    release = threading.Event()
+
+    def blocked_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        release.wait(timeout=30.0)
+        raise profile.ExchangeFailed("test stub: never meant to complete")
+
+    monkeypatch.setattr(profile, "_stream_chat", blocked_stream_chat)
+    out = tmp_path / "run"
+    (out / "pages").mkdir(parents=True)
+    timer = threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            profile._send_pages(0, tmp_path / "serve.log", out, PAGES, concurrency)
+        assert time.monotonic() - started < 2.0
+    finally:
+        timer.cancel()
+        release.set()  # let whatever worker thread is still blocked finish, so none lingers
+
+
+def test_exchange_failed_mid_run_at_concurrency_above_one_still_records_in_flight_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 1 (KON-216), minor: one page failing while others are already in flight must
+    stop further submissions but still wait for, record and write the siblings already sent --
+    not abandon them."""
+    concurrency = 3
+    png_to_page = {profile_corpus.page_png(page): page for page in PAGES}
+    requested: list[str] = []
+    lock = threading.Lock()
+
+    def fake_stream_chat(port: int, png: bytes, max_tokens: int) -> profile.Exchange:
+        page = png_to_page[png]
+        with lock:
+            requested.append(page)
+        if page == PAGES[0]:
+            raise profile.ExchangeFailed("stub failure: server dropped the connection")
+        time.sleep(0.05)  # long enough that the failure above is always processed first
+        t = time.monotonic()
+        return profile.Exchange(max_tokens=max_tokens, t_start=t, t_end=t + 0.01, t_first=t,
+                                completion_tokens=1, finish_reason="stop", text="x")
+
+    monkeypatch.setattr(profile, "_stream_chat", fake_stream_chat)
+    out = tmp_path / "run"
+    (out / "pages").mkdir(parents=True)
+    exchanges, busy, void = profile._send_pages(0, out / "serve.log", out, PAGES, concurrency)
+
+    assert void == [f"request {PAGES[0]} failed: stub failure: server dropped the connection"]
+    # the two siblings already in flight alongside the failing page are still recorded ...
+    assert set(exchanges) == {PAGES[1], PAGES[2]}
+    # ... and nothing beyond the first `concurrency` pages was ever submitted
+    assert set(requested) == set(PAGES[:concurrency])
+
+
 def test_the_stop_message_is_said_while_signals_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[tuple[str, Any]] = []
     monkeypatch.setattr(profile, "_say", lambda message: events.append((message, signal.getsignal(signal.SIGINT))))
@@ -1463,14 +1676,22 @@ def test_each_teardown_check_reads_one_ps_snapshot(
 
     main_thread_walks: list[int] = []
     real_tree = profile_sampling.process_tree
+    real_stop = profile._Server.stop
+    tearing_down = threading.Event()
+
+    def watched_stop(self: Any) -> None:
+        tearing_down.set()  # the post-run GPU check walks the tree before this, once, for its own purpose
+        real_stop(self)
 
     def watched_tree(root: int) -> dict[int, int]:
-        if threading.current_thread() is threading.main_thread():  # the sampler thread keeps its own
+        # the sampler thread keeps its own
+        if tearing_down.is_set() and threading.current_thread() is threading.main_thread():
             main_thread_walks.append(root)
         return real_tree(root)
 
     monkeypatch.setattr(profile, "_ps_table", counted_table)
     monkeypatch.setattr(profile_sampling, "process_tree", watched_tree)
+    monkeypatch.setattr(profile._Server, "stop", watched_stop)
     per_check: dict[str, list[int]] = {}
     for name in ("_record_identities", "_group_alive", "_verified_alive", "leader_exited"):
         def counting(self: Any, *args: Any, _original: Any = getattr(profile._Server, name), _name: str = name) -> Any:

@@ -4,23 +4,18 @@ Staging checks run weightless: every ``Weight`` gets its FQN the way
 ``load_state_dict`` would assign it, no tensor data is resident, and the graph
 is only built (``str(graph)``), never compiled. That is enough to pin the
 declared names/dtypes/shapes against the adapter's stacking, to see both
-language graphs stage the Mojo ops, to count staged ops, and to hit the CPU
-refusal.
+language graphs stage the Mojo ops and to count staged ops.
 
 The numeric checks (marked ``slow``: they compile the Mojo kernels through an
 ``InferenceSession``) run a bare :class:`~unlimited_ocr_max.decoder.MoE` on
 synthetic weights. They run on CPU by default (``UOCR_TEST_DEVICE=gpu`` moves
-them to the accelerator): the kernels are device-agnostic and the CPU bf16
-decode path is bitwise the dense 64-term chain, so CPU exercises exactly the
-graph ops the served GPU path stages, minus the device. The int8-on-CPU refusal
-lives in the graph builders, which these checks bypass on purpose by opening
-their own ``Graph``.
+them to the accelerator): the kernels are device-agnostic and decode stages the
+same qmv ops on every device in both dtypes (KON-234), so CPU exercises exactly
+the decode graph ops the served GPU path stages, minus the device.
 """
 
 from __future__ import annotations
 
-import functools
-import os
 import re
 from collections import Counter
 from types import SimpleNamespace
@@ -29,18 +24,18 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
-from max.driver import CPU, Accelerator, Buffer
+from max.driver import CPU, Buffer
 from max.dtype import DType
-from max.engine import InferenceSession
 from max.graph import DeviceRef, Graph, TensorType
 
 from unlimited_ocr_max.decoder import MoE, UnlimitedOcrDecoder
-from unlimited_ocr_max.graphs import build_decode_graph, build_language_graph, check_int8_device
+from unlimited_ocr_max.graphs import DecodeGraph, LanguageGraph, build_decode_graph, build_language_graph
 from unlimited_ocr_max.model_config import INT8_GROUP_SIZE, ConfigError, DecoderConfig, UnlimitedOCRConfig
 from unlimited_ocr_max.ngram import MOJO_KERNELS
 from unlimited_ocr_max.weight_adapters import check_against_declared, stack_expert_weights
 
-GPU = os.environ.get("UOCR_TEST_DEVICE", "cpu").strip().lower() == "gpu"
+from _harness import device_ref, driver, rel_err, session
+
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 # --------------------------------------------------------------------------
@@ -127,7 +122,7 @@ def _experts(config: UnlimitedOCRConfig, layer: int, *, device: DeviceRef) -> di
 # op census
 # --------------------------------------------------------------------------
 
-#: One MLIR result line; the pinned release emits the generic quoted form ``%1 = "rmo.add"(...)``.
+#: One MLIR result line; the pinned build emits the generic quoted form ``%1 = "rmo.add"(...)``.
 _OP_LINE = re.compile(r'^\s*(?:%\S+\s*=\s*)?"?((?:r?mo)\.[a-zA-Z_.0-9]+)"?')
 
 #: Declarations, not kernels: a weight is one ``mo.constant.external``, a graph constant one ``mo.constant``.
@@ -147,14 +142,179 @@ def _staged(counts: Counter[str]) -> int:
     return sum(n for kind, n in counts.items() if kind not in _DECLARATIONS)
 
 
-def _decode_graph_text(config: UnlimitedOCRConfig, device: DeviceRef) -> str:
-    decoder = _named(UnlimitedOcrDecoder(config.decoder, dtype=config.dtype, device=device))
-    return str(build_decode_graph(config, decoder, max_seq_len=64, device=device).graph)
+def _language_graph(
+    config: UnlimitedOCRConfig,
+    device: DeviceRef,
+    *,
+    decode: bool,
+    batch: int = 1,
+    resident: bool = False,
+    served: bool = False,
+) -> DecodeGraph | LanguageGraph:
+    """A weightless language graph, staged: the decode step at ``batch`` rows (``max_seq_len=64``) or the prefill
+    (``seq_len=5``, two image rows).
+
+    ``resident`` declares every weight device-side; ``served`` is the shipped
+    accelerator declaration -- resident, with the norms and the router fp32.
+    """
+    decoder = _named(
+        UnlimitedOcrDecoder(
+            config.decoder, dtype=config.dtype, device=device, norm_router_dtype=DType.float32 if served else None
+        )
+    )
+    resident = resident or served
+    if decode:
+        return build_decode_graph(
+            config, decoder, batch=batch, max_seq_len=64, device=device, device_resident_weights=resident
+        )
+    return build_language_graph(
+        config, decoder, seq_len=5, n_image_tokens=2, device=device, device_resident_weights=resident
+    )
 
 
-def _prefill_graph_text(config: UnlimitedOCRConfig, device: DeviceRef, *, seq_len: int = 5) -> str:
-    decoder = _named(UnlimitedOcrDecoder(config.decoder, dtype=config.dtype, device=device))
-    return str(build_language_graph(config, decoder, seq_len=seq_len, n_image_tokens=2, device=device).graph)
+def _dense_qmv_calls(dec: DecoderConfig, *, decode: bool) -> int:
+    """``dense_bf16_qmv`` calls a language graph stages (KON-238).
+
+    Decode reads every projection through it -- per layer q/k/v/o and the
+    three FFN projections, dense or shared -- and ``lm_head``; prefill only
+    ``lm_head`` on its last row.
+    """
+    return 7 * dec.num_hidden_layers + 1 if decode else 1
+
+
+# --------------------------------------------------------------------------
+# fold-proofing: does an op's operand trace back only to constants/weights?
+# --------------------------------------------------------------------------
+
+#: A result-binding line: one or more comma-separated SSA names, then its defining expression.
+_SSA_ASSIGN = re.compile(r"^\s*(%[\w]+(?:,\s*%[\w]+)*)\s*=\s*(.*)$")
+#: The op mnemonic at the very start of a right-hand side, quoted or bare.
+_SSA_OP = re.compile(r'^"?([A-Za-z_][\w.]*)"?')
+
+
+def _top_level_boundary(rhs: str) -> int | None:
+    """Index of the top-level ``:`` that opens the type signature, or ``None`` if there isn't one.
+
+    Tracks nesting depth over ``(){}[]<>`` so a colon inside an attribute
+    (``{axis = -1 : si64}``, ``{value = ... : tensor<1xsi32>}``) is never
+    mistaken for the boundary -- only a ``:`` at depth 0 is. ``->`` is
+    special-cased and skipped whole: it is two literal characters, not a
+    closing ``>``, and a generic attribute can contain one well before the
+    real boundary (``rmo.mo.arg_nonzero<() -> image_embedding_elements>(%result) : ...``).
+    A line with no type signature at all (``mo.chain.create()``) has no
+    top-level colon, so this returns ``None`` and the whole right-hand side
+    is operand territory.
+    """
+    depth = 0
+    i, n = 0, len(rhs)
+    while i < n:
+        ch = rhs[i]
+        if ch == "-" and i + 1 < n and rhs[i + 1] == ">":
+            i += 2
+            continue
+        if ch in "({[<":
+            depth += 1
+        elif ch in ")}]>":
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            return i
+        i += 1
+    return None
+
+
+def _rhs_op_and_operands(rhs: str, line: str) -> tuple[str, list[str]]:
+    """``(op mnemonic, operand names)`` for one assignment's right-hand side, parsed generally.
+
+    Every ``%name`` token before the top-level type-signature boundary
+    (:func:`_top_level_boundary`) is an operand: plain
+    (``rmo.select(%187, %189, %190)``), bracketed
+    (``rmo.mo.transfer[%44] %51``), or alongside an attribute dict that
+    carries its own operand-free text on either side of it
+    (``mo.custom {...}(%23, %20, %201)``, ``rmo.top_k(%183) {axis = ...}``).
+    This never assumes a particular ``%N`` or a fixed operand position, so
+    it survives SSA renumbering and a new mix of attribute/operand order.
+
+    Raises if no op mnemonic can be found at all. A line this cannot
+    classify must fail loudly, not silently omit a ``defs`` entry --
+    :func:`_is_weight_only` would then treat its result as a genuine graph
+    input (always safe to call "not weight-only"), which is only correct
+    for an actual ``%argN`` block argument.
+    """
+    boundary = _top_level_boundary(rhs)
+    before = rhs if boundary is None else rhs[:boundary]
+    op_match = _SSA_OP.match(before.strip())
+    if not op_match:
+        raise AssertionError(f"cannot classify the defining op of an SSA assignment -- unrecognised MLIR line: {line!r}")
+    return op_match.group(1), re.findall(r"%[\w]+", before)
+
+
+def _parse_ssa_defs(text: str) -> dict[str, tuple[str, list[str]]]:
+    """Every SSA result name in the staged MLIR -> ``(op mnemonic, operand names)``.
+
+    Every assignment line is parsed (:func:`_rhs_op_and_operands` raises
+    rather than skipping one it cannot classify), so a name with no entry is
+    only ever an ``%argN`` block argument -- one of the graph's own inputs,
+    never produced by an assignment line -- which :func:`_is_weight_only`
+    must treat as genuinely runtime.
+    """
+    defs: dict[str, tuple[str, list[str]]] = {}
+    for line in text.splitlines():
+        assign = _SSA_ASSIGN.match(line)
+        if not assign:
+            continue
+        op, operands = _rhs_op_and_operands(assign.group(2), line)
+        for name in (result.strip() for result in assign.group(1).split(",")):
+            defs[name] = (op, operands)
+    return defs
+
+
+def _is_weight_only(name: str, defs: dict[str, tuple[str, list[str]]], memo: dict[str, bool]) -> bool:
+    """True if ``name``'s whole transitive dependency chain bottoms out in declarations only.
+
+    Only ``mo.constant``/``mo.constant.external`` (a graph constant or a
+    declared weight) are weight-only leaves; a block argument with no def
+    line (a real graph input) never is. A zero-operand op that is *not* a
+    declaration -- e.g. ``mo.chain.create()``, a synchronization token
+    carrying no tensor data at all -- is deliberately *not* weight-only
+    either: it has nothing a weight-only expression could be folded into,
+    so counting it as a leaf would risk calling a chain-gated expression
+    "weight-only" when MAX never would. Anything else is weight-only
+    exactly when every one of its operands is -- MAX's own "weight-only
+    expression" criterion for the load-time constant fold (module
+    docstring, KON-142 / OQ-158-A), not an approximation of it: a call is
+    folded at ``session.load`` iff every one of its transitive inputs is a
+    declaration.
+    """
+    if name in memo:
+        return memo[name]
+    memo[name] = False  # cycle guard; the staged graph is a DAG, so this is never actually read back
+    entry = defs.get(name)
+    if entry is None:
+        result = False  # a graph input (%argN): never declared by an assignment line
+    else:
+        op, operands = entry
+        if op in _DECLARATIONS:
+            result = True
+        elif not operands:
+            result = False  # a zero-operand non-declaration op (e.g. a chain token): not weight data either
+        else:
+            result = all(_is_weight_only(operand, defs, memo) for operand in operands)
+    memo[name] = result
+    return result
+
+
+def _custom_op_calls(text: str, symbol: str) -> list[tuple[str, list[str]]]:
+    """``(result name, operand names)`` for every ``mo.custom`` call naming ``symbol``."""
+    calls: list[tuple[str, list[str]]] = []
+    for line in text.splitlines():
+        if f'symbol = "{symbol}"' not in line:
+            continue
+        assign = _SSA_ASSIGN.match(line)
+        if not assign:
+            continue
+        _, operands = _rhs_op_and_operands(assign.group(2), line)
+        calls.append((assign.group(1).split(",")[0].strip(), operands))
+    return calls
 
 
 # --------------------------------------------------------------------------
@@ -227,12 +387,15 @@ def test_both_language_graphs_build_in_int8_mode() -> None:
     dec = config.decoder
     n_moe = dec.num_hidden_layers - dec.first_k_dense_replace
 
-    decode = _op_counts(_decode_graph_text(config, dref))
-    assert decode["mo.custom"] == 3 * n_moe  # gate, up, down qmv per MoE layer
-    prefill = _op_counts(_prefill_graph_text(config, dref))
-    assert prefill["mo.custom"] == 3 * dec.n_routed_experts * n_moe  # one dequant per expert per projection
+    decode = _op_counts(str(_language_graph(config, dref, decode=True).graph))
+    # gate, up, down qmv per MoE layer, the n-gram guard, MAX's paged k/v stores and attention per layer,
+    # and the dense projections
+    assert decode["mo.custom"] == 3 * n_moe + 1 + 3 * dec.num_hidden_layers + _dense_qmv_calls(dec, decode=True)
+    prefill = _op_counts(str(_language_graph(config, dref, decode=False).graph))
+    # one dequant per expert per projection, and lm_head's last row
+    assert prefill["mo.custom"] == 3 * dec.n_routed_experts * n_moe + _dense_qmv_calls(dec, decode=False)
 
-    for text in (_decode_graph_text(config, dref), _prefill_graph_text(config, dref)):
+    for text in (str(_language_graph(config, dref, decode=decode).graph) for decode in (True, False)):
         assert "moe_int8_qmv" in text or "int8_dequant_expert" in text
         assert "mo.grouped.matmul.ragged" not in text and "mo.moe.create.indices" not in text
         assert "layers.1.mlp.experts.gate_proj_scales" in text
@@ -251,12 +414,13 @@ def test_both_language_graphs_build_in_int8_mode_with_device_resident_weights() 
     dec = config.decoder
     n_moe = dec.num_hidden_layers - dec.first_k_dense_replace
 
-    for build, kwargs, want_custom in (
-        (build_decode_graph, {"max_seq_len": 64}, 3 * n_moe),
-        (build_language_graph, {"seq_len": 5, "n_image_tokens": 2}, 3 * dec.n_routed_experts * n_moe),
+    for decode, want_custom in (
+        # + the n-gram guard (KON-235), the paged stores and attention, three per layer (KON-237),
+        # and the dense projections (KON-238)
+        (True, 3 * n_moe + 1 + 3 * dec.num_hidden_layers + _dense_qmv_calls(dec, decode=True)),
+        (False, 3 * dec.n_routed_experts * n_moe + _dense_qmv_calls(dec, decode=False)),
     ):
-        decoder = _named(UnlimitedOcrDecoder(dec, dtype=config.dtype, device=dref))
-        text = str(build(config, decoder, device=dref, device_resident_weights=True, **kwargs).graph)
+        text = str(_language_graph(config, dref, decode=decode, resident=True).graph)
         counts = _op_counts(text)
         assert counts["mo.custom"] == want_custom
         assert "moe_int8_qmv" in text or "int8_dequant_expert" in text
@@ -264,19 +428,103 @@ def test_both_language_graphs_build_in_int8_mode_with_device_resident_weights() 
         assert "layers.1.mlp.experts.gate_proj_scales" in text
 
 
-def test_int8_on_cpu_is_refused_at_graph_construction() -> None:
-    config = _config(int8=True)
-    cpu = DeviceRef.CPU()
-    # The decoder itself constructs on CPU: the adapter builds one to check the checkpoint's names.
-    decoder = _named(UnlimitedOcrDecoder(config.decoder, dtype=config.dtype, device=cpu))
-    with pytest.raises(ValueError, match="GPU-only"):
-        build_decode_graph(config, decoder, max_seq_len=64, device=cpu)
-    with pytest.raises(ValueError, match="GPU-only"):
-        build_language_graph(config, decoder, seq_len=5, n_image_tokens=2, device=cpu)
-    with pytest.raises(ValueError, match="GPU-only"):
-        check_int8_device(config.decoder, cpu)
-    check_int8_device(config.decoder, DeviceRef.GPU(0))
-    check_int8_device(_config(int8=False).decoder, cpu)
+# --------------------------------------------------------------------------
+# OQ-158-A / 82ab60f: the prefill dequant index must stay load-unfoldable
+# --------------------------------------------------------------------------
+
+
+def test_int8_prefill_dequant_expert_index_is_not_load_foldable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins the property that ended OQ-158-A, at the staged-graph level, model-free.
+
+    Before 82ab60f, ``StackedExperts.expert``'s int8 index was a bare
+    ``ops.constant``: every transitive input of each ``int8_dequant_expert``
+    call was a declaration (a graph constant or an external weight), so MAX
+    treated the whole call as a weight-only expression, ran it at
+    ``session.load``, and folded the fp32 upcast into device constants
+    (9.02 GiB for the routed experts, EXPERIMENTS.md ID 27). Serving the
+    shared device weight registry for that checkpoint then produced 0/12
+    correct pages in both request orders while every in-process test --
+    including the numeric ones in this file -- stayed bitwise clean: the
+    fold is a load-time, registry-adjacent effect that a value comparison
+    inside one process never exercises. 82ab60f added ``MoE._runtime_zero``:
+    the index is now ``runtime_zero + constant``, where ``runtime_zero`` is
+    derived from the router's top-k output, so the call keeps a genuine
+    graph-input ancestor and MAX cannot fold it.
+
+    Neither an op *count* nor the existing bitwise-equality check
+    (``test_int8_prefill_with_a_runtime_expert_index_computes_the_same_bits``,
+    below) pins this: a load-time fold leaves the op count and the computed
+    values exactly as they were (same kernel, same stacks, same numbers) --
+    whether MAX can evaluate the index once, outside the per-request graph,
+    is a question about the staged MLIR's dependency shape, not about any
+    value it produces. So this walks the SSA def-use chain of every
+    ``int8_dequant_expert`` call's expert-index operand (parsing is
+    SSA-renumbering-proof: every assignment line is classified generally, by
+    finding its top-level type-signature boundary and regexing ``%name``
+    tokens out of everything before it, never a hard-coded ``%N`` or a fixed
+    operand position) and asserts it is not "weight-only" -- MAX's own
+    criterion for the fold (module docstring, KON-142) -- built with
+    ``device_resident_weights=True``, the registry declaration that made the
+    corruption reachable in the first place.
+    """
+    config = _config(int8=True, num_hidden_layers=3)  # layer 0 dense, layers 1-2 MoE
+    dref = DeviceRef.GPU(0)
+    dec = config.decoder
+    n_moe = dec.num_hidden_layers - dec.first_k_dense_replace
+
+    def _device_resident_prefill_text() -> str:
+        return str(_language_graph(config, dref, decode=False, resident=True).graph)
+
+    text = _device_resident_prefill_text()
+    calls = _custom_op_calls(text, "int8_dequant_expert")
+    assert len(calls) == 3 * dec.n_routed_experts * n_moe  # one dequant per expert per projection per MoE layer
+
+    defs = _parse_ssa_defs(text)
+    memo: dict[str, bool] = {}
+    foldable = [result for result, operands in calls if _is_weight_only(operands[2], defs, memo)]
+    assert not foldable, (
+        f"{len(foldable)}/{len(calls)} int8_dequant_expert calls have a load-foldable expert-index "
+        f"operand (every transitive input is mo.constant/mo.constant.external): {foldable[:5]} -- "
+        "see 82ab60f / OQ-158-A"
+    )
+
+    # The detector has teeth: simulating the pre-82ab60f shape (a bare constant index, no runtime
+    # zero) on the identical builder must flip every one of these calls back to foldable.
+    monkeypatch.setattr(MoE, "_runtime_zero", lambda self, indices: None)
+    pre_fix_text = _device_resident_prefill_text()
+    pre_fix_calls = _custom_op_calls(pre_fix_text, "int8_dequant_expert")
+    assert len(pre_fix_calls) == len(calls)
+    pre_fix_defs = _parse_ssa_defs(pre_fix_text)
+    pre_fix_memo: dict[str, bool] = {}
+    assert all(_is_weight_only(operands[2], pre_fix_defs, pre_fix_memo) for _, operands in pre_fix_calls)
+
+
+def test_int8_decode_graph_has_no_dequant_call_and_moe_int8_qmv_stays_runtime() -> None:
+    """``build_decode_graph``'s int8 path (batch 1 here) never stages ``int8_dequant_expert``.
+
+    The decode graph's MoE (:meth:`MoE.decode_rows`) takes ``_routed_qmv``, which calls
+    ``moe_int8_qmv`` directly against the whole int8 stacks with the top-k
+    expert ids from this step's own gate -- never a constant -- so there is
+    no load-foldable index here for 82ab60f to have had to guard, and
+    nothing for this test to pin that the fix commit changed. It pins both
+    halves of that claim instead of assuming them: no ``int8_dequant_expert``
+    call appears in the decode graph at all, and the ``moe_int8_qmv`` calls
+    that do appear carry an expert-ids operand that is not weight-only
+    either (the same SSA trace as the prefill test above), so a future
+    change that routed decode through a constant expert id would be caught
+    here too.
+    """
+    config = _config(int8=True, num_hidden_layers=3)  # layer 0 dense, layers 1-2 MoE
+    dref = DeviceRef.GPU(0)
+    text = str(_language_graph(config, dref, decode=True, resident=True).graph)
+    assert "int8_dequant_expert" not in text
+
+    calls = _custom_op_calls(text, "moe_int8_qmv")
+    assert calls
+    defs = _parse_ssa_defs(text)
+    memo: dict[str, bool] = {}
+    foldable = [result for result, operands in calls if _is_weight_only(operands[1], defs, memo)]
+    assert not foldable, f"{len(foldable)}/{len(calls)} moe_int8_qmv calls have a weight-only expert-ids operand"
 
 
 def test_model_detects_int8_from_the_expert_dtypes_only() -> None:
@@ -307,49 +555,69 @@ def test_model_detects_int8_from_the_expert_dtypes_only() -> None:
 
 
 # --------------------------------------------------------------------------
-# op census: staged ops per decode MoE layer, int8 vs bf16 (accelerator graphs)
+# op census and routing: decode MoE layers in both dtypes, and bf16 prefill
 # --------------------------------------------------------------------------
 
 
-def test_decode_op_census_per_moe_layer_is_level_with_bf16() -> None:
-    """Per MoE layer, int8 decode stages within 5% of bf16's ops (the served step is host-encode-bound).
+def test_decode_op_census_per_moe_layer_is_one_qmv_path_in_both_dtypes() -> None:
+    """Per MoE layer, bf16 decode stages exactly int8's ops but for the scale declarations (KON-234).
 
     The per-layer figure is the difference between a 3-layer and a 2-layer
-    decoder (layer 0 is dense in both), so everything outside the MoE layer
-    cancels exactly.
+    decoder (layer 0 is dense in both), so everything outside the added layer
+    cancels exactly; its attention is the same paged ops in both dtypes
+    (KON-237). Both dtypes run :meth:`MoE._routed_qmv`: three kernel
+    calls and the mixing matmul, no index op, no permute/restore gathers.
+    The only kind whose count differs is ``mo.constant.external``: int8
+    declares a scales stack next to each of its three weight stacks. Before
+    KON-234 bf16 staged MAX's native routing here on an accelerator (83 staged
+    ops per layer against int8's 79) and the hand-rolled top-6 chain on CPU
+    (196).
     """
     dref = DeviceRef.GPU(0)
     per_layer: dict[str, dict[str, int]] = {}
     for mode, int8 in (("bf16", False), ("int8", True)):
-        two, three = (_op_counts(_decode_graph_text(_config(int8=int8, num_hidden_layers=n), dref)) for n in (2, 3))
-        per_layer[mode] = {"all": sum(three.values()) - sum(two.values()), "staged": _staged(three) - _staged(two)}
-        print(f"[uocr] decode ops per MoE layer, {mode}: {per_layer[mode]}")
-    for key in ("all", "staged"):
-        bf16, int8 = per_layer["bf16"][key], per_layer["int8"][key]
-        assert bf16 > 0
-        assert abs(int8 - bf16) <= 0.05 * bf16, f"{key}: int8 {int8} vs bf16 {bf16}"
-    # The int8 layer is three kernel calls and no permute/restore gathers.
-    assert per_layer["int8"]["staged"] <= per_layer["bf16"]["staged"]
+        two, three = (
+            _op_counts(str(_language_graph(_config(int8=int8, num_hidden_layers=n), dref, decode=True).graph)) for n in (2, 3)
+        )
+        per_layer[mode] = {kind: three[kind] - two[kind] for kind in three if three[kind] != two[kind]}
+        print(f"[uocr] decode ops per MoE layer, {mode}: all {sum(per_layer[mode].values())}, staged {_staged(Counter(per_layer[mode]))}")
+    bf16, int8 = per_layer["bf16"], per_layer["int8"]
+    moved = {kind: (bf16.get(kind, 0), int8.get(kind, 0)) for kind in bf16.keys() | int8.keys() if bf16.get(kind, 0) != int8.get(kind, 0)}
+    assert moved == {"mo.constant.external": (bf16["mo.constant.external"], bf16["mo.constant.external"] + 3)}
+    # the three qmv calls, the layer's two paged stores and one paged attention, and its seven
+    # dense_bf16_qmv projections (q/k/v/o and the shared experts' three, KON-238)
+    assert bf16["mo.custom"] == 3 + 3 + 7
+    assert _staged(Counter(bf16)) == _staged(Counter(int8)) > 0
+
+
+@pytest.mark.parametrize(("device", "resident"), [("cpu", False), ("gpu", False), ("gpu", True)], ids=["cpu", "gpu-plain", "gpu-resident"])
+def test_bf16_prefill_keeps_its_routing_and_reads_only_lm_head_through_a_kernel(device: str, resident: bool) -> None:
+    """KON-234 moved bf16 decode only: the bf16 prefill graph's experts stage no Mojo op.
+
+    On an accelerator its routed experts are still MAX's native kernels (one
+    ``moe_create_indices`` and three ``grouped_matmul_ragged`` per MoE layer),
+    on CPU the dense 64-term chain. Its one Mojo op is ``dense_bf16_qmv`` on
+    ``lm_head``'s last row (KON-238), so it names the kernel package.
+    """
+    config = _config(int8=False, num_hidden_layers=3)  # layer 0 dense, layers 1-2 MoE
+    dec = config.decoder
+    n_moe = dec.num_hidden_layers - dec.first_k_dense_replace
+    dref = DeviceRef.CPU() if device == "cpu" else DeviceRef.GPU(0)
+    text = str(_language_graph(config, dref, decode=False, resident=resident).graph)
+    assert "_kernel_library_paths = []" not in text
+    assert "moe_bf16_qmv" not in text and "moe_int8_qmv" not in text and "int8_dequant_expert" not in text
+    assert text.count('symbol = "dense_bf16_qmv"') == _dense_qmv_calls(dec, decode=False)
+    if device == "cpu":
+        assert _op_counts(text)["mo.custom"] == _dense_qmv_calls(dec, decode=False)
+    else:
+        assert text.count('symbol = "mo.moe.create.indices"') == n_moe
+        assert text.count('symbol = "mo.grouped.matmul.ragged"') == 3 * n_moe
+        assert _op_counts(text)["mo.custom"] == 4 * n_moe + _dense_qmv_calls(dec, decode=False)
 
 
 # --------------------------------------------------------------------------
 # numeric: a bare MoE layer, int8 decode vs bf16 (slow: compiles the kernels)
 # --------------------------------------------------------------------------
-
-
-@functools.cache
-def _driver():
-    return Accelerator() if GPU else CPU()
-
-
-@functools.cache
-def _device_ref() -> DeviceRef:
-    return DeviceRef.GPU() if GPU else DeviceRef.CPU()
-
-
-@functools.cache
-def _session() -> InferenceSession:
-    return InferenceSession(devices=[_driver()])
 
 
 def _bf16(array: np.ndarray) -> torch.Tensor:
@@ -395,20 +663,34 @@ def _moe_weights(config: DecoderConfig, seed: int) -> tuple[dict[str, Any], dict
     return original, int8, dequantized
 
 
-def _moe_model(config: DecoderConfig, weights: dict[str, Any], *, seq: int, tag: str):
-    dref = _device_ref()
+def _as_declared(weights: dict[str, Any]) -> dict[str, Any]:
+    """A bare ``MoE``'s checkpoint-form state dict as the module declares it: the shared experts'
+    projections K-blocked, ``[K / KBLOCK, N, KBLOCK]`` (the router and the stacks as they are)."""
+    from unlimited_ocr_max.decoder import KBLOCK
+
+    return {
+        name: w.reshape(w.shape[0], -1, KBLOCK).permute(1, 0, 2).contiguous() if name.startswith("shared_experts.") else w
+        for name, w in weights.items()
+    }
+
+
+def _moe_model(config: DecoderConfig, weights: dict[str, Any], *, seq: int, tag: str, decode_rows: bool = False):
+    """A bare ``MoE`` over ``[seq, hidden]``: the decode step's (``decode_rows``) at one row or with ``decode_rows``, else its prefill call."""
+    dref = device_ref()
     moe = MoE(config, dtype=DType.bfloat16, device=dref)
-    moe.load_state_dict(weights)
-    extensions = {"custom_extensions": [MOJO_KERNELS]} if config.int8_experts else {}
+    moe.load_state_dict(_as_declared(weights))
     with Graph(
-        f"test_moe_{tag}_{seq}", input_types=[TensorType(DType.float32, [seq, config.hidden_size], device=dref)], **extensions
+        f"test_moe_{tag}_{seq}",
+        input_types=[TensorType(DType.float32, [seq, config.hidden_size], device=dref)],
+        custom_extensions=[MOJO_KERNELS],  # decode runs a qmv kernel in both dtypes; int8 prefill dequantizes
     ) as graph:
-        graph.output(moe(graph.inputs[0].tensor))
-    return _session().load(graph, weights_registry=moe.state_dict())
+        x = graph.inputs[0].tensor
+        graph.output(moe.decode_rows(x) if decode_rows or seq == 1 else moe(x))
+    return session().load(graph, weights_registry=moe.state_dict())
 
 
 def _run(model, x: np.ndarray) -> np.ndarray:
-    return model.execute(Buffer.from_numpy(np.ascontiguousarray(x)).to(_driver()))[0].to(CPU()).to_numpy()
+    return model.execute(Buffer.from_numpy(np.ascontiguousarray(x)).to(driver()))[0].to(CPU()).to_numpy()
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -424,23 +706,35 @@ def _decode_reference_fp64(config: DecoderConfig, int8: dict[str, Any], x: np.nd
     graph fed the dequantized weights is *not* the tight reference (its weights
     carry ~2^-9 relative rounding noise each).
     """
+    def dequantized(proj: str) -> np.ndarray:
+        q, scales = _f64(int8[f"experts.{proj}"]), _f64(int8[f"experts.{proj}_scales"])
+        return q * np.repeat(scales, INT8_GROUP_SIZE, axis=2)
+
+    return _moe_reference_fp64(config, int8, x, [dequantized(proj) for proj in PROJECTIONS])
+
+
+def _f64(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.float().numpy().astype(np.float64)
+
+
+def _moe_reference_fp64(config: DecoderConfig, weights: dict[str, Any], x: np.ndarray, stacks: list[np.ndarray]) -> np.ndarray:
+    """One token's MoE layer in float64: softmax gate, top-k, the given ``[E, N, K]`` gate/up/down stacks, shared experts."""
     xf = x.astype(np.float64)[0]
-    f64 = lambda t: t.float().numpy().astype(np.float64)  # noqa: E731
     silu = lambda a: a / (1.0 + np.exp(-a))  # noqa: E731
-    logits = f64(int8["gate.gate_score.weight"]) @ xf
+    logits = _f64(weights["gate.gate_score.weight"]) @ xf
     probs = np.exp(logits - logits.max())
     probs /= probs.sum()
     top = np.argsort(-probs, kind="stable")[: config.num_experts_per_tok]
-
-    def dequantized(proj: str) -> np.ndarray:
-        q, scales = f64(int8[f"experts.{proj}"]), f64(int8[f"experts.{proj}_scales"])
-        return q * np.repeat(scales, INT8_GROUP_SIZE, axis=2)
-
-    gate, up, down = (dequantized(proj) for proj in PROJECTIONS)
+    gate, up, down = stacks
     routed = sum(probs[e] * (down[e] @ (silu(gate[e] @ xf) * (up[e] @ xf))) for e in top)
-    shared_gate, shared_up, shared_down = (f64(int8[f"shared_experts.{proj}.weight"]) for proj in PROJECTIONS)
+    shared_gate, shared_up, shared_down = (_f64(weights[f"shared_experts.{proj}.weight"]) for proj in PROJECTIONS)
     shared = shared_down @ (silu(shared_gate @ xf) * (shared_up @ xf))
     return (routed + shared)[None, :]
+
+
+def _bf16_decode_reference_fp64(config: DecoderConfig, original: dict[str, Any], x: np.ndarray) -> np.ndarray:
+    """The bf16 MoE layer's exact math in float64: the bf16 stacks' values, exactly, for every expert."""
+    return _moe_reference_fp64(config, original, x, [_f64(original[f"experts.{proj}"]) for proj in PROJECTIONS])
 
 
 @pytest.mark.slow
@@ -476,6 +770,44 @@ def test_int8_decode_moe_matches_bf16_per_layer(layer: int) -> None:
 
 
 @pytest.mark.slow
+def test_int8_multi_row_qmv_matches_the_exact_math_and_the_dense_chain() -> None:
+    """``MoE.decode_rows`` on 8 rows (``moe_int8_qmv`` over 48 (token, expert) rows) vs the dense chain on the same rows.
+
+    The two are different arithmetic, not just a different order: the dense
+    chain multiplies by the bf16-rounded ``int8_dequant_expert`` weights and
+    sums every expert (zero-weighted ones included) in ascending id, while
+    qmv uses the exact fp32 ``q * scale`` over the top-6 alone. So the tight
+    bar is each row against the float64 evaluation of the exact int8 math
+    (:func:`_decode_reference_fp64`, the batch-1 test's bars), and the dense
+    chain only has to agree to the bf16 weight rounding. Each row must also
+    match the one-row decode MoE (``_routed_qmv`` at ``seq == 1``) to fp32
+    rounding: same kernel, but a different mixing and gate matmul shape.
+    """
+    int8_cfg = _small_decoder_config(int8=True)
+    _, int8, _ = _moe_weights(_small_decoder_config(int8=False), seed=19)
+    x = np.random.default_rng(23).standard_normal((8, int8_cfg.hidden_size)).astype(np.float32)
+
+    rows = _run(_moe_model(int8_cfg, int8, seq=8, tag="int8_rows", decode_rows=True), x)
+    dense = _run(_moe_model(int8_cfg, int8, seq=8, tag="int8_dense"), x)
+    one_row = _moe_model(int8_cfg, int8, seq=1, tag="int8_one_row")
+    single = np.concatenate([_run(one_row, x[i : i + 1]) for i in range(x.shape[0])])
+    exact = np.concatenate([_decode_reference_fp64(int8_cfg, int8, x[i : i + 1]) for i in range(x.shape[0])])
+
+    rel_exact, rel_dense, rel_single = rel_err(rows, exact), rel_err(rows, dense), rel_err(rows, single)
+    cos_exact = min(_cosine(rows[i], exact[i]) for i in range(x.shape[0]))
+    cos_dense = min(_cosine(rows[i], dense[i]) for i in range(x.shape[0]))
+    print(
+        f"[uocr] int8 multi-row qmv (8 rows): vs exact int8 math rel {rel_exact:.2e} (min cos {cos_exact:.9f}); "
+        f"vs dense chain rel {rel_dense:.2e} (min cos {cos_dense:.9f}, dense vs exact rel {rel_err(dense, exact):.2e}); "
+        f"vs one-row qmv rel {rel_single:.2e}, bitwise {bool(np.array_equal(rows, single))}"
+    )
+    assert np.all(np.isfinite(rows))
+    assert cos_exact >= 0.99999 and rel_exact <= 1e-4
+    assert cos_dense >= 0.9999 and rel_dense <= 1e-2
+    assert rel_single <= 1e-5
+
+
+@pytest.mark.slow
 def test_int8_prefill_moe_matches_bf16_on_dequantized_weights() -> None:
     """seq > 1: ``int8_dequant_expert`` feeds the 64-term chain the same bf16 weights the bf16 path slices.
 
@@ -496,3 +828,98 @@ def test_int8_prefill_moe_matches_bf16_on_dequantized_weights() -> None:
     print(f"[uocr] int8 prefill MoE: bitwise vs dequantized bf16 {bitwise}, min row cosine vs bf16 {cos:.6f}")
     np.testing.assert_allclose(got, ref_deq, rtol=1e-5, atol=1e-6)
     assert cos >= 0.999
+
+
+@pytest.mark.slow
+def test_int8_prefill_with_a_runtime_expert_index_computes_the_same_bits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fold-proof prefill (the dequant index derived from the router) is bitwise the constant-index build.
+
+    With only constants for inputs ``int8_dequant_expert`` is folded at load into
+    an fp32 copy of every expert (ID 27); the runtime zero keeps it a
+    prefill-time op. Same kernel, same int8 stacks, same index values, same
+    64-term chain after it -- so the output must not move a bit.
+    """
+    from unlimited_ocr_max.decoder import MoE
+
+    int8_cfg = _small_decoder_config(int8=True)
+    _, int8, _ = _moe_weights(_small_decoder_config(int8=False), seed=13)
+    x = np.random.default_rng(17).standard_normal((4, int8_cfg.hidden_size)).astype(np.float32)
+
+    runtime = _run(_moe_model(int8_cfg, int8, seq=4, tag="int8_prefill_runtime_idx"), x)
+    monkeypatch.setattr(MoE, "_runtime_zero", lambda self, indices: None)  # the pre-fix, constant-index build
+    constant = _run(_moe_model(int8_cfg, int8, seq=4, tag="int8_prefill_const_idx"), x)
+    assert np.all(np.isfinite(runtime))
+    assert np.array_equal(runtime, constant), (
+        f"max abs diff {float(np.max(np.abs(runtime.astype(np.float64) - constant.astype(np.float64)))):.3e}"
+    )
+
+
+# --------------------------------------------------------------------------
+# numeric: a bare bf16 MoE layer, decode through moe_bf16_qmv (KON-234)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("layer", [1, 2])
+def test_bf16_decode_moe_matches_the_exact_math_and_the_prefill_path(layer: int) -> None:
+    """seq == 1: ``moe_bf16_qmv`` over the top-6 vs the float64 evaluation of the bf16 layer, and vs the prefill path.
+
+    Against float64 the only difference left is fp32 rounding, which pins the
+    wiring -- the right experts, the right router weights, the right mixing:
+    cosine >= 0.99999 and a 1e-4 relative max-abs gate (the int8 decode
+    test's bars). The prefill path (the dense 64-term chain on CPU, MAX's
+    native routing on an accelerator) on the same row, fed as a two-row
+    sequence, is the other fp32 spelling of the same math; it has to agree to
+    fp32 rounding as well.
+    """
+    bf16_cfg = _small_decoder_config(int8=False)
+    original, _, _ = _moe_weights(bf16_cfg, seed=layer)
+    rng = np.random.default_rng(100 + layer)
+    x = rng.standard_normal((1, bf16_cfg.hidden_size)).astype(np.float32)
+
+    got = _run(_moe_model(bf16_cfg, original, seq=1, tag=f"bf16_qmv_l{layer}"), x)
+    prefill = _run(_moe_model(bf16_cfg, original, seq=2, tag=f"bf16_prefill_l{layer}"), np.concatenate([x, x]))
+    exact = _bf16_decode_reference_fp64(bf16_cfg, original, x)
+
+    cos_exact, rel_exact = _cosine(got, exact), rel_err(got, exact)
+    rel_prefill = rel_err(got, prefill[:1])
+    print(
+        f"[uocr] bf16 decode MoE layer {layer}: vs exact bf16 math cosine {cos_exact:.9f} (rel {rel_exact:.2e}); "
+        f"vs the prefill path rel {rel_prefill:.2e}"
+    )
+    assert np.all(np.isfinite(got))
+    assert cos_exact >= 0.99999 and rel_exact <= 1e-4
+    assert rel_prefill <= 1e-4
+
+
+@pytest.mark.slow
+def test_bf16_multi_row_qmv_matches_the_exact_math_and_the_prefill_path() -> None:
+    """``MoE.decode_rows`` on 8 rows (``moe_bf16_qmv`` over 48 (token, expert) rows) vs float64, prefill and one-row decode.
+
+    Each row against the float64 evaluation of the bf16 layer at the batch-1
+    test's bars; against the prefill path on the same 8 rows (the dense chain
+    on CPU, MAX's native routing on an accelerator) and against the one-row
+    decode MoE to fp32 rounding (same kernel, but a different gate matmul
+    and mixing shape).
+    """
+    bf16_cfg = _small_decoder_config(int8=False)
+    original, _, _ = _moe_weights(bf16_cfg, seed=19)
+    x = np.random.default_rng(23).standard_normal((8, bf16_cfg.hidden_size)).astype(np.float32)
+
+    rows = _run(_moe_model(bf16_cfg, original, seq=8, tag="bf16_rows", decode_rows=True), x)
+    prefill = _run(_moe_model(bf16_cfg, original, seq=8, tag="bf16_prefill_rows"), x)
+    one_row = _moe_model(bf16_cfg, original, seq=1, tag="bf16_one_row")
+    single = np.concatenate([_run(one_row, x[i : i + 1]) for i in range(x.shape[0])])
+    exact = np.concatenate([_bf16_decode_reference_fp64(bf16_cfg, original, x[i : i + 1]) for i in range(x.shape[0])])
+
+    rel_exact, rel_prefill, rel_single = rel_err(rows, exact), rel_err(rows, prefill), rel_err(rows, single)
+    cos_exact = min(_cosine(rows[i], exact[i]) for i in range(x.shape[0]))
+    print(
+        f"[uocr] bf16 multi-row qmv (8 rows): vs exact bf16 math rel {rel_exact:.2e} (min cos {cos_exact:.9f}); "
+        f"vs the prefill path rel {rel_prefill:.2e}; vs one-row qmv rel {rel_single:.2e}, "
+        f"bitwise {bool(np.array_equal(rows, single))}"
+    )
+    assert np.all(np.isfinite(rows))
+    assert cos_exact >= 0.99999 and rel_exact <= 1e-4
+    assert rel_prefill <= 1e-4
+    assert rel_single <= 1e-5

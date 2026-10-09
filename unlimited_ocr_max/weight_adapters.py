@@ -8,11 +8,13 @@ hands MAX back what MAX handed it, and only the vision side, which serves fp32
 anyway, materialises numpy.
 
 ``language_model``: strip ``model.``, rename ``mlp.gate.weight`` to
-``mlp.gate.gate_score.weight``, and stack each MoE layer's 64 routed experts into
+``mlp.gate.gate_score.weight``, stack each MoE layer's 64 routed experts into
 three ``[64, N, K]`` tensors in ascending expert index (the layout
-``grouped_matmul_ragged`` wants; slice ``j`` must be expert ``j``). The result is
-checked name-for-name, shape-for-shape and dtype-for-dtype against what
-:class:`~unlimited_ocr_max.decoder.UnlimitedOcrDecoder` declares.
+``grouped_matmul_ragged`` wants; slice ``j`` must be expert ``j``), and lay every
+projection the decoder declares K-blocked out as ``[K / KBLOCK, N, KBLOCK]``
+(:func:`kblocked`). The result is checked name-for-name, shape-for-shape and
+dtype-for-dtype against what :class:`~unlimited_ocr_max.decoder.UnlimitedOcrDecoder`
+declares.
 
 Two checkpoint forms are read, told apart by :func:`is_int8_checkpoint`:
 
@@ -45,7 +47,7 @@ import numpy as np
 from max.driver import Buffer
 
 from .buffers import as_float32, buffer_to_numpy, numpy_to_buffer
-from .decoder import UnlimitedOcrDecoder
+from .decoder import KBLOCK, UnlimitedOcrDecoder
 from .layers.clip_l import UNUSED_CHECKPOINT_WEIGHTS
 from .layers.sam_vit import CHECKPOINT_PREFIX as SAM_PREFIX
 from .layers.sam_vit import sam_state_dict
@@ -57,6 +59,8 @@ __all__ = [
     "WeightMappingError",
     "check_against_declared",
     "is_int8_checkpoint",
+    "kblock_projections",
+    "kblocked",
     "language_state_dict",
     "stack_expert_weights",
     "vision_state_dict",
@@ -215,6 +219,36 @@ def is_int8_checkpoint(checkpoint: Mapping[str, Any]) -> bool:
     return True
 
 
+def kblocked(weight: Buffer) -> Buffer:
+    """A projection ``W [N, K]`` as ``[K / KBLOCK, N, KBLOCK]``: block ``kb`` of every row side by side.
+
+    The layout ``dense_bf16_qmv`` reads (:data:`~unlimited_ocr_max.decoder.KBLOCK`).
+    The bytes are copied once, by the transpose that lays them out; bf16 makes
+    the trip as its uint16 bit patterns, as in :func:`stack_expert_weights`.
+    """
+    bits = buffer_to_numpy(weight)
+    n, k = bits.shape
+    if k % KBLOCK:
+        raise WeightMappingError(f"a K-blocked projection needs K to be a multiple of {KBLOCK}, got shape {bits.shape}")
+    return numpy_to_buffer(np.ascontiguousarray(bits.reshape(n, k // KBLOCK, KBLOCK).transpose(1, 0, 2)), weight.dtype)
+
+
+def kblock_projections(state_dict: Mapping[str, Any], declared: Mapping[str, Any]) -> dict[str, Any]:
+    """``state_dict`` with every projection ``declared`` K-blocked laid out so (:func:`kblocked`).
+
+    A K-blocked declaration is rank 3 where the checkpoint tensor is rank 2;
+    the expert stacks are rank 3 on both sides and pass through, like
+    everything else. :func:`check_against_declared` checks the result.
+    """
+    out: dict[str, Any] = {}
+    for name, value in state_dict.items():
+        weight = declared.get(name)
+        if weight is not None and len(weight.shape) == 3 and len(value.shape) == 2:
+            value = kblocked(value)
+        out[name] = value
+    return out
+
+
 def check_against_declared(state_dict: Mapping[str, Any], declared: Mapping[str, Any]) -> None:
     """Check ``state_dict`` name-for-name, shape-for-shape and dtype-for-dtype against ``declared``.
 
@@ -242,7 +276,7 @@ def check_against_declared(state_dict: Mapping[str, Any], declared: Mapping[str,
 
 
 def language_state_dict(checkpoint: Mapping[str, Any], config: UnlimitedOCRConfig) -> dict[str, Any]:
-    """The decoder's tensors, renamed and expert-stacked, verified against the declared weights."""
+    """The decoder's tensors, renamed, expert-stacked and K-blocked, verified against the declared weights."""
     selected = {
         key: value
         for key, value in checkpoint.items()
@@ -252,8 +286,9 @@ def language_state_dict(checkpoint: Mapping[str, Any], config: UnlimitedOCRConfi
         raise WeightMappingError("no language weights found in the checkpoint")
     is_int8_checkpoint(selected)  # reject a half-quantized file here, where the names still say why
     renamed = {language_weight_name(key): value for key, value in selected.items()}
-    out = stack_expert_weights(renamed, num_experts=config.decoder.n_routed_experts)
-    check_against_declared(out, UnlimitedOcrDecoder(config.decoder, dtype=config.dtype).raw_state_dict())
+    declared = UnlimitedOcrDecoder(config.decoder, dtype=config.dtype).raw_state_dict()
+    out = kblock_projections(stack_expert_weights(renamed, num_experts=config.decoder.n_routed_experts), declared)
+    check_against_declared(out, declared)
     return out
 
 

@@ -2,7 +2,9 @@
 
 [`baidu/Unlimited-OCR`](https://huggingface.co/baidu/Unlimited-OCR) served through
 [MAX](https://docs.modular.com/max/) as an OpenAI-compatible endpoint on Metal,
-CUDA, ROCm or CPU. Weights: [`kthierbach/unlimited-ocr-max`](https://huggingface.co/kthierbach/unlimited-ocr-max).
+CUDA or ROCm.
+Code: [`github.com/kthr/unlimited-ocr-max`](https://github.com/kthr/unlimited-ocr-max) ·
+Weights: [`kthierbach/unlimited-ocr-max`](https://huggingface.co/kthierbach/unlimited-ocr-max).
 
 * **bf16** — baidu's `model.safetensors`, unchanged.
 * **int8** — `model-int8.safetensors`, this port's weight-only quantisation of
@@ -42,50 +44,66 @@ sudo apt-get install -y libcublas-13-0
 ls -l /usr/local/cuda-13.0/lib64/libcublas.so.13 /usr/local/cuda-13.0/lib64/libcublasLt.so.13
 ```
 
-Use these system packages, not the `nvidia-*-cu13` pip wheels — the loader does
-not find those. NVIDIA needs **v0.3.1 or later**: v0.3.0 aborts on the first
-request with `CUDA_ERROR_INVALID_VALUE`.
-
 ### AMD — Linux, driver 6.3.3+ (MI355X: ROCm 7+)
 
 MAX also loads ROCm's rocBLAS, hipBLASLt and MIOpen from `/opt/rocm/lib`;
 untested beyond compilation.
 
-### CPU
-
-Nothing beyond Python. Supported, slow.
-
 ## Serve
 
 ```bash
-uv tool install unlimited-ocr-max        # or: pip install unlimited-ocr-max
+uv tool install --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
+# or: pip install --pre --extra-index-url https://whl.modular.com/nightly/simple/ unlimited-ocr-max
 unlimited-ocr-max serve --devices gpu
 ```
 
-This installs `max[all]==26.6.0`, `numpy` and `pillow` from PyPI (no extra
-index). The first run downloads the weights (6.2 GiB bf16, 4.0 GiB int8) and
-compiles the kernels. Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, model
-`unlimited-ocr-max`.
+This installs `max[all]==26.7.0.dev2026100105` from Modular's nightly index. The extra index is required: 26.7 has no stable release yet.
+Endpoint: `http://127.0.0.1:8010/v1/chat/completions`, model `unlimited-ocr-max`.
 
 | flag | values | default | what it does |
 |---|---|---|---|
-| `--devices` | `gpu` \| `cpu` | **required** | `gpu` is Metal, CUDA or ROCm; `cpu` is slow |
-| `--weights` | `bf16` \| `int8` | `bf16` | `int8`: quantised routed experts, faster decode, **gpu only** |
+| `--devices` | `gpu` | **required** | Metal, CUDA or ROCm; `cpu` is refused |
+| `--weights` | `bf16` \| `int8` | `bf16` | `int8`: quantised routed experts, faster decode |
 | `--model` | Hub repo or local dir | `kthierbach/unlimited-ocr-max` | a local dir needs this repository's layout |
-| `--revision` | tag | `v0.3.2` | the model-repo tag this package version was validated against |
+| `--revision` | tag | `v0.4.0` | the model-repo tag this package version was validated against |
 | `--port` | integer | `8010` | |
 | `--ngram-size` | integer | `35` | no-repeat n-gram guard; `0` disables it |
+| `--max-batch-size` | `1`–`8` | `1` | concurrent requests decoded together each step; a lone request runs slower; output is independent of what else is in flight |
+
+A prompt may be at most 512 tokens, the page's image tokens included: 274 in `base` mode, which
+leaves about 238 tokens of text. A longer prompt gets an HTTP 400 and never reaches the model.
+The server allocates its KV page pool at startup and holds it: 90 MiB at `--max-batch-size 1`,
+615 MiB at 8.
+
+### First run
+
+The first run compiles every graph for this build, which can take several minutes. On Apple
+silicon the int8 first compile briefly raises the server's physical footprint far above its
+steady level -- a transient during compilation; steady state is much lower. Apple M4, with the
+graphs not yet cached (one draw each):
+- the first bf16 request took 100 s (the server was ready after 29 s);
+- the first int8 request took 331 s, almost all of it compiling the int8 language graphs. During
+  that compile macOS reported a footprint of about 42 GiB, which counts memory it compresses; the
+  resident memory peaked at about 16.6 GiB and swap grew by less than 1 GiB on the 24 GB M4.
+  Afterwards the footprint is 9–13 GiB;
+- with `--max-batch-size 8`, startup compiles the batched graphs: 212 s (bf16) and 181 s (int8)
+  uncached, against 20–31 s cached.
+
+Later runs read the compiled graphs from the cache.
 
 ### Measure it on your machine
 
 ```bash
-unlimited-ocr-max profile --devices gpu            # add --weights int8, or --devices cpu
+unlimited-ocr-max profile --devices gpu            # add --weights int8
+unlimited-ocr-max profile --devices gpu --max-batch-size 8   # concurrency defaults to 8
 ```
 
 Starts its own server, sends the 12 bundled pages, prints one row of the table
-below and writes `profile.json`. On a GPU it refuses to run unless no other
+below and writes `profile.json`. It refuses to run unless no other
 process is using the GPU. `--out DIR` sets the output directory (default
-`./unlimited-ocr-max-profile-<UTC time>`).
+`./unlimited-ocr-max-profile-<UTC time>`). `--concurrency N` (profile-only)
+keeps N requests in flight over the corpus instead of one; it defaults to
+`--max-batch-size` and must not exceed it.
 
 One page to Markdown:
 
@@ -101,7 +119,7 @@ EOF
 Offline:
 
 ```bash
-uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.3.2 --local-dir ocr-model
+uvx --from huggingface_hub hf download kthierbach/unlimited-ocr-max --revision v0.4.0 --local-dir ocr-model
 unlimited-ocr-max serve --devices gpu --model ocr-model
 ```
 
@@ -113,31 +131,40 @@ characters over all pages.
 
 | hardware | weights | status | decode | prefill | memory, peak / steady | text vs reference |
 |---|---|---|---|---|---|---|
-| Apple M4 24 GB | bf16 | 12 pages | **21.3 tok/s** | 3.20 s | 17.8 / 11.1–11.2 GiB | **12/12 byte-identical** |
-| Apple M4 24 GB | int8 | 12 pages ² | **36.6 tok/s** | 6.86 s | 20.7 / 10.9 GiB | 6/12; CER 0.0011, all edits bbox digits |
-| NVIDIA A100 80 GB | bf16 | 12 pages | **93.6 tok/s** | 3.56 s | device 10.6 / 10.6 GiB | 10/12; CER 0.022 ³ |
-| NVIDIA A100 80 GB | int8 | 12 pages | **82.7 tok/s** | 6.23 s | device 17.4 / 17.4 GiB | 6/12; CER 0.025 ³ |
-| NVIDIA T4 (Turing, sm_75) | any | **does not run** ¹ | — | — | — | — |
+| Apple M4 24 GB | bf16 | 12 pages | **66.8 tok/s** | 2.12 s | 16.6 / 10.8 GiB | **12/12 byte-identical** |
+| Apple M4 24 GB | int8 | 12 pages | **69.3 tok/s** | 3.05 s | 13.0 / 9.9 GiB | 6/12; CER 0.0011, all edits bbox digits |
+| NVIDIA A100 80 GB | bf16 | 12 pages | **141.8 tok/s** | 1.94 s | device 10.1 / 10.1 GiB | 10/12; CER 0.022 |
+| NVIDIA A100 80 GB | int8 | 12 pages | **123.3 tok/s** | 1.68 s | device 10.4 / 10.4 GiB | 6/12; CER 0.025 |
 | AMD gfx90a / gfx942 / gfx950 / gfx1100 | both | compiles, never served | — | — | — | — |
-| CPU (Apple M4) | bf16 | 12 pages ² | 5.1 tok/s | 47.9 s | 21.1 / 21.0 GiB | **12/12 byte-identical** |
 
-Every measured row is one draw with `unlimited-ocr-max profile` on v0.3.2
-(Apple M4: macOS 26.5.2; A100: Linux; `max` 26.6.0 on both). Memory is the server's **physical
-footprint** on Apple silicon -- what `footprint` and `vmmap` report, which on
-unified memory includes the Metal allocations and excludes clean page cache --
-and its device memory on NVIDIA/AMD. Peak is reached in the first request
-(weight upload and graph compile); steady is the server idle between pages.
-¹ Upstream: MAX's `ldmatrix` PTX needs sm_80, and Turing has no bf16 tensor
-cores ([modular/modular#6653](https://github.com/modular/modular/issues/6653),
-[#6659](https://github.com/modular/modular/issues/6659)). ² System swap grew
-during these runs, so their timings are indicative; the text results are
-exact. ³ On CUDA two of the twelve pages differ from the fp32 reference. The
-bf16 output is byte-identical to v0.3.1's on the same A100, so this is CUDA's
-arithmetic rather than a change in this release.
+### Continuous batching (`--max-batch-size 8`, Apple M4)
+
+`unlimited-ocr-max profile --devices gpu [--weights int8] --max-batch-size 8 --concurrency N`,
+12 pages, one draw each. In every row the text is byte-identical to the same weights at
+`--max-batch-size 1`, so bf16 stays 12/12 against the reference and int8 6/12 (CER 0.0011).
+
+| weights | concurrency | aggregate tok/s | per-page latency (median) | decode step (full batch) |
+|---|---|---|---|---|
+| bf16 | 1 | 35.8 | 14.2 s | 23.9 ms (a lone request, padded to 2 rows) |
+| bf16 | 2 | 58.3 | 17.1 s | 23.3 ms |
+| bf16 | 4 | 74.8 | 25.0 s | 31.0 ms |
+| bf16 | 8 | **85.7** | 40.9 s | 47.6 ms |
+| int8 | 1 | 38.4 | 13.3 s | 21.0 ms (a lone request, padded to 2 rows) |
+| int8 | 2 | 57.6 | 17.8 s | 21.1 ms |
+| int8 | 4 | 72.5 | 25.0 s | 24.9 ms |
+| int8 | 8 | **82.2** | 45.7 s | 37.9 ms |
 
 ## Not supported
 
-`gundam` (tiled) mode; batch size > 1; multi-GPU.
+`gundam` (tiled) mode; multi-GPU. A new request's prefill pauses every
+running decode -- there is no in-flight batching.
+
+CPU serving was removed: `serve`, `profile` and a plain `max serve` refuse `--devices cpu`.
+The MAX 26.7 nightlies miscompile a CPU `reshape(matmul, split N)` plus broadcast, so served
+CPU pages came out wrong with no error.
+
+On Apple silicon, MAX does not report a GPU allocation it cannot satisfy. The
+computation returns wrong values instead of an error.
 
 ## References
 
@@ -146,11 +173,32 @@ This port changes how the model is served, not the model (int8 excepted, as
 quantified above); model-level behaviour, limitations and biases are those of
 `baidu/Unlimited-OCR`.
 
-## Authorship
+```bibtex
+@misc{yin2026unlimitedocrworks,
+      title={Unlimited OCR Works},
+      author={Youyang Yin and Huanhuan Liu and YY and Qunyi Xie and Chaorun Liu and Shiqi Yang and Shaohua Wang and Zhanlong Liu and Hao Zou and Jinyue Chen and Shu Wei and Jingjing Wu and Mingxin Huang and Zhen Wu and Guibin Wang and Tengyu Du and Lei Jia},
+      year={2026},
+      eprint={2606.23050},
+      archivePrefix={arXiv}
+}
+```
 
-This port, its serve configuration and this documentation were written with
-substantial AI assistance (Claude, via Claude Code); Konstantin Thierbach
-reviewed them and is accountable for their contents. Assisted-by: AI.
+## Disclaimer
+
+This port is a research project by Konstantin Thierbach and Claude (Anthropic's
+AI model, working in Claude Code). It asks how far one gets migrating a current
+model to [MAX](https://docs.modular.com/max/). `baidu/Unlimited-OCR` is the test
+case: a SAM and CLIP vision tower feeding a 64-expert mixture-of-experts decoder.
+The port rebuilds it as MAX graphs, with custom [Mojo](https://docs.modular.com/mojo/)
+kernels where MAX has none, and serves it locally on Apple silicon as well as on
+NVIDIA and AMD GPUs.
+
+The code, the measurements and this documentation came out of that collaboration.
+Every change is gated against pinned reference transcripts, and every figure comes
+from a recorded run. It remains a research artefact rather than a supported
+product, though. It tracks MAX's own development closely, at times pinning a
+nightly build, and can change or break with it. It is not affiliated with or
+endorsed by Baidu or Modular.
 
 ## License
 

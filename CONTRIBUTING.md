@@ -1,12 +1,12 @@
 # Contributing
 
 ```bash
-uv venv && uv pip install -e '.[test]'   # everything, MAX included, comes from PyPI
-.venv/bin/pytest tests -q -m "not slow"  # 102 model-free tests, no weights needed
+uv venv && uv pip install -e '.[test]'   # the nightly index comes from [[tool.uv.index]]
+.venv/bin/pytest tests -q -m "not slow"  # 454 model-free tests, no weights needed
 ```
 
 CI runs the same tests against the *built wheel* in a throwaway venv on Linux
-and macOS, and asserts both `kernels/*.mojo` are inside it.
+and macOS, and asserts every `kernels/*.mojo` is inside it.
 
 ## Release
 
@@ -48,9 +48,10 @@ secret.
 *Environments* → `pypi` → *Required reviewers*, so every upload to PyPI waits
 for a human approval instead of going out on any tag push.
 
-The install instructions need no extra index **from v0.3.0 on**: the pinned
-`max[all]==26.6.0` is on PyPI, so `pip install unlimited-ocr-max` resolves the
-whole dependency set from PyPI alone. Releases up to and including **0.2.1**
-pin `max[all]==26.6.0.dev2026082707`, a nightly that is not on PyPI — installing
-those old versions needs
-`--extra-index-url https://whl.modular.com/nightly/simple/`.
+From **0.4.0** on, the install instructions need `--extra-index-url
+https://whl.modular.com/nightly/simple/` again: the pinned `max[all]==26.7.0.dev2026100105`
+is a nightly that is not on PyPI. With `pip` they need `--pre` too, for the
+pre-release `mojo` it depends on. The pin moves to the 26.7 stable release
+once that ships. Releases 0.3.0 to 0.3.2 pin `max[all]==26.6.0`, from PyPI
+alone. Releases up to and including **0.2.1** pin
+`max[all]==26.6.0.dev2026082707`, which also needs the extra index.

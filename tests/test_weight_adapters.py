@@ -21,10 +21,14 @@ from max.driver import Buffer
 from max.dtype import DType
 from max.graph import DeviceRef, Weight
 
+from unlimited_ocr_max.buffers import buffer_to_numpy
+from unlimited_ocr_max.decoder import KBLOCK
 from unlimited_ocr_max.weight_adapters import (
     WeightMappingError,
     check_against_declared,
     is_int8_checkpoint,
+    kblock_projections,
+    kblocked,
     stack_expert_weights,
 )
 
@@ -262,6 +266,45 @@ def test_declared_weights_still_check_names_and_shapes() -> None:
     wrong_shape = {"layers.1.mlp.experts.gate_proj": _stack(torch.bfloat16, (EXPERTS, N, GROUPS))}
     with pytest.raises(WeightMappingError, match="checkpoint shape"):
         check_against_declared(wrong_shape, _declared(DType.bfloat16))
+
+
+# --- K-blocked projections ---------------------------------------------------
+
+
+def test_kblocked_puts_column_kk_of_row_n_at_block_kk_div_kblock() -> None:
+    """``W [N, K]`` as ``[K / KBLOCK, N, KBLOCK]``: ``W[n, kk] == out[kk // KBLOCK, n, kk % KBLOCK]``, bit for bit, still bf16."""
+    weight = torch.arange(N * K, dtype=torch.float32).reshape(N, K).to(torch.bfloat16)
+    out = kblocked(_buffer(weight))
+    assert out.dtype == DType.bfloat16 and tuple(out.shape) == (K // KBLOCK, N, KBLOCK)
+    bits, want = buffer_to_numpy(out), weight.view(torch.int16).numpy().view(np.uint16)
+    for n, kk in [(0, 0), (N - 1, K - 1), (2, 17), (5, 128), (3, KBLOCK - 1)]:
+        assert bits[kk // KBLOCK, n, kk % KBLOCK] == want[n, kk], (n, kk)
+    assert np.array_equal(bits.transpose(1, 0, 2).reshape(N, K), want)
+
+
+def test_kblocked_refuses_a_k_that_is_not_a_multiple_of_kblock() -> None:
+    with pytest.raises(WeightMappingError, match=f"multiple of {KBLOCK}"):
+        kblocked(_buffer(torch.zeros((N, KBLOCK + 1), dtype=torch.bfloat16)))
+
+
+def test_kblock_projections_lays_out_only_what_is_declared_k_blocked() -> None:
+    """A rank-3 declaration over a rank-2 tensor is K-blocked; a stack (rank 3 on both sides) and a rank-2 declaration pass."""
+    device = DeviceRef.CPU()
+    declared = {
+        "layers.0.self_attn.q_proj.weight": Weight("q", DType.bfloat16, [K // KBLOCK, N, KBLOCK], device=device),
+        "layers.1.mlp.gate.gate_score.weight": Weight("r", DType.bfloat16, [N, K], device=device),
+        "layers.1.mlp.experts.gate_proj": Weight("e", DType.bfloat16, [EXPERTS, N, K], device=device),
+    }
+    provided = {
+        "layers.0.self_attn.q_proj.weight": _buffer(torch.zeros((N, K), dtype=torch.bfloat16)),
+        "layers.1.mlp.gate.gate_score.weight": _buffer(torch.zeros((N, K), dtype=torch.bfloat16)),
+        "layers.1.mlp.experts.gate_proj": _stack(torch.bfloat16),
+    }
+    out = kblock_projections(provided, declared)
+    assert tuple(out["layers.0.self_attn.q_proj.weight"].shape) == (K // KBLOCK, N, KBLOCK)
+    assert out["layers.1.mlp.gate.gate_score.weight"] is provided["layers.1.mlp.gate.gate_score.weight"]
+    assert out["layers.1.mlp.experts.gate_proj"] is provided["layers.1.mlp.experts.gate_proj"]
+    check_against_declared(out, declared)
 
 
 def test_language_state_dict_rejects_a_half_quantized_file_at_the_detector() -> None:

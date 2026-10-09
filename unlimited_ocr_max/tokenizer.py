@@ -4,6 +4,9 @@ The prompt is not a chat template. ``infer()`` uses the ``plain`` format (the
 user content, stripped), replaces each ``<image>`` marker with a run of
 placeholder ids -- ``([id] * 16 + [id]) * 16 + [id]`` = 273 for a 1024px view --
 and prepends a literal ``bos_id = 0``; no special tokens are added anywhere.
+A served prompt longer than :data:`~unlimited_ocr_max.kv_cache.MAX_PROMPT_TOKENS`
+(those 273 rows included) is refused with an HTTP 400 by
+:meth:`UnlimitedOcrTokenizer.new_context`.
 
 The tokenizer is built from ``tokenizer.json`` alone: ``AutoTokenizer`` resolves
 this checkpoint to a slow ``LlamaTokenizer`` that mis-tokenises and drops every
@@ -22,12 +25,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from max.pipelines.context.exceptions import PromptTooLongError
 from max.pipelines.lib import TextAndVisionTokenizer
 
 from .batch_processor import BASE_SIZE, LOCAL_SIZE, ViewGeometry, preprocess_page
+from .kv_cache import MAX_PROMPT_TOKENS
 
 if TYPE_CHECKING:
+    from max.pipelines.context import TextAndVisionContext
     from max.pipelines.lib import PipelineConfig
+    from max.pipelines.modeling.types import TextGenerationRequest
     from PIL import Image
 
 __all__ = [
@@ -304,6 +311,28 @@ class UnlimitedOcrTokenizer(TextAndVisionTokenizer):
         # Read by getattr in max/serve's incremental detokenizer.
         self.skipped_special_token_ids = skipped_special_token_ids(self.delegate)
         self.enable_prefix_caching = pipeline_config.model.kv_cache.enable_prefix_caching
+
+    async def new_context(self, request: TextGenerationRequest) -> TextAndVisionContext:
+        """MAX's context for ``request``, refused when its prompt is longer than :data:`MAX_PROMPT_TOKENS`.
+
+        This is the method the API process calls per request
+        (``max/serve/pipelines/llm.py`` ``next_token_chunk``), before the
+        request is handed to the model worker, whose KV page pool holds slots
+        of exactly that many prompt tokens. The refusal is a
+        ``PromptTooLongError`` -- an ``InputError``, which MAX's OpenAI routes
+        answer with an HTTP 400 carrying this message -- so the server keeps
+        serving. The length counted is the whole prompt: BOS, the page's image
+        placeholders and the text.
+        """
+        context = await super().new_context(request)
+        prompt_len = int(context.tokens.prompt_length)
+        if prompt_len > MAX_PROMPT_TOKENS:
+            raise PromptTooLongError(
+                prompt_len,
+                MAX_PROMPT_TOKENS,
+                limit_description="per-request prompt limit of this server (the page's image tokens count toward it)",
+            )
+        return context
 
     async def decode(self, encoded: Any, **kwargs: Any) -> str:
         """The non-streaming path, filtered with the same exclusion set."""
