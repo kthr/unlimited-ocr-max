@@ -45,7 +45,6 @@ import unlimited_ocr_max.pipeline as pipeline_module
 from unlimited_ocr_max.decoder import UnlimitedOcrDecoder
 from unlimited_ocr_max.graphs import DecodeGraph, build_decode_graph
 from unlimited_ocr_max.kv_cache import PAGE_SIZE, KvCache, PagedStep
-from unlimited_ocr_max.model_config import UnlimitedOCRConfig
 from unlimited_ocr_max.pipeline import UnlimitedOcrPipeline
 
 from test_decoder_int8 import (
