@@ -10,14 +10,28 @@ and macOS, and asserts every `kernels/*.mojo` is inside it.
 
 ## Release
 
-1. Bump `project.version` in `pyproject.toml` **and** `DEFAULT_REVISION` in
-   `unlimited_ocr_max/cli.py` to the same `vX.Y.Z` (a test ties them together),
-   and make sure that tag exists on the model repo.
-2. Commit.
-3. `git tag -a vX.Y.Z -m "<the release notes>"` — the tag message becomes the
-   GitHub Release body.
-4. `git push origin main --follow-tags`.
-5. `.github/workflows/publish.yml` then checks the tag against
+Every release goes through a pull request, so CI has run on exactly what is merged and tagged.
+
+1. On a branch `release/X.Y.Z`: bump `project.version` in `pyproject.toml` **and**
+   `DEFAULT_REVISION` in `unlimited_ocr_max/cli.py` to the same `vX.Y.Z` (a test ties them
+   together), date the version's section in `CHANGELOG.md`, and make sure the tag `vX.Y.Z`
+   exists on the model repo.
+2. Run CI's lint step and the model-free tests locally:
+   ```bash
+   uvx ruff@0.16.6 check --select F unlimited_ocr_max tests   # the lint step of ci.yml
+   .venv/bin/pytest tests -q -m "not slow"
+   ```
+3. Push the branch and open a pull request into `main`. `.github/workflows/ci.yml` runs the
+   lint and the wheel jobs (Linux and macOS) on it.
+4. When CI is green, **squash-merge** the pull request; the squash commit message summarises
+   the release for users.
+5. Tag the squash commit and push the tag -- the tag message becomes the GitHub Release body:
+   ```bash
+   git switch main && git pull
+   git tag -a vX.Y.Z -m "<the release notes>"
+   git push origin vX.Y.Z
+   ```
+6. `.github/workflows/publish.yml` then checks the tag against
    `project.version`, builds the wheel and sdist, publishes them to PyPI
    through Trusted Publishing, and attaches them to a GitHub Release (created
    with `gh release create` and the workflow's own token -- no third-party
